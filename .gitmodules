@@ -1,0 +1,6 @@
+[submodule "PLATO"]
+	path = PLATO
+	url = https://github.com/ArvindCar/PLATO.git
+[submodule "robomail"]
+	path = robomail
+	url = https://github.com/rumilog/robomail.git

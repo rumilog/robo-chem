@@ -1,0 +1,24 @@
+# RoboChem Requirements
+
+# Core dependencies
+numpy>=1.20.0
+opencv-python>=4.5.0
+Pillow>=8.0.0
+scikit-learn>=0.24.0
+
+# VLM/API
+openai>=1.0.0
+
+# 3D Vision
+open3d>=0.15.0
+
+# Segmentation (install separately if needed)
+# segment-anything @ git+https://github.com/facebookresearch/segment-anything.git
+
+# Robot control (install separately)
+# frankapy
+# robomail (install from local ../robomail)
+
+# Development
+pytest>=6.0.0
+black>=21.0.0
