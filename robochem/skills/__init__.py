@@ -79,6 +79,13 @@ class SkillsExecutor:
     Manages skill execution with shared robot and vision resources.
     """
     
+    # Registry aliases that pin a parameter, so the orchestrator can call
+    # "open_gripper" directly instead of "gripper" with action="open".
+    SKILL_ALIASES = {
+        "open_gripper": {"action": "open"},
+        "close_gripper": {"action": "close"},
+    }
+    
     def __init__(self, robot_interface, vision_system, config: dict = None):
         """
         Initialize the skills executor.
@@ -94,6 +101,14 @@ class SkillsExecutor:
         
         # Pre-instantiate skills for reuse
         self._skill_instances = {}
+    
+    def list_skills(self) -> list:
+        """
+        Names the orchestrator may dispatch.
+
+        Includes the aliases, since those are what the planner is told about.
+        """
+        return list_skills()
         
     def execute(self, skill_name: str, params: dict) -> tuple:
         """
@@ -113,6 +128,8 @@ class SkillsExecutor:
             )
         
         skill = self._skill_instances[skill_name]
+        
+        params = {**self.SKILL_ALIASES.get(skill_name, {}), **(params or {})}
         
         # Check preconditions
         can_execute, message = skill.check_preconditions(params)

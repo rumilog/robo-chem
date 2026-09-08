@@ -1,137 +1,274 @@
 """
 Scoop Skill
 
-Scoops powder or granular material using a scoop/spoon tool.
-Critical for handling dry chemistry reagents.
+Transfers a measured quantity of powder out of a source container with a held
+scoop. This is how dry reagents are metered — the profile in robomail_Aliyah's
+`config/robot_profile.py` explicitly rules out metering a pour by weight.
+
+Hardened along the same lines as pick_up / pour:
+  - reset_joints before scanning, world-frame rim geometry from the pointcloud
+  - the drag is clamped to the measured opening, so the scoop cannot ram the wall
+  - the dig and drag run *compliant* (impedance on) because they are contact
+    motions; the free-space approach and the lift run stiff and are verified
+  - the retaining tilt uses tool-axis rotation and is confirmed by measurement,
+    the way pour confirms its tip instead of assuming it
 """
 
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple
 import numpy as np
 
-from .base_skill import BaseSkill
+from .base_skill import BaseSkill, _orthonormalize
 
 
 class ScoopSkill(BaseSkill):
     """
-    Scoop powder/granular material with a scoop or spoon tool.
-    
+    Scoop powder from a source container with a held scoop or spoon.
+
     Pipeline:
-    1. Verify holding a scoop-type tool
-    2. Localize powder source container
-    3. Approach from behind the powder
-    4. Lower scoop to surface level
-    5. Push forward (scooping motion)
-    6. Tilt up slightly to retain material
-    7. Lift
+    1. Record held width; the scoop must survive the whole motion
+    2. Clear the cameras, scan the source, measure rim height / radius
+    3. Flatten the wrist so the scoop bowl faces up and the shaft hangs down
+    4. Hover over the powder, descend to the dig depth (compliant)
+    5. Drag across the powder bed (compliant), staying inside the opening
+    6. Tilt the bowl up about the tool axis to retain the powder, and verify it
+    7. Lift straight out, keeping the tilt
     """
-    
+
     name = "scoop"
     required_params = ["powder_source"]
-    
+
     @property
     def optional_params(self) -> Dict[str, Any]:
         return {
-            "scoop_depth": 0.02,  # How deep to scoop (meters)
-            "scoop_distance": 0.05,  # Forward distance of scoop motion
-            "approach_offset": 0.08,  # Distance behind the target to approach from
-            "lift_angle": 25,  # Degrees to tilt up after scooping
-            "lift_height": 0.10,  # Height to lift after scooping
+            # How far below the powder surface to dig. The surface is taken as
+            # the top of the fused cloud inside the container, which for a
+            # part-full tub is the powder itself, not the rim.
+            "scoop_depth": 0.015,
+            # Length of the drag through the powder. Clamped to the opening.
+            "scoop_distance": 0.04,
+            # Degrees to tilt the bowl up after digging, about the tool's own
+            # closing axis (NOT the base frame — see rotate_about_tool_axis).
+            "lift_angle": 30.0,
+            "lift_height": 0.12,
+            "approach_height": 0.10,
+            "reset_before_scan": True,
+            # Distance kept from the container wall during the drag.
+            "wall_clearance": 0.015,
+            # Offset from the gripper TCP to the scoop bowl, in metres.
+            # MEASURE THIS for your scoop. Left at 0 the arm digs with the
+            # gripper itself, which is wrong for any tool of real length.
+            "tool_length": 0.0,
+            "hover_tol": 0.05,
+            # The dig and drag are contact motions: the powder resists, so the
+            # arm legitimately stops short and a tight tolerance would fail
+            # every successful scoop. Only a gross miss is a failure.
+            "contact_tol": 0.05,
+            "tilt_tol_deg": 12.0,
+            # frankapy often needs a second attempt before the wrist tracks a
+            # commanded orientation; pour retries the same way.
+            "tilt_retries": 3,
         }
-    
+
     def check_preconditions(self, params: Dict[str, Any]) -> Tuple[bool, str]:
-        """
-        Check if scoop can be executed:
-        - Gripper is holding a scoop-type tool
-        - Powder source is visible
-        """
         valid, msg = self.validate_params(params)
         if not valid:
             return False, msg
-        
+
         if not self.is_gripper_holding():
             return False, "Gripper is not holding anything. Pick up a scoop/spoon first."
-        
-        source = params["powder_source"]
-        centroid = self.get_object_centroid(source)
-        if centroid is None:
-            return False, f"Cannot locate powder source '{source}'"
-        
+
         return True, "Preconditions met"
-    
+
     def execute(self, params: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Execute the scoop skill.
-        """
         params = self.get_params_with_defaults(params)
-        powder_source = params["powder_source"]
-        scoop_depth = params["scoop_depth"]
-        scoop_distance = params["scoop_distance"]
-        approach_offset = params["approach_offset"]
-        lift_angle = params["lift_angle"]
-        lift_height = params["lift_height"]
-        
-        print(f"[Scoop] Starting scoop from '{powder_source}'")
-        
-        # Step 1: Localize powder source
-        source_pos = self.get_object_centroid(powder_source)
-        if source_pos is None:
-            return False, {"error": f"Cannot locate '{powder_source}'"}
-        
-        # Get source dimensions for better positioning
-        source_dims = self.get_object_dimensions(powder_source)
-        source_height = source_dims[2] if source_dims is not None else 0.03
-        
-        print(f"[Scoop] Source position: {source_pos}")
-        
-        # Step 2: Calculate approach position (behind the powder)
-        approach_pos = source_pos.copy()
-        approach_pos[0] -= approach_offset  # Behind in X direction
-        approach_pos[2] += source_height + 0.05  # Above the source
-        
-        # Step 3: Move to approach position
-        print(f"[Scoop] Moving to approach position...")
-        if not self.move_to_position(approach_pos):
-            return False, {"error": "Failed to move to approach position"}
-        
-        # Ensure scoop is level (parallel to table)
-        # Note: May need to reset wrist orientation here depending on current state
-        
-        # Step 4: Lower to scooping level
-        print(f"[Scoop] Lowering to scoop level...")
-        scoop_start_pos = source_pos.copy()
-        scoop_start_pos[0] -= approach_offset / 2  # Still slightly behind
-        scoop_start_pos[2] = source_pos[2] - scoop_depth + source_height
-        
-        if not self.move_to_position(scoop_start_pos):
-            return False, {"error": "Failed to lower to scoop level"}
-        
-        # Step 5: Execute forward scooping motion
-        print(f"[Scoop] Executing scoop motion...")
-        scoop_end_pos = scoop_start_pos.copy()
-        scoop_end_pos[0] += scoop_distance  # Move forward
-        
-        if not self.move_to_position(scoop_end_pos):
-            return False, {"error": "Failed during scoop motion"}
-        
-        # Step 6: Tilt up to retain material
-        print(f"[Scoop] Tilting up to retain material...")
-        if not self.rotate_wrist(lift_angle, axis="y"):
-            return False, {"error": "Failed to tilt scoop up"}
-        
-        # Step 7: Lift while maintaining tilt
-        print(f"[Scoop] Lifting scoop...")
-        current_pose = self.get_current_pose()
-        lift_pos = current_pose.translation.copy()
-        lift_pos[2] += lift_height
-        current_pose.translation = lift_pos
-        
-        if not self.move_to_pose(current_pose):
-            return False, {"error": "Failed to lift scoop"}
-        
-        print(f"[Scoop] Successfully scooped from '{powder_source}'")
-        
+        source = params["powder_source"]
+        scoop_depth = float(params["scoop_depth"])
+        requested_distance = float(params["scoop_distance"])
+        lift_angle = float(params["lift_angle"])
+        lift_height = float(params["lift_height"])
+        tool_length = float(params["tool_length"])
+        wall_clearance = float(params["wall_clearance"])
+        contact_tol = float(params["contact_tol"])
+
+        print(f"[Scoop] Starting scoop from '{source}'")
+
+        start_width = self.held_width()
+        print(f"[Scoop] Holding scoop at {start_width * 1000:.1f}mm")
+
+        # 1. Clear the cameras and scan the source.
+        if not self.clear_cameras(params, tag="Scoop"):
+            return False, {"error": "Failed to clear the cameras before scanning"}
+
+        self.vision.clear_cache()
+        located = self.locate_container(source, force_refresh=True)
+        if located is None:
+            return False, {"error": f"Cannot locate '{source}'"}
+
+        ok, msg = self.check_still_holding(start_width, tag="Scoop")
+        if not ok:
+            return False, {"error": f"Lost the scoop before scooping: {msg}"}
+
+        rim_center = located["rim_center"]
+        surface_z = located["top_z"]
+        rim_radius = located["rim_radius"]
+        print(f"[Scoop] '{source}' surface z={surface_z:.4f}, "
+              f"centre {np.round(rim_center, 4)}, "
+              f"opening radius {rim_radius * 1000:.0f}mm")
+
+        # 2. Clamp the drag so it stays inside the container. A 50mm drag in a
+        # 35mm-wide reagent tub just rams the far wall and stalls the arm.
+        usable = max(0.0, rim_radius - wall_clearance)
+        distance = min(requested_distance, 2.0 * usable)
+        if distance < requested_distance:
+            print(f"[Scoop] Clamping drag {requested_distance * 1000:.0f}mm -> "
+                  f"{distance * 1000:.0f}mm (opening radius "
+                  f"{rim_radius * 1000:.0f}mm minus "
+                  f"{wall_clearance * 1000:.0f}mm clearance)")
+        if distance < 0.008:
+            return False, {
+                "error": (f"'{source}' opening is only "
+                          f"{rim_radius * 2000:.0f}mm across — no room to drag "
+                          f"the scoop through the powder"),
+                "rim_radius": rim_radius,
+            }
+
+        # 3. Drag toward the robot base (-X), the same direction pour tips.
+        # Pulling toward the base keeps the elbow inside its comfortable range;
+        # pushing away runs into the reach limit that pour already documented.
+        drag = np.array([-1.0, 0.0])
+        entry_xy = rim_center - drag * (distance / 2.0)
+        exit_xy = rim_center + drag * (distance / 2.0)
+
+        rotation = self.tool_down_rotation()
+        dig_z = surface_z - scoop_depth + tool_length
+        if dig_z < self.workspace_min[2]:
+            return False, {
+                "error": (f"Dig depth would put the wrist at z={dig_z:.3f}, below "
+                          f"the workspace floor {self.workspace_min[2]:.3f}"),
+            }
+
+        # 4. Hover above the entry point (free space, verified strictly).
+        hover = np.array([entry_xy[0], entry_xy[1],
+                          surface_z + float(params["approach_height"]) + tool_length])
+        print(f"[Scoop] Hovering above the powder at {np.round(hover, 4)}...")
+        if not self.goto_pose_rigid(hover, rotation, duration=3.0):
+            return False, {"error": "Failed to command hover pose"}
+        arrived, err = self.reached(hover, float(params["hover_tol"]))
+        if not arrived:
+            return False, {
+                "error": (f"Hover above '{source}' unreachable "
+                          f"(off by {err * 1000:.0f}mm)"),
+            }
+
+        # 5. Dig in. Compliant: the scoop is entering a granular bed, so the
+        # controller should yield rather than push through at full stiffness.
+        entry = np.array([entry_xy[0], entry_xy[1], dig_z])
+        print(f"[Scoop] Digging in to z={dig_z:.4f} "
+              f"({scoop_depth * 1000:.0f}mm into the powder, compliant)...")
+        if not self.goto_pose_rigid(entry, rotation, duration=3.0, use_impedance=True):
+            return False, {"error": "Failed to command dig pose"}
+        arrived, err = self.reached(entry, contact_tol)
+        if not arrived:
+            print(f"[Scoop] Dig stopped {err * 1000:.0f}mm short — lifting out")
+            self.goto_pose_rigid(hover, rotation, duration=3.0)
+            return False, {
+                "error": (f"Could not enter the powder in '{source}' "
+                          f"(off by {err * 1000:.0f}mm); the scoop is probably "
+                          f"fouling the rim"),
+            }
+
+        # 6. Drag through the powder, also compliant.
+        exit_point = np.array([exit_xy[0], exit_xy[1], dig_z])
+        print(f"[Scoop] Dragging {distance * 1000:.0f}mm toward the base "
+              f"to {np.round(exit_point, 4)}...")
+        if not self.goto_pose_rigid(exit_point, rotation, duration=3.0,
+                                    use_impedance=True):
+            return False, {"error": "Failed to command the drag"}
+        arrived, err = self.reached(exit_point, contact_tol)
+        if not arrived:
+            # Worth reporting but not fatal — a partial drag still lifts powder.
+            print(f"[Scoop] Drag ended {err * 1000:.0f}mm short of target "
+                  f"(powder resistance); continuing with a partial scoop")
+
+        ok, msg = self.check_still_holding(start_width, tag="Scoop")
+        if not ok:
+            return False, {"error": f"Scoop lost while digging: {msg}"}
+
+        # 7. Tilt the bowl up to retain the powder, and CHECK it happened.
+        # rotate_wrist would rotate about a base axis and roll the bowl over;
+        # the tool axis is the one that lifts the leading edge.
+        tilt_before = self.tool_tip_deg()
+        tilt_tol = float(params["tilt_tol_deg"])
+        retries = max(1, int(params["tilt_retries"]))
+        print(f"[Scoop] Tilting bowl up {lift_angle:.0f}° about the tool axis "
+              f"(tip now {tilt_before:.1f}° from vertical)...")
+
+        # Retry the *remaining* angle, not the whole command: frankapy often
+        # needs a second, longer goto_pose before the wrist tracks orientation
+        # (the same lag pour retries through). Re-commanding the full angle
+        # would stack rotations and overshoot.
+        achieved = 0.0
+        for attempt in range(1, retries + 1):
+            remaining = lift_angle - achieved
+            if remaining <= 0.5:
+                break
+            if not self.rotate_about_tool_axis(remaining, axis="y"):
+                return False, {"error": "Failed to command the retaining tilt"}
+            self.wait(0.3)
+            achieved = self.tool_tip_deg() - tilt_before
+            print(f"[Scoop]   attempt {attempt}/{retries}: tilt "
+                  f"{achieved:+.1f}° of {lift_angle:.0f}°")
+            if abs(achieved) >= lift_angle - tilt_tol:
+                break
+
+        tilt_after = self.tool_tip_deg()
+        print(f"[Scoop] Measured tilt {tilt_after:.1f}° "
+              f"(Δ{achieved:+.1f}°, commanded {lift_angle:.0f}°)")
+        if abs(achieved) < lift_angle - tilt_tol:
+            # pour's lesson: a wrist that stalls short must not report success.
+            return False, {
+                "error": (f"Retaining tilt stalled: commanded {lift_angle:.0f}° "
+                          f"but only achieved {achieved:.1f}° after {retries} "
+                          f"attempts (tol {tilt_tol:.0f}°). The powder will fall "
+                          f"out of an untilted bowl, so this is not a successful "
+                          f"scoop."),
+                "tilt_commanded": lift_angle,
+                "tilt_achieved": achieved,
+            }
+
+        # 8. Lift straight out, keeping the tilt we just achieved.
+        tilted_rotation = _orthonormalize(
+            np.asarray(self.get_current_pose().rotation, dtype=float)
+        )
+        lift = np.asarray(self.get_current_pose().translation, dtype=float).copy()
+        lift[2] = surface_z + lift_height + tool_length
+        print(f"[Scoop] Lifting clear to z={lift[2]:.4f}...")
+        if not self.goto_pose_rigid(lift, tilted_rotation, duration=3.0):
+            return False, {"error": "Failed to lift the scoop clear"}
+        arrived, err = self.reached(lift, float(params["hover_tol"]))
+        if not arrived:
+            return False, {
+                "error": f"Scoop did not lift clear (off by {err * 1000:.0f}mm)",
+            }
+
+        ok, msg = self.check_still_holding(start_width, tag="Scoop")
+        if not ok:
+            return False, {"error": f"Scoop lost during the lift: {msg}"}
+
+        # The powder bed changed shape, so the cached source cloud is stale.
+        self.vision.clear_cache()
+
+        print(f"[Scoop] Successfully scooped from '{source}'")
         return True, {
-            "scooped_from": powder_source,
+            "scooped_from": source,
             "scoop_depth": scoop_depth,
-            "lift_angle": lift_angle
+            "scoop_distance": distance,
+            "requested_distance": requested_distance,
+            "rim_radius": rim_radius,
+            "surface_z": surface_z,
+            "tilt_commanded": lift_angle,
+            "tilt_achieved": achieved,
+            # There is no measurement of how much powder is on the scoop. The
+            # quantity is nominal, set by depth and drag length.
+            "quantity_measured": False,
         }

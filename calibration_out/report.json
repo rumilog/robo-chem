@@ -1,0 +1,47 @@
+{
+  "timestamp": "2026-09-04T15:20:25.938419",
+  "detector": "hsv",
+  "poses_attempted": 27,
+  "cameras": {
+    "2": {
+      "n": 26,
+      "residual_mean_mm": 5.273916473829333,
+      "residual_median_mm": 4.450212210993361,
+      "residual_max_mm": 19.655041493645,
+      "heldout_mean_mm": 5.626195923388445,
+      "heldout_max_mm": 20.96177285253765,
+      "shift_from_current_mm": 44.63344702955821,
+      "rotation_change_deg": 3.013649034201919
+    },
+    "3": {
+      "n": 24,
+      "residual_mean_mm": 2.5679143747761795,
+      "residual_median_mm": 2.7058463864083917,
+      "residual_max_mm": 6.137238692249775,
+      "heldout_mean_mm": 2.7786698817481725,
+      "heldout_max_mm": 6.5850668250061455,
+      "shift_from_current_mm": 42.2357977098365,
+      "rotation_change_deg": 0.6887580301805457
+    },
+    "4": {
+      "n": 26,
+      "residual_mean_mm": 4.387205352355432,
+      "residual_median_mm": 3.832500012811225,
+      "residual_max_mm": 16.334910161347906,
+      "heldout_mean_mm": 4.664249146368128,
+      "heldout_max_mm": 17.31020205132642,
+      "shift_from_current_mm": 46.15195867904362,
+      "rotation_change_deg": 2.6271065302465857
+    },
+    "5": {
+      "n": 26,
+      "residual_mean_mm": 4.329810061868841,
+      "residual_median_mm": 3.5074012331112945,
+      "residual_max_mm": 17.095118542301055,
+      "heldout_mean_mm": 4.604743959211306,
+      "heldout_max_mm": 18.138331916719654,
+      "shift_from_current_mm": 39.6579071166799,
+      "rotation_change_deg": 2.4047324779839836
+    }
+  }
+}

@@ -14,6 +14,52 @@ except ImportError:
     o3d = None
 
 
+_LIVE_INTRINSICS_CACHE = {}
+
+
+def get_live_intrinsics(cam):
+    """
+    Colour-stream intrinsics read from the RealSense device itself.
+
+    The .intr files shipped with the cage are mutually inconsistent: camera 2
+    claimed fy was roughly half fx, which is impossible for a square-pixel
+    sensor and skews the depth reconstruction projectively, so no rigid
+    camera-to-world transform can fit it. The factory intrinsics stored on the
+    devices agree to well under 1% across all four cameras, so trust those.
+
+    Depth is aligned to the colour stream upstream, so the colour intrinsics are
+    the correct ones for deprojecting the depth image.
+
+    Falls back to the file intrinsics if the device cannot be queried.
+    """
+    cam_id = cam.get_cam_number()
+    if cam_id in _LIVE_INTRINSICS_CACHE:
+        return _LIVE_INTRINSICS_CACHE[cam_id]
+
+    try:
+        import pyrealsense2 as rs
+        from perception import CameraIntrinsics
+
+        profile = cam.pipeline.get_active_profile()
+        rs_intr = (profile.get_stream(rs.stream.color)
+                   .as_video_stream_profile()
+                   .get_intrinsics())
+
+        intr = CameraIntrinsics(
+            frame=str(cam_id),
+            fx=rs_intr.fx, fy=rs_intr.fy,
+            cx=rs_intr.ppx, cy=rs_intr.ppy,
+            height=rs_intr.height, width=rs_intr.width,
+        )
+    except Exception as e:
+        print(f"[ObjectLocalizer] cam {cam_id}: device intrinsics unavailable "
+              f"({e}); using file intrinsics")
+        intr = cam.get_cam_intrinsics()
+
+    _LIVE_INTRINSICS_CACHE[cam_id] = intr
+    return intr
+
+
 class ObjectLocalizer:
     """
     Localizes objects in 3D using multi-camera pointcloud fusion.
@@ -54,16 +100,33 @@ class ObjectLocalizer:
         Returns:
             List of color images (HxWx3 numpy arrays)
         """
-        images = []
-        for cam_id in self.camera_ids:
-            if cam_id in self.cameras:
-                img, _, _, _, _ = self.cameras[cam_id].get_next_frame()
-                images.append(img)
-        return images
+        data = self.capture_pointclouds()
+        return [data["images"][c] for c in self.camera_ids if c in data["images"]]
     
-    def capture_pointclouds(self) -> Dict:
+    def _open_camera(self, cam_id: int):
+        """Return (camera, owned). owned means this call started the pipeline."""
+        if cam_id in self.cameras:
+            return self.cameras[cam_id], False
+        import robomail.vision as vis
+        print(f"[ObjectLocalizer] opening cam {cam_id}...")
+        return vis.CameraClass(cam_number=cam_id), True
+
+    @staticmethod
+    def _close_camera(cam):
+        try:
+            cam.stop_pipeline()
+        except Exception:
+            pass
+
+    def capture_pointclouds(self, warmup: int = 8) -> Dict:
         """
-        Capture pointclouds and images from all cameras.
+        Capture colour and depth from each camera, one at a time.
+
+        Opening all four RealSense pipelines together has repeatedly wedged
+        this machine's USB controller. A static scene does not need a
+        synchronised snapshot, so each camera is started, warmed up, read,
+        and stopped before the next one starts. Persistent CameraClass
+        instances (if the caller already opened them) are reused as-is.
         
         Returns:
             Dict with 'pointclouds', 'images', 'depth_images', 'intrinsics'
@@ -74,14 +137,24 @@ class ObjectLocalizer:
         intrinsics = {}
         
         for cam_id in self.camera_ids:
-            if cam_id in self.cameras:
-                cam = self.cameras[cam_id]
-                img, depth, pc, verts, intr = cam.get_next_frame()
-                
-                pointclouds[cam_id] = pc
-                images[cam_id] = img
-                depth_images[cam_id] = depth
-                intrinsics[cam_id] = intr
+            cam, owned = self._open_camera(cam_id)
+            try:
+                n = warmup if owned else 1
+                img, depth = None, None
+                for _ in range(n):
+                    img, depth, _, _ = cam.get_next_frame(
+                        get_point_cloud=False, get_verts=False
+                    )
+                images[cam_id] = img.copy()
+                depth_images[cam_id] = depth.copy()
+                pointclouds[cam_id] = None
+                intrinsics[cam_id] = get_live_intrinsics(cam)
+            except Exception as e:
+                print(f"[ObjectLocalizer] cam {cam_id} capture failed: "
+                      f"{type(e).__name__}: {e}")
+            finally:
+                if owned:
+                    self._close_camera(cam)
         
         return {
             'pointclouds': pointclouds,
@@ -89,6 +162,12 @@ class ObjectLocalizer:
             'depth_images': depth_images,
             'intrinsics': intrinsics
         }
+
+    def _extrinsics(self, cam_id: int):
+        if cam_id in self.cameras:
+            return self.cameras[cam_id].get_cam_extrinsics()
+        from robomail.vision.cam_utils import get_cam_info
+        return get_cam_info(cam_id)[1]
     
     def get_fused_pointcloud(self) -> Optional['o3d.geometry.PointCloud']:
         """
@@ -149,42 +228,75 @@ class ObjectLocalizer:
             intrinsics = {}
             for cam_id in masks.keys():
                 if cam_id in self.cameras:
-                    intrinsics[cam_id] = self.cameras[cam_id].get_intrinsics()
+                    intrinsics[cam_id] = get_live_intrinsics(self.cameras[cam_id])
         
-        object_points = []
+        by_camera = self.get_object_points_by_camera(masks, depth_images, intrinsics)
         
-        for cam_id, mask in masks.items():
-            if cam_id not in depth_images or cam_id not in self.cameras:
-                continue
-            
-            depth = depth_images[cam_id]
-            intr = intrinsics.get(cam_id)
-            
-            if intr is None:
-                continue
-            
-            # Project masked depth to 3D
-            points_cam = self._depth_to_points(depth, mask, intr)
-            
-            if len(points_cam) == 0:
-                continue
-            
-            # Transform to world frame
-            extrinsics = self.cameras[cam_id].get_cam_extrinsics()
-            points_world = self._transform_points(points_cam, extrinsics)
-            
-            object_points.append(points_world)
-        
-        if len(object_points) == 0:
+        if not by_camera:
             return None
         
         # Combine points from all cameras
-        all_points = np.vstack(object_points)
+        all_points = np.vstack(list(by_camera.values()))
         
         # Remove outliers
         cleaned = self._remove_outliers(all_points)
         
         return cleaned
+    
+    def get_object_points_by_camera(
+        self,
+        masks: Dict[int, np.ndarray],
+        depth_images: Dict[int, np.ndarray] = None,
+        intrinsics: Dict[int, object] = None,
+    ) -> Dict[int, np.ndarray]:
+        """
+        Reconstruct the object separately for each camera.
+
+        Keeping the views separate lets callers check whether the cameras
+        actually agree before fusing them. Fusing first hides the case where
+        one view is segmenting something entirely different.
+
+        Args:
+            masks: Camera ID -> segmentation mask (HxW boolean)
+            depth_images: Camera ID -> depth image (captured fresh if omitted)
+            intrinsics: Camera ID -> intrinsics (read from cameras if omitted)
+
+        Returns:
+            Camera ID -> Nx3 array of world-frame points
+        """
+        if depth_images is None:
+            data = self.capture_pointclouds()
+            depth_images = data['depth_images']
+            intrinsics = data['intrinsics']
+        elif intrinsics is None:
+            intrinsics = {
+                cam_id: get_live_intrinsics(self.cameras[cam_id])
+                for cam_id in masks.keys()
+                if cam_id in self.cameras
+            }
+        
+        by_camera = {}
+        
+        for cam_id, mask in masks.items():
+            if cam_id not in depth_images:
+                continue
+            
+            intr = intrinsics.get(cam_id)
+            if intr is None:
+                continue
+            
+            # Project masked depth to 3D
+            points_cam = self._depth_to_points(depth_images[cam_id], mask, intr)
+            
+            if len(points_cam) == 0:
+                continue
+            
+            # Transform to world frame
+            by_camera[cam_id] = self._transform_points(
+                points_cam, self._extrinsics(cam_id)
+            )
+        
+        return by_camera
     
     def _depth_to_points(
         self, 
@@ -214,16 +326,19 @@ class ObjectLocalizer:
         if len(z) == 0:
             return np.array([]).reshape(0, 3)
         
-        # Get intrinsic parameters
-        try:
-            fx = intrinsics.fx
-            fy = intrinsics.fy
-            cx = intrinsics.ppx
-            cy = intrinsics.ppy
-        except:
-            # Fallback to typical RealSense values
-            fx = fy = 600.0
-            cx, cy = depth.shape[1] / 2, depth.shape[0] / 2
+        # perception.CameraIntrinsics exposes cx/cy; native pyrealsense2
+        # intrinsics expose ppx/ppy. Guessing here silently produces
+        # plausible-looking but wrong 3D points, so fail loudly instead.
+        fx = getattr(intrinsics, "fx", None)
+        fy = getattr(intrinsics, "fy", None)
+        cx = getattr(intrinsics, "cx", getattr(intrinsics, "ppx", None))
+        cy = getattr(intrinsics, "cy", getattr(intrinsics, "ppy", None))
+        
+        if None in (fx, fy, cx, cy):
+            raise ValueError(
+                f"Could not read fx/fy/cx/cy from intrinsics of type "
+                f"{type(intrinsics).__name__}"
+            )
         
         # Project to 3D
         x = (u - cx) * z / fx

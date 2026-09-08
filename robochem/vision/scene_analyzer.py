@@ -18,13 +18,32 @@ class SceneAnalyzer:
     and VLM for object identification.
     """
     
-    def __init__(self, sam_checkpoint: str = None, model_type: str = "vit_h"):
+    @staticmethod
+    def _encode_jpeg(image: np.ndarray) -> str:
+        """
+        Base64-encode an image for the VLM.
+
+        robomail cameras stream bgr8, which is what imencode expects, so the
+        image is passed through unconverted.
+        """
+        _, buffer = cv2.imencode('.jpg', image)
+        return base64.b64encode(buffer).decode('utf-8')
+    
+    def __init__(
+        self,
+        sam_checkpoint: str = None,
+        model_type: str = "vit_h",
+        grounding_url: str = None,
+    ):
         """
         Initialize scene analyzer.
         
         Args:
-            sam_checkpoint: Path to SAM model checkpoint
-            model_type: SAM model type ("vit_h", "vit_l", "vit_b")
+            sam_checkpoint: Path to SAM 1 checkpoint (legacy grounding path)
+            model_type: SAM 1 model type ("vit_h", "vit_l", "vit_b")
+            grounding_url: URL of the open-vocabulary grounding service. When
+                set, grounding uses a real detector instead of asking the VLM
+                for pixel bounding boxes, which it is not reliable at.
         """
         self.sam = None
         self.predictor = None
@@ -33,8 +52,15 @@ class SceneAnalyzer:
         
         self.vlm_client = OpenAI()
         
-        # Lazy load SAM to avoid loading if not needed
-        if sam_checkpoint:
+        self.grounding = None
+        if grounding_url:
+            from .grounding_client import GroundingClient
+            self.grounding = GroundingClient(grounding_url)
+            health = self.grounding.health()
+            print(f"[SceneAnalyzer] Grounding via {health.get('backend')} "
+                  f"at {grounding_url}")
+        elif sam_checkpoint:
+            # Lazy load SAM to avoid loading if not needed
             self._load_sam()
     
     def _load_sam(self):
@@ -75,6 +101,9 @@ class SceneAnalyzer:
         if cameras is None:
             cameras = list(range(2, 2 + len(images)))
         
+        if self.grounding is not None:
+            return self.grounding.segment(dict(zip(cameras, images)), object_query)
+        
         masks = {}
         confidences = {}
         
@@ -102,9 +131,7 @@ class SceneAnalyzer:
         Returns:
             Tuple of (bbox [x1, y1, x2, y2], confidence)
         """
-        # Encode image
-        _, buffer = cv2.imencode('.jpg', cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-        base64_image = base64.b64encode(buffer).decode('utf-8')
+        base64_image = self._encode_jpeg(image)
         
         prompt = f"""Find the object described as "{query}" in this image.
         
@@ -170,9 +197,10 @@ If you cannot find the object, return:
             return mask
         
         try:
-            self.predictor.set_image(image)
+            # SAM expects RGB; robomail cameras stream bgr8.
+            self.predictor.set_image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
             masks, scores, _ = self.predictor.predict(
-                box=bbox,
+                box=bbox[None, :],
                 multimask_output=True
             )
             
@@ -199,8 +227,7 @@ If you cannot find the object, return:
         if image is None:
             return {}
         
-        _, buffer = cv2.imencode('.jpg', cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-        base64_image = base64.b64encode(buffer).decode('utf-8')
+        base64_image = self._encode_jpeg(image)
         
         prompt = """Analyze this chemistry workspace scene. Identify:
 

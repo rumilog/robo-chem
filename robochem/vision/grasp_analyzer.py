@@ -38,13 +38,13 @@ class GraspAnalyzer:
             "stirrer": "handle",
             "tongs": "handle",
             
-            # Containers (usually side or top)
-            "bottle": "side",
-            "cup": "side",
-            "beaker": "side",
-            "flask": "side",
-            "bowl": "side",
-            "container": "side",
+            # Containers — upright top-down grasp (no pour tip)
+            "bottle": "top",
+            "cup": "top",
+            "beaker": "top",
+            "flask": "top",
+            "bowl": "top",
+            "container": "top",
             
             # Small objects (top grasp)
             "powder": "top",
@@ -56,7 +56,8 @@ class GraspAnalyzer:
         self, 
         object_points: np.ndarray,
         object_type: str = "unknown",
-        grasp_preference: str = "auto"
+        grasp_preference: str = "auto",
+        pitch_deg: float = 25.0,
     ) -> Optional[np.ndarray]:
         """
         Compute optimal 4x4 grasp pose for object.
@@ -65,6 +66,8 @@ class GraspAnalyzer:
             object_points: Nx3 pointcloud of object
             object_type: Semantic type (cup, bottle, spoon, etc.)
             grasp_preference: "top", "side", "handle", or "auto"
+            pitch_deg: For side grasps, tip the wrist this many degrees from
+                vertical so the cup rim clears the EEF for later pouring.
             
         Returns:
             4x4 grasp pose matrix in world frame
@@ -85,12 +88,69 @@ class GraspAnalyzer:
         if grasp_preference == "top":
             return self._compute_top_grasp(centroid, dimensions, object_points)
         elif grasp_preference == "side":
-            return self._compute_side_grasp(centroid, dimensions, object_points)
+            candidates = self._compute_side_grasp_candidates(
+                object_points, pitch_deg=pitch_deg
+            )
+            return candidates[0] if candidates else None
         elif grasp_preference == "handle":
             return self._compute_handle_grasp(object_points, centroid)
         else:
             # Default to top
             return self._compute_top_grasp(centroid, dimensions, object_points)
+
+    def compute_side_grasp_candidates(
+        self,
+        object_points: np.ndarray,
+        pitch_deg: float = 25.0,
+        spout_xy: np.ndarray = None,
+    ):
+        """
+        Pour-friendly side grasps at ``pitch_deg`` from vertical.
+
+        Closing axis stays parallel to the table. If ``spout_xy`` is given
+        (beaker), the wrist tips toward the spout and the fingers close
+        across the axis perpendicular to it so a later pour exits the spout.
+        """
+        if len(object_points) < 10:
+            return []
+        return self._compute_side_grasp_candidates(
+            object_points, pitch_deg=pitch_deg, spout_xy=spout_xy
+        )
+
+    def estimate_spout_direction_xy(self, points: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Horizontal unit vector from object centre toward the spout.
+
+        Uses the farthest XY point in the upper half of the cloud from the
+        median centre — for a beaker that outlier is the spout lip. Returns
+        None if the cloud is too round to have a clear protrusion.
+        """
+        if len(points) < 50:
+            return None
+
+        z_lo, z_hi = float(points[:, 2].min()), float(points[:, 2].max())
+        # Prefer the rim band where the spout sticks out most.
+        rim = points[points[:, 2] > z_lo + 0.45 * (z_hi - z_lo)]
+        if len(rim) < 30:
+            rim = points
+
+        centre = np.median(rim[:, :2], axis=0)
+        deltas = rim[:, :2] - centre
+        dists = np.linalg.norm(deltas, axis=1)
+        # Robust "radius" of the body vs the spout tip.
+        body_r = float(np.percentile(dists, 70))
+        tip_r = float(np.percentile(dists, 98))
+        if tip_r < body_r * 1.08:
+            print(f"[GraspAnalyzer] No clear spout protrusion "
+                  f"(body_r={body_r * 1000:.1f}mm tip_r={tip_r * 1000:.1f}mm)")
+            return None
+
+        tip = deltas[int(np.argmax(dists))]
+        direction = tip / (np.linalg.norm(tip) + 1e-9)
+        print(f"[GraspAnalyzer] Spout direction XY ≈ "
+              f"{np.round(direction, 3)} "
+              f"(protrudes {(tip_r - body_r) * 1000:.1f}mm past body)")
+        return direction
     
     def get_principal_dimensions(self, points: np.ndarray) -> np.ndarray:
         """
@@ -192,39 +252,144 @@ class GraspAnalyzer:
         
         return pose
     
+    def _compute_side_grasp_candidates(
+        self,
+        points: np.ndarray,
+        pitch_deg: float = 25.0,
+        spout_xy: np.ndarray = None,
+    ):
+        """
+        Cup/beaker grasps with finger-closing axis parallel to the table.
+
+        Without a spout: tip ±pitch around the narrow-axis closing direction.
+        With a spout: tip toward the spout only, fingers close on the axis
+        perpendicular to the spout so pour tilts liquid out the lip.
+        """
+        z_lo, z_hi = float(points[:, 2].min()), float(points[:, 2].max())
+        position = np.array([
+            float(np.median(points[:, 0])),
+            float(np.median(points[:, 1])),
+            0.5 * (z_lo + z_hi),
+        ])
+
+        pitch = np.radians(float(pitch_deg))
+        z_lift = 0.004 * abs(np.sin(pitch)) / max(abs(np.sin(np.radians(25))), 1e-3)
+
+        if spout_xy is not None:
+            spout = np.asarray(spout_xy, dtype=float)[:2]
+            spout = spout / (np.linalg.norm(spout) + 1e-9)
+            # Fingers close across the spout axis (perpendicular in XY).
+            closing0 = np.array([-spout[1], spout[0]])
+            candidates = []
+            for closing in (closing0, -closing0):
+                # Choose signed pitch so tool Z leans toward spout.
+                for signed in (pitch, -pitch):
+                    pose = self._pose_pitch_around_closing(
+                        position, closing, signed, z_lift
+                    )
+                    tip_h = pose[:2, 2].copy()
+                    if np.linalg.norm(tip_h) < 1e-6:
+                        continue
+                    tip_h = tip_h / np.linalg.norm(tip_h)
+                    if float(tip_h @ spout) > 0.3:
+                        candidates.append(pose)
+            unique = []
+            for pose in candidates:
+                if any(np.allclose(pose[:3, :3], u[:3, :3], atol=1e-3) for u in unique):
+                    continue
+                unique.append(pose)
+            print(f"[GraspAnalyzer] {len(unique)} spout-aligned grasps "
+                  f"(tip toward spout, closing ⊥ spout, ±{pitch_deg:.0f} deg)")
+            return unique
+
+        xy = points[:, :2] - np.median(points[:, :2], axis=0)
+        if len(xy) >= 10:
+            _, _, Vt = np.linalg.svd(xy, full_matrices=False)
+            closing0 = Vt[-1]
+        else:
+            closing0 = np.array([0.0, 1.0])
+        closing0 = closing0 / (np.linalg.norm(closing0) + 1e-9)
+
+        candidates = []
+        for closing in (closing0, -closing0):
+            for signed_pitch in (pitch, -pitch):
+                candidates.append(
+                    self._pose_pitch_around_closing(
+                        position, closing, signed_pitch, z_lift
+                    )
+                )
+
+        unique = []
+        for pose in candidates:
+            R = pose[:3, :3]
+            if any(np.allclose(R, u[:3, :3], atol=1e-3) for u in unique):
+                continue
+            unique.append(pose)
+
+        def lean_toward_base_score(pose):
+            return float(pose[0, 2])
+
+        unique.sort(key=lean_toward_base_score)
+        print(f"[GraspAnalyzer] {len(unique)} cup grasps: closing axis "
+              f"parallel to table, wrist tip ±{pitch_deg:.0f} deg "
+              f"(xy={np.round(position[:2], 4)}, z={position[2] + z_lift:.3f})")
+        return unique
+
+    @staticmethod
+    def _pose_pitch_around_closing(position, closing_xy, pitch_rad, z_lift):
+        """
+        Top-down cup frame pitched around the horizontal closing axis.
+
+        Tool Y (finger open/close) stays in the table plane. Tool Z tips
+        from vertical by ``pitch_rad`` around Y — that is the wrist rotation
+        that clears the rim for pouring without tilting the jaws.
+        """
+        # Closing axis: strictly horizontal.
+        y_axis = np.array([closing_xy[0], closing_xy[1], 0.0], dtype=float)
+        y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-9)
+
+        down = np.array([0.0, 0.0, -1.0])
+        # Upright along-cup axis (horizontal, ⊥ closing).
+        x0 = np.cross(y_axis, down)
+        x0 = x0 / (np.linalg.norm(x0) + 1e-9)
+
+        # Rotate x and z around y by pitch (Rodrigues).
+        c, s = np.cos(pitch_rad), np.sin(pitch_rad)
+        # z starts as down; after pitch around y: z' = c*down - s*x0
+        # (right-hand: positive pitch tips z toward -x0)
+        z_axis = c * down - s * x0
+        x_axis = c * x0 + s * down
+        z_axis = z_axis / (np.linalg.norm(z_axis) + 1e-9)
+        x_axis = x_axis / (np.linalg.norm(x_axis) + 1e-9)
+        # Re-orthonormalize y against the tipped frame.
+        y_axis = np.cross(z_axis, x_axis)
+        y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-9)
+        # Force closing back to horizontal if float drift introduced a Z.
+        y_axis[2] = 0.0
+        y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-9)
+        x_axis = np.cross(y_axis, z_axis)
+        x_axis = x_axis / (np.linalg.norm(x_axis) + 1e-9)
+        z_axis = np.cross(x_axis, y_axis)
+        z_axis = z_axis / (np.linalg.norm(z_axis) + 1e-9)
+
+        pose = np.eye(4)
+        pose[:3, 0] = x_axis
+        pose[:3, 1] = y_axis
+        pose[:3, 2] = z_axis
+        pose[:3, 3] = position
+        pose[2, 3] += z_lift
+        return pose
+
     def _compute_side_grasp(
         self, 
         centroid: np.ndarray, 
         dimensions: np.ndarray,
-        points: np.ndarray
+        points: np.ndarray,
+        pitch_deg: float = 25.0,
     ) -> np.ndarray:
-        """
-        Compute side grasp pose (for tall objects like bottles).
-        
-        The gripper approaches from the side horizontally.
-        
-        Args:
-            centroid: Object centroid
-            dimensions: Object dimensions
-            points: Object pointcloud
-            
-        Returns:
-            4x4 grasp pose matrix
-        """
-        pose = np.eye(4)
-        
-        # Position at centroid
-        pose[:3, 3] = centroid.copy()
-        
-        # Gripper approaching from +X direction
-        # Orientation: gripper fingers along Y-axis
-        pose[:3, :3] = np.array([
-            [0, 0, 1],   # X points in Z direction (forward)
-            [0, 1, 0],   # Y stays Y (gripper opening direction)
-            [-1, 0, 0]   # Z points in -X direction (up from gripper's perspective)
-        ])
-        
-        return pose
+        """Single preferred cup side-grasp (first candidate)."""
+        candidates = self._compute_side_grasp_candidates(points, pitch_deg=pitch_deg)
+        return candidates[0] if candidates else np.eye(4)
     
     def _compute_handle_grasp(
         self, 
