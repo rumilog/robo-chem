@@ -60,6 +60,8 @@ def build_stack(args):
             robot.reset_joints()
             robot.open_gripper()
 
+    print(f"Workspace Z floor: {args.workspace_min[2]:.3f} m "
+          f"(min={args.workspace_min}, max={args.workspace_max})")
     skills = SkillsExecutor(
         robot_interface=robot,
         vision_system=vision,

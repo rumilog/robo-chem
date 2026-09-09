@@ -1,13 +1,13 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-09-08
+Last updated: 2026-09-09
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
 
 ---
 
-## Working commands (validated 2026-09-08)
+## Working commands (validated 2026-09-08 / 2026-09-09)
 
 Prereqs: franka-interface/ROS up, grounding service on SAM 3, then:
 
@@ -33,6 +33,19 @@ python scripts/run_experiment.py --skill pick_up \
 - Opens gripper, **`reset_joints`** (joint-space home) before multi-cam scan
 - Upright **top** grasp (no 25° pour tip / spout align)
 - Width close = measured diameter − squeeze (`grasp=False`)
+  — soft cups still need `"force_limited": false`; default is now close-on-contact
+
+### Pick larger spoon (flat object — lower workspace floor)
+
+```bash
+python scripts/run_experiment.py --skill pick_up \
+  --workspace-min 0.25 -0.40 -0.13 \
+  --params '{"object_name":"larger spoon","z_offset":0.0,"grasp_force":1.0}'
+```
+
+- Spoon sits ~z −0.01; default workspace floor (0.015 m) clamps the grasp too high
+- `--workspace-min … -0.13` lowers the Z floor so fingers can reach the table
+- Force-limited close at 1 N (`force_limited` default True); omit large positive `z_offset`
 
 ### Pour into white paper cup
 
@@ -59,7 +72,7 @@ python scripts/run_experiment.py --skill pour \
 | SAM 3 grounding service (`perception_service/`, `weights/sam3.pt`) | Working; prefer over GroundingDINO |
 | Sequential RealSense capture (cams 2–5, one at a time) | Working — avoid streaming all four at once (USB wedge) |
 | Live factory intrinsics + board-free cube extrinsic calib | Working (~3–6 mm held-out) |
-| `pick_up` upright top grasp + reset_joints pre-scan | Working (beaker params above) |
+| `pick_up` upright top grasp + reset_joints pre-scan | Working (beaker + spoon params above) |
 | `pour` tip toward/away base + stall detection + site offsets | Working with `forward_offset=-0.08` |
 | Smoke scripts | `scripts/smoke_test_skills.py`, `scripts/smoke_test_motion.py` |
 

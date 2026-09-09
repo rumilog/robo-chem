@@ -90,19 +90,23 @@ class PickUpSkill(BaseSkill):
             "grasp_type": "top",  # upright top-down; "side" still available if needed
             "approach_height": 0.10,  # Height above object for approach
             "lift_height": 0.15,  # Height to lift after grasping
-            # Max gripper force (N). Used as a cap while driving to the
-            # target width; the stop condition is the width, not contact.
-            "grasp_force": 15.0,
+            # Max gripper force (N). With force_limited=True the jaws stop as
+            # soon as contact force hits this — keep it low for "any resistance".
+            "grasp_force": 5.0,
             # Only used when grasp_type="side" (pour-style tipped grasps).
             "pitch_deg": 0.0,
+            # Close mode: True = squeeze until contact force (good for rigid
+            # objects / flat spoons). False = close to measured diameter minus
+            # squeeze (needed for soft paper cups that give no force feedback).
+            "force_limited": True,
             # How much narrower than the measured object diameter to close
-            # (metres). Soft cups have no useful force feedback, so we aim
-            # for diameter minus this instead of "squeeze until resistance".
+            # (metres). Only used when force_limited=False.
             "squeeze": 0.004,
             # Below this fraction of the measured object width, treat the
-            # grasp as having crushed the object.
+            # grasp as having crushed the object (width-close mode only).
             "crush_fraction": 0.7,
             # World-Z shift of the grasp, metres. Negative lowers the fingers.
+            # Keep near 0 for flat objects (spoons); +0.02 floats above them.
             "z_offset": 0.0,
             # Clear the cameras before scanning via frankapy reset_joints
             # (home), not a hardcoded XYZ park.
@@ -263,58 +267,74 @@ class PickUpSkill(BaseSkill):
             return False, {
                 "error": f"No reachable grasp among {len(candidates)} candidates",
             }
-        
-        # Close to measured diameter minus squeeze. Soft paper cups give no
-        # useful contact force, so force-limited closing just keeps driving
-        # and crushes them; a fixed under-size width is the reliable stop.
+
+        force_limited = bool(params["force_limited"])
+        # Best-effort width for logging / width-close mode. Flat objects often
+        # have no cloud at grasp height — that used to abort the whole pick.
         expected = width_along_closing_axis(object_pc, grasp_pose)
-        if expected is None:
-            return False, {
-                "error": "Could not measure object width at grasp height; "
-                         "refusing to close blind on a crushable object",
-            }
+        target_width = None
 
-        max_w = params.get("max_object_width")
-        if max_w is not None and expected > float(max_w):
-            self.open_gripper()
-            return False, {
-                "error": (
-                    f"Measured width {expected * 1000:.1f}mm > "
-                    f"max_object_width {float(max_w) * 1000:.0f}mm — "
-                    f"segmentation is probably bloated; refusing false grasp"
-                ),
-                "expected_width": expected,
-            }
+        if force_limited:
+            print(f"[PickUp] Closing until contact "
+                  f"(force_limited, max {grasp_force:.1f} N)"
+                  + (f"; cloud width ~{expected * 1000:.1f}mm"
+                     if expected is not None else
+                     "; no cloud width at grasp height"))
+            if not self.close_gripper(
+                force=grasp_force, force_limited=True
+            ):
+                return False, {"error": "Failed to close gripper"}
+        else:
+            # Soft cups: no useful contact force, so aim for diameter − squeeze.
+            if expected is None:
+                return False, {
+                    "error": "Could not measure object width at grasp height; "
+                             "refusing to close blind on a crushable object "
+                             "(set force_limited=True to close on contact instead)",
+                }
 
-        # Gripper max opening is ~80mm; closing target must fit.
-        gripper_max = 0.08
-        if expected > gripper_max:
-            self.open_gripper()
-            return False, {
-                "error": (
-                    f"Measured width {expected * 1000:.1f}mm > gripper opening "
-                    f"{gripper_max * 1000:.0f}mm"
-                ),
-                "expected_width": expected,
-            }
+            max_w = params.get("max_object_width")
+            if max_w is not None and expected > float(max_w):
+                self.open_gripper()
+                return False, {
+                    "error": (
+                        f"Measured width {expected * 1000:.1f}mm > "
+                        f"max_object_width {float(max_w) * 1000:.0f}mm — "
+                        f"segmentation is probably bloated; refusing false grasp"
+                    ),
+                    "expected_width": expected,
+                }
 
-        target_width = max(0.0, expected - params["squeeze"])
-        print(f"[PickUp] Object ~{expected * 1000:.1f}mm across; "
-              f"closing to {target_width * 1000:.1f}mm "
-              f"(diameter - {params['squeeze'] * 1000:.0f}mm)...")
+            gripper_max = 0.08
+            if expected > gripper_max:
+                self.open_gripper()
+                return False, {
+                    "error": (
+                        f"Measured width {expected * 1000:.1f}mm > gripper opening "
+                        f"{gripper_max * 1000:.0f}mm"
+                    ),
+                    "expected_width": expected,
+                }
 
-        if not self.close_gripper(
-            force=grasp_force, target_width=target_width, force_limited=False
-        ):
-            return False, {"error": "Failed to close gripper"}
-        
+            target_width = max(0.0, expected - params["squeeze"])
+            print(f"[PickUp] Object ~{expected * 1000:.1f}mm across; "
+                  f"closing to {target_width * 1000:.1f}mm "
+                  f"(diameter - {params['squeeze'] * 1000:.0f}mm)...")
+
+            if not self.close_gripper(
+                force=grasp_force, target_width=target_width, force_limited=False
+            ):
+                return False, {"error": "Failed to close gripper"}
+
         self.wait(0.3)
-        
+
         gripper_width = self.get_gripper_width()
         grasped = self.gripper_is_grasped()
         print(f"[PickUp] Holding at {gripper_width * 1000:.1f}mm "
-              f"(target {target_width * 1000:.1f}mm, "
-              f"gripper_is_grasped={grasped})")
+              f"(gripper_is_grasped={grasped}"
+              + (f", target {target_width * 1000:.1f}mm" if target_width is not None
+                 else "")
+              + ")")
 
         if gripper_width < 0.008:
             self.open_gripper()
@@ -324,7 +344,8 @@ class PickUpSkill(BaseSkill):
                 "expected_width": expected,
                 "target_width": target_width,
             }
-        if gripper_width < expected * params["crush_fraction"]:
+        if (not force_limited and expected is not None
+                and gripper_width < expected * params["crush_fraction"]):
             print("[PickUp] Crush detected — opening gripper to release")
             self.open_gripper()
             return False, {
@@ -366,7 +387,8 @@ class PickUpSkill(BaseSkill):
                 "gripper_width": lifted_width,
                 "expected_width": expected,
             }
-        if expected is not None and lifted_width < expected * params["crush_fraction"]:
+        if (not force_limited and expected is not None
+                and lifted_width < expected * params["crush_fraction"]):
             print("[PickUp] Crush after lift — opening gripper to release")
             self.open_gripper()
             return False, {

@@ -123,8 +123,19 @@ class SkillsExecutor:
         """
         if skill_name not in self._skill_instances:
             skill_class = get_skill(skill_name)
+            # Top-level config (workspace_min, etc.) applies to every skill.
+            # Optional nested config[skill_name] can override per skill.
+            # Previously only config[skill_name] was passed, so --workspace-min
+            # from run_experiment was silently ignored and the 0.015 m floor stuck.
+            skill_config = {
+                k: v for k, v in self.config.items()
+                if k not in SKILL_REGISTRY
+            }
+            per_skill = self.config.get(skill_name)
+            if isinstance(per_skill, dict):
+                skill_config.update(per_skill)
             self._skill_instances[skill_name] = skill_class(
-                self.robot, self.vision, self.config.get(skill_name, {})
+                self.robot, self.vision, skill_config
             )
         
         skill = self._skill_instances[skill_name]

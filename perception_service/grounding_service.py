@@ -136,20 +136,39 @@ class GroundingDinoSamBackend:
         scores = outputs.iou_scores[0][0].cpu().numpy()
         return masks[int(np.argmax(scores))].numpy().astype(bool)
 
-    def infer(self, image_bgr: np.ndarray, prompt: str) -> dict:
+    def infer(self, image_bgr: np.ndarray, prompt: str,
+              return_all: bool = False) -> dict:
         boxes, scores = self.detect(image_bgr, prompt)
         if len(boxes) == 0:
             return {"found": False, "reason": "no detection above threshold"}
 
-        best = int(np.argmax(scores))
-        mask = self.segment_box(image_bgr, boxes[best])
+        if not return_all:
+            best = int(np.argmax(scores))
+            mask = self.segment_box(image_bgr, boxes[best])
+            return {
+                "found": True,
+                "mask": mask,
+                "score": float(scores[best]),
+                "box": [float(v) for v in boxes[best]],
+                "num_instances": int(len(boxes)),
+            }
 
+        instances = []
+        for box, score in zip(boxes, scores):
+            mask = self.segment_box(image_bgr, box)
+            instances.append({
+                "mask": mask,
+                "score": float(score),
+                "box": [float(v) for v in box],
+            })
         return {
             "found": True,
-            "mask": mask,
-            "score": float(scores[best]),
-            "box": [float(v) for v in boxes[best]],
-            "num_instances": int(len(boxes)),
+            "instances": instances,
+            "num_instances": int(len(instances)),
+            # Keep best as the primary mask for backward-compatible clients.
+            "mask": instances[int(np.argmax(scores))]["mask"],
+            "score": float(np.max(scores)),
+            "box": [float(v) for v in boxes[int(np.argmax(scores))]],
         }
 
 
@@ -174,7 +193,16 @@ class Sam3Backend:
         )
         log.info("backend ready")
 
-    def infer(self, image_bgr: np.ndarray, prompt: str) -> dict:
+    def _resize_mask(self, mask: np.ndarray, h: int, w: int) -> np.ndarray:
+        mask = mask.astype(bool)
+        if mask.shape != (h, w):
+            mask = cv2.resize(
+                mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
+            ).astype(bool)
+        return mask
+
+    def infer(self, image_bgr: np.ndarray, prompt: str,
+              return_all: bool = False) -> dict:
         self.predictor.set_image(image_bgr)
         out = self.predictor(text=[prompt])
 
@@ -189,29 +217,53 @@ class Sam3Backend:
             return {"found": False, "reason": "no masks"}
 
         mask_data = masks.data.cpu().numpy()
+        h, w = image_bgr.shape[:2]
 
         if boxes is not None and getattr(boxes, "conf", None) is not None and len(boxes.conf):
             scores = boxes.conf.cpu().numpy()
+            xyxy = boxes.xyxy.cpu().numpy()
+        else:
+            scores = np.ones(len(mask_data), dtype=float)
+            xyxy = None
+
+        if not return_all:
             best = int(np.argmax(scores))
             score = float(scores[best])
-            box = boxes.xyxy.cpu().numpy()[best].tolist()
-        else:
-            best, score, box = 0, None, None
+            box = xyxy[best].tolist() if xyxy is not None else None
+            mask = self._resize_mask(mask_data[best], h, w)
+            return {
+                "found": True,
+                "mask": mask,
+                "score": score,
+                "box": box,
+                "num_instances": int(len(mask_data)),
+            }
 
-        mask = mask_data[best].astype(bool)
-        h, w = image_bgr.shape[:2]
-        if mask.shape != (h, w):
-            mask = cv2.resize(
-                mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST
-            ).astype(bool)
-
+        instances = []
+        for i in range(len(mask_data)):
+            mask = self._resize_mask(mask_data[i], h, w)
+            box = xyxy[i].tolist() if xyxy is not None else _mask_to_box(mask)
+            instances.append({
+                "mask": mask,
+                "score": float(scores[i]),
+                "box": [float(v) for v in box] if box is not None else None,
+            })
+        best = int(np.argmax(scores))
         return {
             "found": True,
-            "mask": mask,
-            "score": score,
-            "box": box,
-            "num_instances": int(len(mask_data)),
+            "instances": instances,
+            "num_instances": int(len(instances)),
+            "mask": instances[best]["mask"],
+            "score": instances[best]["score"],
+            "box": instances[best]["box"],
         }
+
+
+def _mask_to_box(mask: np.ndarray):
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return None
+    return [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
 
 
 # ---------------------------------------------------------------- transport
