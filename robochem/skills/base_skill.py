@@ -365,7 +365,7 @@ class BaseSkill(ABC):
         return float(self.get_gripper_width())
 
     def check_still_holding(self, reference_width: float, tag: str = "Skill",
-                            drop_floor: float = 0.008,
+                            drop_floor: float = 0.003,
                             slip_fraction: float = 0.6) -> Tuple[bool, str]:
         """
         Confirm the tool is still in the gripper.
@@ -375,10 +375,15 @@ class BaseSkill(ABC):
         motions ago while the skill happily reported success. Compare against
         the width recorded when the skill started.
 
+        Thin tools (spoon handles ~7mm) sit near the old 8mm "empty" floor, so
+        emptiness is only absolute shut jaws (~3mm). A width that has not
+        collapsed relative to the start is still a hold.
+
         Returns:
             (still_holding, message)
         """
         width = self.held_width()
+        # Jaws essentially shut — nothing left, even for a thin spoon.
         if width < drop_floor:
             return False, (f"gripper closed to {width * 1000:.1f}mm — the held "
                            f"object is gone (was {reference_width * 1000:.1f}mm)")

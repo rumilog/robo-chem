@@ -9,6 +9,7 @@ Provides visual perception capabilities:
 """
 
 import numpy as np
+from itertools import combinations
 
 from .scene_analyzer import SceneAnalyzer
 from .object_localizer import ObjectLocalizer
@@ -57,6 +58,9 @@ class VisionSystem:
         self.min_object_height = min_object_height
         self.min_object_points = min_object_points
         self.labeled_cup_category = labeled_cup_category
+        # Drop labelled-cup / multi-instance masks below this SAM score before
+        # 3D consensus (cam 2 once matched baking soda at 0.39 on the wrong blob).
+        self.min_instance_score = 0.5
         
         # Initialize components
         self.scene_analyzer = SceneAnalyzer(
@@ -214,27 +218,46 @@ class VisionSystem:
         if not by_camera:
             print(f"[VisionSystem] No 3D points reconstructed for '{object_name}'")
             return None
-        
-        agreed, rejected = self._filter_by_consensus(by_camera)
+
+        # Drop weak SAM instances before consensus (wrong blob, tiny mask, etc.).
+        score_rejected = []
+        if confidences:
+            for cam_id in list(by_camera.keys()):
+                score = confidences.get(cam_id)
+                if score is not None and float(score) < self.min_instance_score:
+                    print(f"[VisionSystem] Discarded cam {cam_id} for "
+                          f"{object_name!r}: score {float(score):.2f} < "
+                          f"{self.min_instance_score}")
+                    del by_camera[cam_id]
+                    score_rejected.append(cam_id)
+        if not by_camera:
+            print(f"[VisionSystem] All cameras below score floor for "
+                  f"{object_name!r}")
+            return None
+
+        agreed, rejected = self._filter_by_consensus(
+            by_camera, confidences=confidences
+        )
+        rejected = list(score_rejected) + list(rejected)
         if not agreed:
             print(f"[VisionSystem] Cameras could not agree on '{object_name}'; "
                   f"refusing to guess a position")
             return None
         if rejected:
             print(f"[VisionSystem] Discarded cameras {rejected} for '{object_name}' "
-                  f"(disagreed with the majority)")
-        
+                  f"(low score or disagreed with the largest cluster)")
+
         points = self.object_localizer._remove_outliers(
             np.vstack([by_camera[c] for c in agreed])
         )
-        
+
         plausible, reason = self._check_plausible(points)
         if not plausible:
             print(f"[VisionSystem] Rejecting '{object_name}': {reason}")
             return None
-        
+
         self.object_localizer.cache_object(object_name, points)
-        
+
         result = {
             "points": points,
             "centroid": self.object_localizer._cached_centroids[object_name],
@@ -247,41 +270,88 @@ class VisionSystem:
         if extra:
             result.update(extra)
         return result
-    
-    def _filter_by_consensus(self, by_camera: dict):
-        """
-        Drop cameras whose reconstructed centroid disagrees with the majority.
 
-        A camera that segmented the wrong thing produces a centroid far from
-        the others. Fusing it in silently corrupts the result, so it is
-        excluded instead.
+    def _filter_by_consensus(self, by_camera: dict, confidences: dict = None):
+        """
+        Keep the largest set of cameras whose centroids all agree pairwise.
+
+        Median-of-all fails when two wrong views and two right views form
+        separate clusters: everyone is far from the global median and the
+        object is rejected. Pairwise clustering keeps the biggest agreeing
+        group. Ties break on higher mean SAM score, then higher median Z
+        (cups sit above the table; floor/label blobs often sit lower).
 
         Returns:
             (accepted_camera_ids, rejected_camera_ids)
         """
         cam_ids = sorted(by_camera.keys())
+        confidences = confidences or {}
         if len(cam_ids) == 1:
-            return cam_ids, []
-        
-        centroids = np.array([by_camera[c].mean(axis=0) for c in cam_ids])
-        median = np.median(centroids, axis=0)
-        distances = np.linalg.norm(centroids - median, axis=1)
-        
-        accepted = [c for c, d in zip(cam_ids, distances) if d <= self.consensus_tolerance]
-        rejected = [c for c, d in zip(cam_ids, distances) if d > self.consensus_tolerance]
-        
-        for c, d in zip(cam_ids, distances):
+            c = cam_ids[0]
             print(f"    cam {c}: centroid={np.round(by_camera[c].mean(axis=0), 4)} "
-                  f"dist_from_median={d:.4f}m "
-                  f"{'OK' if d <= self.consensus_tolerance else 'REJECT'}")
-        
-        # With only two views there is no majority to appeal to, so a
-        # disagreement means neither can be trusted.
-        if len(cam_ids) == 2 and rejected:
+                  f"(only view)")
+            return cam_ids, []
+
+        centroids = {
+            c: np.asarray(by_camera[c].mean(axis=0), dtype=float) for c in cam_ids
+        }
+        tol = float(self.consensus_tolerance)
+
+        def clique_key(subset):
+            scores = [float(confidences[c]) for c in subset
+                      if confidences.get(c) is not None]
+            mean_score = float(np.mean(scores)) if scores else 0.0
+            mean_z = float(np.mean([centroids[c][2] for c in subset]))
+            pair_ds = [
+                np.linalg.norm(centroids[a] - centroids[b])
+                for a, b in combinations(subset, 2)
+            ] or [0.0]
+            # Prefer: larger size, higher score, higher Z, tighter cluster.
+            return (len(subset), mean_score, mean_z, -max(pair_ds))
+
+        # Largest pairwise-agreeing cliques; among equal size, clique_key breaks ties.
+        candidates = []
+        for size in range(len(cam_ids), 0, -1):
+            for subset in combinations(cam_ids, size):
+                if all(
+                    np.linalg.norm(centroids[a] - centroids[b]) <= tol
+                    for a, b in combinations(subset, 2)
+                ):
+                    candidates.append(list(subset))
+            if candidates:
+                break
+        best = max(candidates, key=clique_key) if candidates else []
+
+        # Two cameras that disagree: neither is trustworthy.
+        if len(cam_ids) == 2 and len(best) < 2:
+            d = np.linalg.norm(centroids[cam_ids[0]] - centroids[cam_ids[1]])
+            for c in cam_ids:
+                print(f"    cam {c}: centroid={np.round(centroids[c], 4)} "
+                      f"pairwise={d:.4f}m REJECT")
             return [], cam_ids
-        
+
+        accepted = best
+        rejected = [c for c in cam_ids if c not in accepted]
+
+        for c in cam_ids:
+            if c in accepted and len(accepted) == 1:
+                print(f"    cam {c}: centroid={np.round(centroids[c], 4)} "
+                      f"OK (singleton cluster)")
+                continue
+            if c in accepted:
+                dists = [
+                    np.linalg.norm(centroids[c] - centroids[o])
+                    for o in accepted if o != c
+                ]
+                print(f"    cam {c}: centroid={np.round(centroids[c], 4)} "
+                      f"max_pair={max(dists):.4f}m OK")
+            else:
+                refs = accepted or [o for o in cam_ids if o != c]
+                d = min(np.linalg.norm(centroids[c] - centroids[o]) for o in refs)
+                print(f"    cam {c}: centroid={np.round(centroids[c], 4)} "
+                      f"dist_from_cluster={d:.4f}m REJECT")
+
         return accepted, rejected
-    
     def _check_plausible(self, points: np.ndarray):
         """
         Sanity-check a reconstructed object against physical expectations.
