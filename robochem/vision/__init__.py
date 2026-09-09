@@ -14,6 +14,7 @@ from .scene_analyzer import SceneAnalyzer
 from .object_localizer import ObjectLocalizer
 from .grasp_analyzer import GraspAnalyzer
 from .instruction_parser import InstructionParser
+from .label_resolver import LabelResolver, looks_like_label_query
 
 
 class VisionSystem:
@@ -31,6 +32,7 @@ class VisionSystem:
         max_object_extent: float = 0.35,
         min_object_height: float = -0.01,
         min_object_points: int = 50,
+        labeled_cup_category: str = "white paper cup",
     ):
         """
         Initialize the vision system.
@@ -46,12 +48,15 @@ class VisionSystem:
             min_object_height: Lowest plausible centroid height (m); guards
                 against reconstructions that land below the table
             min_object_points: Minimum surviving points for a valid detection
+            labeled_cup_category: SAM prompt used when resolving reagent labels
+                on paper under scoop-target cups
         """
         self.cameras = cameras or {}
         self.consensus_tolerance = consensus_tolerance
         self.max_object_extent = max_object_extent
         self.min_object_height = min_object_height
         self.min_object_points = min_object_points
+        self.labeled_cup_category = labeled_cup_category
         
         # Initialize components
         self.scene_analyzer = SceneAnalyzer(
@@ -70,7 +75,10 @@ class VisionSystem:
         
         self.grasp_analyzer = GraspAnalyzer()
         self.instruction_parser = InstructionParser()
-        
+        self.label_resolver = LabelResolver(
+            vlm_client=getattr(self.scene_analyzer, "vlm_client", None)
+            if self.scene_analyzer else None
+        )
     def capture_scene(self):
         """Capture images from all cameras."""
         if self.object_localizer:
@@ -89,7 +97,8 @@ class VisionSystem:
             return self.object_localizer.get_object_pointcloud(masks)
         return None
     
-    def locate(self, object_name, force_refresh: bool = False):
+    def locate(self, object_name, force_refresh: bool = False,
+               category: str = None, use_labels: bool = None):
         """
         Segment an object, reconstruct its pointcloud and cache the result.
 
@@ -97,9 +106,16 @@ class VisionSystem:
         localizer only reads from its cache, so without this step every
         get_object_centroid call returns None.
 
+        For scoop targets (reagent names on paper under white cups), pass the
+        label as ``object_name`` (e.g. ``"citric acid"``). That routes through
+        multi-instance SAM + VLM label reading unless ``use_labels=False``.
+
         Args:
             object_name: Semantic name of the object to find
             force_refresh: Re-segment even if the object is already cached
+            category: SAM category when resolving labels (default: white paper cup)
+            use_labels: Force / disable the labelled-cup path. Default None =
+                auto (label path for reagent-like names)
 
         Returns:
             Dict with points, centroid, dimensions and confidences, or None
@@ -116,7 +132,64 @@ class VisionSystem:
                 "dimensions": self.compute_dimensions(points) if points is not None else None,
                 "cached": True,
             }
-        
+
+        want_labels = (
+            use_labels if use_labels is not None
+            else looks_like_label_query(object_name)
+        )
+        if want_labels:
+            located = self.locate_labeled(
+                object_name,
+                category=category or self.labeled_cup_category,
+            )
+            if located is not None:
+                return located
+            print(f"[VisionSystem] Label match failed for {object_name!r}; "
+                  f"falling back to direct SAM prompt")
+
+        return self._locate_direct(object_name)
+
+    def locate_labeled(self, label: str, category: str = None):
+        """
+        Find the cup whose paper label matches ``label``.
+
+        Segments every instance of ``category`` (default white paper cup),
+        reads labels with the VLM, then fuses the matching cup in 3D.
+        """
+        category = category or self.labeled_cup_category
+        if self.object_localizer is None or self.scene_analyzer is None:
+            return None
+        if self.scene_analyzer.grounding is None:
+            print("[VisionSystem] locate_labeled needs the grounding service")
+            return None
+
+        data = self.object_localizer.capture_pointclouds()
+        cam_ids = [c for c in self.object_localizer.camera_ids if c in data["images"]]
+        images = {c: data["images"][c] for c in cam_ids}
+        if not images:
+            print("[VisionSystem] No camera images available")
+            return None
+
+        print(f"[VisionSystem] Resolving labelled cup {label!r} "
+              f"via category {category!r}")
+        instances = self.scene_analyzer.grounding.segment_instances(images, category)
+        if not instances:
+            print(f"[VisionSystem] No {category!r} instances found")
+            return None
+
+        masks, confidences, observed = self.label_resolver.resolve(
+            images, instances, label
+        )
+        if not masks:
+            print(f"[VisionSystem] No cup labelled {label!r} in any camera")
+            return None
+
+        return self._fuse_masks(
+            label, masks, confidences, data,
+            extra={"label_matches": observed, "category": category},
+        )
+
+    def _locate_direct(self, object_name: str):
         data = self.object_localizer.capture_pointclouds()
         cam_ids = [c for c in self.object_localizer.camera_ids if c in data["images"]]
         images = [data["images"][c] for c in cam_ids]
@@ -131,7 +204,10 @@ class VisionSystem:
         if not masks:
             print(f"[VisionSystem] '{object_name}' not detected in any of cameras {cam_ids}")
             return None
-        
+
+        return self._fuse_masks(object_name, masks, confidences, data)
+
+    def _fuse_masks(self, object_name, masks, confidences, data, extra=None):
         by_camera = self.object_localizer.get_object_points_by_camera(
             masks, depth_images=data["depth_images"], intrinsics=data["intrinsics"]
         )
@@ -159,7 +235,7 @@ class VisionSystem:
         
         self.object_localizer.cache_object(object_name, points)
         
-        return {
+        result = {
             "points": points,
             "centroid": self.object_localizer._cached_centroids[object_name],
             "dimensions": self.compute_dimensions(points),
@@ -168,6 +244,9 @@ class VisionSystem:
             "rejected_cameras": rejected,
             "cached": False,
         }
+        if extra:
+            result.update(extra)
+        return result
     
     def _filter_by_consensus(self, by_camera: dict):
         """

@@ -299,18 +299,24 @@ def health():
 def segment():
     """
     Request JSON:
-        {"prompt": "white paper cup", "images": {"2": "<b64 jpeg>", ...}}
+        {"prompt": "white paper cup", "images": {"2": "<b64 jpeg>", ...},
+         "return_all": false}
 
-    Response JSON:
+    Response JSON (return_all=false, default):
         {"prompt": ..., "backend": ..., "results": {
             "2": {"found": true, "mask": "<b64 png>", "score": 0.71,
                   "box": [...], "num_instances": 1, "area_px": 8123},
             "3": {"found": false, "reason": "..."}
         }}
+
+    With return_all=true, each found camera also includes:
+        "instances": [{"mask": "<b64 png>", "score": ..., "box": [...],
+                       "area_px": ...}, ...]
     """
     payload = request.get_json(force=True)
     prompt = payload.get("prompt")
     images = payload.get("images") or {}
+    return_all = bool(payload.get("return_all", False))
 
     if not prompt:
         return jsonify({"error": "missing 'prompt'"}), 400
@@ -331,17 +337,30 @@ def segment():
             continue
 
         try:
-            entry = backend.infer(image, prompt)
+            entry = backend.infer(image, prompt, return_all=return_all)
         except Exception as e:
             log.exception(f"inference failed on cam {cam_id}")
             results[cam_id] = {"found": False, "error": f"inference failed: {e}"}
             continue
 
         if entry.get("found"):
+            instances = entry.pop("instances", None)
             mask = entry.pop("mask")
             entry["area_px"] = int(mask.sum())
             entry["shape"] = [int(mask.shape[0]), int(mask.shape[1])]
             entry["mask"] = encode_mask(mask)
+
+            if instances is not None:
+                encoded_instances = []
+                for inst in instances:
+                    m = inst["mask"]
+                    encoded_instances.append({
+                        "mask": encode_mask(m),
+                        "score": inst.get("score"),
+                        "box": inst.get("box"),
+                        "area_px": int(m.sum()),
+                    })
+                entry["instances"] = encoded_instances
 
         entry["elapsed_s"] = round(time.time() - t0, 3)
         results[cam_id] = entry
@@ -349,10 +368,16 @@ def segment():
         log.info(
             f"cam {cam_id}: {prompt!r} found={entry.get('found')} "
             f"score={entry.get('score')} instances={entry.get('num_instances')} "
-            f"area={entry.get('area_px')} ({entry['elapsed_s']}s)"
+            f"return_all={return_all} area={entry.get('area_px')} "
+            f"({entry['elapsed_s']}s)"
         )
 
-    return jsonify({"prompt": prompt, "backend": STATE["name"], "results": results})
+    return jsonify({
+        "prompt": prompt,
+        "backend": STATE["name"],
+        "return_all": return_all,
+        "results": results,
+    })
 
 
 def main():

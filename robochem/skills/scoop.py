@@ -5,6 +5,11 @@ Transfers a measured quantity of powder out of a source container with a held
 scoop. This is how dry reagents are metered — the profile in robomail_Aliyah's
 `config/robot_profile.py` explicitly rules out metering a pour by weight.
 
+``powder_source`` should be the **reagent label** on the paper under the cup
+(e.g. ``"citric acid"``, ``"baking soda"``), not a generic ``"white paper cup"``.
+Vision segments every white paper cup, reads the labels with a VLM, then scoops
+from the matching instance.
+
 Hardened along the same lines as pick_up / pour:
   - reset_joints before scanning, world-frame rim geometry from the pointcloud
   - the drag is clamped to the measured opening, so the scoop cannot ram the wall

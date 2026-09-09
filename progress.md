@@ -47,6 +47,38 @@ python scripts/run_experiment.py --skill pick_up \
 - `--workspace-min … -0.13` lowers the Z floor so fingers can reach the table
 - Force-limited close at 1 N (`force_limited` default True); omit large positive `z_offset`
 
+### Scoop from a labelled cup (reagent name → cup instance)
+
+White paper cups sit on handwritten paper squares (`BAKING SODA`, `CITRIC ACID`,
+`RED CABBAGE POWDER`, `Water`). SAM alone cannot tell them apart; locate now:
+
+1. Segments **all** `white paper cup` instances (`return_all` on the grounding service)
+2. Asks GPT-4o which label is under each numbered cup
+3. Fuses the matching cup in 3D for scoop / pour / place
+
+**Restart the grounding service** after pulling this change (needs `return_all`).
+
+Offline check on stills (no robot):
+
+```bash
+python scripts/check_labeled_cups.py \
+  --images-dir "scene_captures/spoon graspped_20260909_155259" \
+  --label "citric acid" \
+  --out-dir diag_out/labeled_cups
+```
+
+Scoop (hold the spoon first), using the reagent label as `powder_source`:
+
+```bash
+python scripts/run_experiment.py --skill scoop \
+  --workspace-min 0.25 -0.40 -0.13 \
+  --params '{"powder_source":"citric acid","tool_length":0.08}'
+```
+
+- Measure / tune `tool_length` for the held spoon before trusting dig depth
+- Direct SAM category names (`plastic beaker`, `larger spoon`, `white paper cup`)
+  still skip the label path
+
 ### Pour into white paper cup
 
 ```bash
