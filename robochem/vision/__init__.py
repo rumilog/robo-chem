@@ -31,7 +31,7 @@ class VisionSystem:
         grounding_url: str = None,
         consensus_tolerance: float = 0.05,
         max_object_extent: float = 0.35,
-        min_object_height: float = -0.01,
+        min_object_height: float = -0.02,
         min_object_points: int = 50,
         labeled_cup_category: str = "white paper cup",
     ):

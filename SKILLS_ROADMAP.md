@@ -216,15 +216,60 @@ descend to immersion depth → walk N revolutions of discrete waypoints → lift
 
 ### `scoop` — [`robochem/skills/scoop.py`](robochem/skills/scoop.py)
 
-Clear cameras → scan → clamp drag to the opening → hover (stiff) → dig
-(compliant) → drag (compliant) → tilt bowl up **and verify** → lift (stiff).
+Clear cameras → scan → clamp drag to the opening → hover level (stiff) →
+**tilt forward and verify** → dig tilted (compliant) → drag tilted (compliant)
+→ tilt back to normal → lift level (stiff).
+
+**Bench-corrected 2026-09-11.** The first hardware attempt tilted *after* the
+drag, mirroring how `pour` originally tilted after moving to the pour site.
+That plowed the powder flat instead of collecting it — a scoop has to bite in
+at an angle before it moves through the medium, the way pour tips toward its
+site before liquid can flow. The order is now, explicitly:
+
+1. Hover level above the entry point
+2. Tilt forward `dig_tilt_deg` about the tool axis — the same role pour's tip
+   angle plays — and verify it was actually achieved (same retry pattern as
+   pour, and a hard failure if it stalls: dragging level collects nothing)
+3. Descend into the powder **tilted**, compliant
+4. Drag across the bed **tilted**, compliant
+5. Tilt back to normal (level) — recomputed via `tool_down_rotation()` rather
+   than rotating back by `-achieved`, which self-corrects: rotating about the
+   tool's own y-axis leaves that axis fixed, so re-flattening from wherever
+   the arm ended up recovers the exact pre-tilt orientation instead of
+   compounding drift. Not gated on success, the same as pour's unconditional
+   return to upright — the powder is already collected by this point.
+6. Lift straight out, level
+
+Also still true from the original design:
 
 - Drags **toward the robot base (−X)**, the same direction `pour` tips. Pulling
   toward the base keeps the elbow inside its comfortable range; pushing away
   runs into the reach limit `pour` already documented.
-- A stalled retaining tilt fails the skill — see P4.
 - Dig depth is measured from the top of the cloud *inside* the container, which
   for a part-full tub is the powder surface, not the rim.
+
+**Second bench correction, same session.** Two more things showed up on the
+first physical attempt after the reordering above:
+
+1. **The tilt direction was backwards.** `tool_tip_deg()` measures tilt
+   *magnitude* from vertical via `arccos(-R[2,2])`, which is always ≥ 0 — it
+   cannot distinguish "tilted forward" from "tilted the wrong way," only how
+   far from vertical. So the verification reported "achieved 30°" as success
+   even while the physical tilt leaned opposite to the drag direction. Fixed
+   by negating the angle passed to `rotate_about_tool_axis` for the dig tilt.
+   This is a real gap in what the magnitude check can catch — worth remembering
+   for any other skill that verifies a tool-axis rotation this way.
+2. **The dig-in motion was a straight vertical plunge with no forward
+   component.** Real digging has to already be moving into the medium as it
+   enters, not descend straight down and only then start dragging. Added
+   `dig_advance` (default 3cm, clamped to `scoop_distance`): the entry stroke
+   now moves to `dig_xy = entry_xy + drag * dig_advance` at `dig_z` in the same
+   tilted, compliant motion, and the subsequent drag covers only the remaining
+   distance to `exit_xy`.
+
+**Not yet bench-validated**: `dig_tilt_deg` (30°, direction now corrected but
+magnitude untried) and `dig_advance` (3cm) are both first-guess defaults —
+nobody has yet confirmed either number for the actual scoop in hand.
 
 ### `dispense` — [`robochem/skills/dispense.py`](robochem/skills/dispense.py)
 

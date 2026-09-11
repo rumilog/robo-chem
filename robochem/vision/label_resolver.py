@@ -69,6 +69,12 @@ def labels_match(requested: str, observed: str) -> bool:
     return overlap >= max(1, (min(len(ta), len(tb)) + 1) // 2)
 
 
+# Utensil words: any query containing one of these is a physical-object
+# query, never a reagent label. Unlike "cup"/"beaker", these never appear
+# in "cup labeled X" phrasing, so matching on the word alone is safe.
+_DIRECT_SAM_KEYWORDS = {"spoon", "scoop"}
+
+
 def looks_like_label_query(object_name: str) -> bool:
     """
     Heuristic: reagent / content names go through label matching; raw
@@ -78,6 +84,8 @@ def looks_like_label_query(object_name: str) -> bool:
     if not key:
         return False
     if key in {normalize_label(q) for q in DIRECT_SAM_QUERIES}:
+        return False
+    if set(key.split()) & _DIRECT_SAM_KEYWORDS:
         return False
     # "cup labeled X" / "labelled X" still count as label queries.
     return True

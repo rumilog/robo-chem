@@ -336,7 +336,7 @@ class PickUpSkill(BaseSkill):
                  else "")
               + ")")
 
-        if gripper_width < 0.008:
+        if gripper_width < 0.003:
             self.open_gripper()
             return False, {
                 "error": "Gripper closed on nothing",
@@ -378,8 +378,13 @@ class PickUpSkill(BaseSkill):
             return False, {"error": "Failed to lift object"}
 
         # Re-check after the lift: an object can slip out on the way up.
+        # Floor matches the "closed on nothing" check above (0.003m) — the
+        # 8mm floor this used to use was well within the range of a thin
+        # held object (e.g. a spoon's neck), so a low-force grasp that
+        # settled there was misreported as lost even while still holding it.
         lifted_width = self.get_gripper_width()
-        if lifted_width < 0.008:
+        if lifted_width < 0.003:
+            self.open_gripper()
             return False, {
                 "error": (f"Object lost during the lift: gripper went from "
                           f"{gripper_width * 1000:.1f}mm to "
