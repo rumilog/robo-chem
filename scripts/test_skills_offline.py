@@ -24,6 +24,16 @@ from pathlib import Path
 
 import numpy as np
 
+# Skill print statements use degree signs / deltas / em dashes. The bench PC
+# runs this over a UTF-8 terminal, but a plain Windows console defaults to a
+# codepage (cp1252) that can't encode them and crashes mid-run.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from robochem.skills import base_skill
@@ -265,6 +275,81 @@ def test_place_explicit_coordinates_skip_the_scan():
           abs(result["place_position"][0] - 0.45) < 1e-6
           and abs(result["place_position"][1] + 0.10) < 1e-6,
           f"{result.get('place_position')}")
+
+
+def test_place_on_top_stacks():
+    """on_top=True should stack above the target's own centre, not beside it."""
+    print("\n[place: on_top stacks instead of beside]")
+    cloud = cylinder_cloud([0.50, 0.05], base_z=0.02, height=0.10, radius=0.03)
+    vision = FakeVision({"target cup": cloud})
+    arm = FakeArm(tracking=1.0, gripper_width=0.04)
+    skill = make(PlaceSkill, vision, arm)
+    ok, result = skill.execute({"target_location": "target cup", "on_top": True})
+    check("on_top place succeeds", ok, f"{result}")
+    pos = result.get("place_position") if ok else None
+    check("on_top release sits above the target's own centre, not beside it",
+          ok and abs(pos[0] - 0.50) < 0.01 and abs(pos[1] - 0.05) < 0.01,
+          f"{pos}")
+    check("on_top release sits above the measured rim, not the bench",
+          ok and pos[2] > 0.10,
+          f"{pos}")
+
+
+def test_place_stuck_gripper_retries_then_fails():
+    """
+    A gripper that opens partially (past open_gripper's own 70%-of-target
+    check) but not past place's own 60mm release floor must retry once, and
+    still refuse to report success if it never lets go.
+    """
+    print("\n[place: gripper stuck partially open]")
+    cloud = cylinder_cloud([0.50, 0.05], base_z=0.02, height=0.10, radius=0.03)
+    vision = FakeVision({"paper cup": cloud})
+
+    class StuckOpenArm(FakeArm):
+        """goto_gripper commands to 0.08 always land short, at 58mm."""
+
+        def __init__(self):
+            super().__init__(tracking=1.0, gripper_width=0.04)
+
+        def goto_gripper(self, width=0.0, grasp=False, force=None, speed=None,
+                         block=True):
+            self.gripper_commands.append({"width": width, "grasp": grasp})
+            self.gripper_width = 0.058 if width > 0.06 else float(width)
+
+    arm = StuckOpenArm()
+    skill = make(PlaceSkill, vision, arm)
+    ok, result = skill.execute({"target_location": "paper cup"})
+    check("place fails when the gripper won't fully open", not ok, f"{result}")
+    check("place reports still holding after a stuck open",
+          result.get("still_holding") is True, f"{result}")
+    open_attempts = [c for c in arm.gripper_commands if c["width"] > 0.06]
+    check("place retried the open before giving up", len(open_attempts) >= 2,
+          f"{arm.gripper_commands}")
+
+
+def test_stir_and_scoop_refuse_below_workspace_floor():
+    """An oversized depth must be refused, not driven through the table."""
+    print("\n[stir/scoop: refuse to dig below the workspace floor]")
+    cup = cylinder_cloud([0.50, 0.0], base_z=0.02, height=0.08, radius=0.045)
+
+    vision = FakeVision({"cup": cup})
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    skill = make(StirSkill, vision, arm)
+    ok, result = skill.execute({"target_container": "cup", "stir_depth": 0.5})
+    check("stir refuses a depth below the workspace floor", not ok, f"{result}")
+    check("stir names the workspace floor in the error",
+          "workspace floor" in result.get("error", "").lower(),
+          f"{result.get('error')}")
+
+    vision2 = FakeVision({"tub": cup})
+    arm2 = FakeArm(tracking=1.0, gripper_width=0.03)
+    skill2 = make(ScoopSkill, vision2, arm2)
+    ok2, result2 = skill2.execute({"powder_source": "tub", "scoop_depth": 0.5})
+    check("scoop refuses a dig depth below the workspace floor", not ok2,
+          f"{result2}")
+    check("scoop names the workspace floor in the error",
+          "workspace floor" in result2.get("error", "").lower(),
+          f"{result2.get('error')}")
 
 
 def test_stir_clamps_to_the_opening():
@@ -565,6 +650,9 @@ def main():
     test_rim_geometry()
     test_place_does_not_drop_from_height()
     test_place_explicit_coordinates_skip_the_scan()
+    test_place_on_top_stacks()
+    test_place_stuck_gripper_retries_then_fails()
+    test_stir_and_scoop_refuse_below_workspace_floor()
     test_stir_clamps_to_the_opening()
     test_stir_detects_a_dropped_stirrer()
     test_scoop_requires_a_real_tilt()

@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python scripts/test_skills_offline.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/test_skills_offline.py)"
+    ]
+  }
+}
