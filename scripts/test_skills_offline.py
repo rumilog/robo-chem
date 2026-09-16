@@ -546,6 +546,90 @@ def test_stir_approaches_the_circle_before_walking_it():
           not ok2, f"{result2}")
 
 
+def test_stir_circle_path_geometry():
+    """The streamed path must be a real circle, eased at both ends."""
+    print("\n[stir: streamed circle path geometry]")
+    vision = FakeVision({})
+    skill = make(StirSkill, vision, FakeArm(gripper_width=0.03))
+    center = np.array([0.45, -0.05])
+    path = skill._circle_path(center, radius=0.03, z=0.25,
+                              seconds=4.0, rate_hz=50.0)
+
+    check("the path is dense enough to read as continuous", len(path) >= 200,
+          f"{len(path)} setpoints")
+    radii = [float(np.linalg.norm(np.asarray(p)[:2] - center)) for p in path]
+    check("every point sits on the circle",
+          max(abs(r - 0.03) for r in radii) < 1e-6,
+          f"radius range {min(radii):.5f}..{max(radii):.5f}")
+    check("the z plane is held", all(abs(p[2] - 0.25) < 1e-9 for p in path))
+    check("it closes the loop",
+          float(np.linalg.norm(np.asarray(path[0]) - np.asarray(path[-1]))) < 1e-6,
+          f"start={np.round(path[0], 4)}, end={np.round(path[-1], 4)}")
+
+    # Min-jerk easing: the first and last steps must be much smaller than the
+    # middle ones, so each revolution starts and ends at rest.
+    steps = [float(np.linalg.norm(np.asarray(b) - np.asarray(a)))
+             for a, b in zip(path, path[1:])]
+    mid = steps[len(steps) // 2]
+    check("it accelerates away from rest", steps[0] < mid * 0.2,
+          f"first step={steps[0] * 1000:.2f}mm vs mid={mid * 1000:.2f}mm")
+    check("it settles back to rest", steps[-1] < mid * 0.2,
+          f"last step={steps[-1] * 1000:.2f}mm vs mid={mid * 1000:.2f}mm")
+
+
+def test_stir_streams_each_revolution_as_one_motion():
+    """When streaming is available, one skill per revolution — not per point."""
+    print("\n[stir: each revolution is one streamed motion]")
+    vision = FakeVision({})
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    arm.pose.rotation = FLAT_GRASP_R.copy()
+    skill = make(StirSkill, vision, arm)
+
+    streamed = []
+
+    def fake_stream(points, rotation, seconds, rate_hz=50.0, tag="Skill",
+                    cartesian_impedance=False):
+        pts = [np.asarray(p, dtype=float) for p in points]
+        streamed.append(pts)
+        arm.pose.translation = pts[-1].copy()     # end where the path ends
+        return True, f"streamed {len(pts)} setpoints"
+
+    skill.stream_pose_path = fake_stream
+
+    ok, result = skill.execute({"in_air": True, "revolutions": 3,
+                                "stir_radius": 0.03, "seconds_per_revolution": 4.0})
+    check("streamed stir succeeds", ok, f"{result}")
+    check("it reports having run smooth", ok and result["smooth"] is True,
+          f"smooth={result.get('smooth')}")
+    check("one streamed path per revolution", len(streamed) == 3,
+          f"{len(streamed)} streamed paths")
+    check("each path is a dense circle, not a handful of waypoints",
+          all(len(p) >= 200 for p in streamed),
+          f"lengths={[len(p) for p in streamed]}")
+    check("all three revolutions counted",
+          ok and result["revolutions_completed"] == 3.0,
+          f"{result.get('revolutions_completed')}")
+
+
+def test_stir_falls_back_when_streaming_is_unavailable():
+    """No ROS -> blocking waypoints, still a successful stir."""
+    print("\n[stir: falls back to waypoints without streaming]")
+    vision = FakeVision({})
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    arm.pose.rotation = FLAT_GRASP_R.copy()
+    skill = make(StirSkill, vision, arm)
+    # FakeArm has no ROS behind it, so the real stream_pose_path returns False.
+    ok, result = skill.execute({"in_air": True, "revolutions": 1,
+                                "stir_radius": 0.03, "waypoints_per_rev": 12,
+                                "seconds_per_waypoint": 0.0})
+    check("the fallback still stirs", ok, f"{result}")
+    check("it reports NOT smooth, so the log is honest",
+          ok and result["smooth"] is False, f"smooth={result.get('smooth')}")
+    check("the revolution still completed",
+          ok and result["revolutions_completed"] == 1.0,
+          f"{result.get('revolutions_completed')}")
+
+
 def test_stir_in_air_needs_no_container():
     """The demo mode stirs in free space with no scan and no target."""
     print("\n[stir: in-air demo]")
@@ -954,6 +1038,9 @@ def main():
     test_stir_refuses_a_spoon_that_will_not_stand_up()
     test_stir_homes_before_orienting()
     test_stir_approaches_the_circle_before_walking_it()
+    test_stir_circle_path_geometry()
+    test_stir_streams_each_revolution_as_one_motion()
+    test_stir_falls_back_when_streaming_is_unavailable()
     test_stir_in_air_needs_no_container()
     test_stir_detects_a_dropped_stirrer()
     test_scoop_requires_a_real_tilt()

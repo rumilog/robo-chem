@@ -12,8 +12,9 @@ Hardened along the same lines as pick_up / pour:
   - reset_joints before scanning, then measure the rim in the world frame
   - circle radius is clamped to the measured opening, so the stirrer cannot
     scrape the wall or knock the cup over
-  - discrete blocking waypoints instead of a 50Hz stream of non-blocking
-    goto_pose calls (see _circle_waypoints for why)
+  - each revolution is traced as ONE streamed frankapy skill, so the circle is
+    continuous; pauses between revolutions are deliberate. Blocking waypoints
+    remain as the fallback wherever streaming is unavailable
   - the tool is confirmed still held before, during and after stirring
 """
 
@@ -32,7 +33,8 @@ class StirSkill(BaseSkill):
     2. Clear the cameras, scan the container, measure rim height and radius
     3. Tilt toward the base so a flat-grasped spoon stands vertical
     4. Hover over the rim centre, then descend to the immersion depth
-    5. Walk a circle as discrete blocking waypoints, for N revolutions
+    5. Approach the rim of the circle, then trace N revolutions, each one a
+       single streamed motion
     6. Lift clear, re-centre, and verify the tool is still held
     """
 
@@ -56,6 +58,14 @@ class StirSkill(BaseSkill):
             # giving that the per-waypoint dwell asks for ~0.5 m/s and the move
             # simply does not happen.
             "approach_seconds": 3.0,
+            # Trace each revolution as ONE streamed motion (frankapy dynamic
+            # mode) so the circle is continuous instead of stepping between
+            # waypoints. Pauses BETWEEN revolutions are fine — each revolution
+            # is its own skill. Falls back to blocking waypoints wherever
+            # streaming is unavailable (no ROS, dry runs, tests).
+            "smooth": True,
+            "seconds_per_revolution": 4.0,
+            "stream_rate_hz": 50.0,
             # Swing the tool's long axis from horizontal to straight down
             # before stirring. pick_up grasps a spoon lying FLAT — handle along
             # +X, away from the base — so without this the "stirrer" is held
@@ -288,54 +298,96 @@ class StirSkill(BaseSkill):
                               f"fouling the rim"),
                 }
 
-        # 5. Walk the circle.
-        waypoints = self._circle_waypoints(center, radius, stir_z,
-                                           revolutions, per_rev)
-        print(f"[Stir] Stirring: {len(waypoints)} waypoints, "
-              f"radius {radius * 1000:.0f}mm, ~{dwell:.1f}s each")
-
-        circle_tol = float(params["circle_tol"])
+        # 5. Trace the circle.
+        #
+        # Each revolution is ONE streamed skill, so the trace itself is
+        # continuous — a chain of goto_pose calls decelerates to a stop at every
+        # waypoint and visibly steps. Stopping between revolutions is fine and
+        # is what lets each one be its own skill.
+        smooth = bool(params["smooth"])
         approach_seconds = max(0.5, float(params["approach_seconds"]))
+        rev_seconds = max(0.5, float(params["seconds_per_revolution"]))
+        rate_hz = max(5.0, float(params["stream_rate_hz"]))
+        circle_tol = float(params["circle_tol"])
         completed = 0
-        for i, point in enumerate(waypoints):
-            # Waypoint 1 is an approach, not a circle step — the tool has to
-            # travel from wherever it is to the rim of the circle, which in air
-            # is the whole way down from home. Time it accordingly.
-            if i == 0:
-                gap = float(np.linalg.norm(
-                    np.asarray(self.get_current_pose().translation, dtype=float)
-                    - point))
-                seconds = approach_seconds
-                print(f"[Stir] Approaching the circle start "
-                      f"({gap * 1000:.0f}mm away) over {seconds:.1f}s...")
-            else:
-                seconds = dwell
-            if not self.goto_pose_rigid(point, rotation, duration=seconds):
-                print(f"[Stir] Waypoint {i + 1}/{len(waypoints)} command failed")
-                break
-            arrived, err = self.reached(point, circle_tol)
-            if not arrived:
-                # Not a hard failure on its own — but a big miss mid-circle
-                # means the stirrer is jammed against something.
-                phase = "approach to the circle" if i == 0 else "circle"
-                print(f"[Stir] Waypoint {i + 1} off by {err * 1000:.0f}mm "
-                      f"(tol {circle_tol * 1000:.0f}mm) — stopping the {phase}")
-                break
-            completed += 1
 
-            # A mid-stir drop is the failure this skill most needs to catch:
-            # the remaining waypoints would stir with an empty gripper and
-            # still report success.
-            if (i + 1) % per_rev == 0:
-                ok, msg = self.check_still_holding(start_width, tag="Stir")
+        # Get to the rim of the circle first, at a duration that suits the
+        # distance. In air that trip starts at home and is ~17cm; giving it a
+        # circle-step duration asks for ~0.5 m/s and the move does not happen.
+        start_point = np.array([center[0] + radius, center[1], stir_z])
+        gap = float(np.linalg.norm(
+            np.asarray(self.get_current_pose().translation, dtype=float)
+            - start_point))
+        print(f"[Stir] Approaching the circle start ({gap * 1000:.0f}mm away) "
+              f"over {approach_seconds:.1f}s...")
+        if not self.goto_pose_rigid(start_point, rotation,
+                                    duration=approach_seconds):
+            return False, {"error": "Failed to command the circle approach"}
+        arrived, err = self.reached(start_point, circle_tol)
+        if not arrived:
+            return False, {
+                "error": (f"Could not reach the start of the circle "
+                          f"(off by {err * 1000:.0f}mm)"),
+            }
+
+        streamed = False
+        if smooth:
+            print(f"[Stir] Tracing {revolutions} revolution(s), "
+                  f"{rev_seconds:.1f}s each, streamed at {rate_hz:.0f}Hz...")
+            streamed = True
+            for rev in range(1, revolutions + 1):
+                path = self._circle_path(center, radius, stir_z,
+                                         rev_seconds, rate_hz)
+                ok, msg = self.stream_pose_path(path, rotation,
+                                                seconds=rev_seconds,
+                                                rate_hz=rate_hz, tag="Stir")
                 if not ok:
-                    print(f"[Stir] {msg} — aborting mid-stir")
-                    self.goto_pose_rigid(hover, rotation, duration=3.0)
-                    return False, {
-                        "error": f"Stirrer lost during stirring: {msg}",
-                        "waypoints_completed": completed,
-                    }
+                    print(f"[Stir] Smooth trace unavailable ({msg}); "
+                          f"falling back to waypoints")
+                    streamed = False
+                    break
 
+                ok, held = self.check_still_holding(start_width, tag="Stir")
+                if not ok:
+                    print(f"[Stir] {held} — aborting mid-stir")
+                    return False, {
+                        "error": f"Stirrer lost during stirring: {held}",
+                        "revolutions_completed": float(rev - 1),
+                    }
+                completed = rev * per_rev
+                print(f"[Stir]   revolution {rev}/{revolutions} done ({msg})")
+
+        if not streamed:
+            waypoints = self._circle_waypoints(center, radius, stir_z,
+                                               revolutions, per_rev)
+            print(f"[Stir] Stirring: {len(waypoints)} waypoints, "
+                  f"radius {radius * 1000:.0f}mm, ~{dwell:.1f}s each")
+            completed = 0
+            for i, point in enumerate(waypoints):
+                if not self.goto_pose_rigid(point, rotation, duration=dwell):
+                    print(f"[Stir] Waypoint {i + 1}/{len(waypoints)} command failed")
+                    break
+                arrived, err = self.reached(point, circle_tol)
+                if not arrived:
+                    print(f"[Stir] Waypoint {i + 1} off by {err * 1000:.0f}mm "
+                          f"(tol {circle_tol * 1000:.0f}mm) — stopping the circle")
+                    break
+                completed += 1
+
+                # A mid-stir drop is the failure this skill most needs to catch:
+                # the remaining waypoints would stir with an empty gripper and
+                # still report success.
+                if (i + 1) % per_rev == 0:
+                    ok, msg = self.check_still_holding(start_width, tag="Stir")
+                    if not ok:
+                        print(f"[Stir] {msg} — aborting mid-stir")
+                        self.goto_pose_rigid(hover, rotation, duration=3.0)
+                        return False, {
+                            "error": f"Stirrer lost during stirring: {msg}",
+                            "waypoints_completed": completed,
+                        }
+
+        total_steps = revolutions * per_rev
         revolutions_done = completed / float(per_rev)
 
         # 6. Lift out along the axis we came in on. In air there is no rim to
@@ -355,9 +407,9 @@ class StirSkill(BaseSkill):
             return False, {"error": f"Stirrer lost during the lift: {msg}",
                            "revolutions_completed": revolutions_done}
 
-        if completed < len(waypoints):
+        if completed < total_steps:
             return False, {
-                "error": (f"Stir stopped early: {completed}/{len(waypoints)} "
+                "error": (f"Stir stopped early: {completed}/{total_steps} "
                           f"waypoints ({revolutions_done:.1f} of {revolutions} "
                           f"revolutions)"),
                 "revolutions_completed": revolutions_done,
@@ -379,8 +431,32 @@ class StirSkill(BaseSkill):
             "requested_radius": requested_radius,
             "rim_radius": rim_radius,
             "stir_depth": stir_depth,
-            "waypoints": len(waypoints),
+            "smooth": streamed,
+            "seconds_per_revolution": rev_seconds if streamed else None,
         }
+
+    def _circle_path(self, center_xy: np.ndarray, radius: float, z: float,
+                     seconds: float, rate_hz: float) -> List[np.ndarray]:
+        """
+        Dense points for one streamed revolution, swept with min-jerk timing.
+
+        Constant angular velocity would jerk at the start and end of every
+        revolution, because the tool is at rest either side. Easing the ANGLE
+        through a min-jerk profile means the trace accelerates away from rest
+        and settles back into it, which is what makes stopping between
+        revolutions look deliberate rather than like a stall.
+        """
+        n = max(2, int(round(seconds * rate_hz)))
+        path: List[np.ndarray] = []
+        for i in range(n + 1):
+            t = seconds * (i / float(n))
+            angle = 2.0 * np.pi * self.min_jerk_fraction(t, seconds)
+            path.append(np.array([
+                center_xy[0] + radius * np.cos(angle),
+                center_xy[1] + radius * np.sin(angle),
+                z,
+            ]))
+        return path
 
     @staticmethod
     def _circle_waypoints(center_xy: np.ndarray, radius: float, z: float,

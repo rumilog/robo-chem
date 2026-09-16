@@ -59,3 +59,7 @@ Thumbs.db
 # Logs
 *.log
 logs/
+
+# Local Python environments (built by scripts/setup_sim.sh; never committed)
+perception_env/
+sim_env/

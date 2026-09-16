@@ -181,11 +181,13 @@ the `VisionSystem` surface, so `SkillsExecutor` is unmodified. The simulator has
 ### Setup (once)
 
 ```bash
-perception_env/bin/pip install mujoco robot_descriptions
+bash scripts/setup_sim.sh
 ```
 
-The Panda MJCF is fetched and cached under `~/.cache/robot_descriptions/` on
-first use.
+Reuses `perception_env/` if present, otherwise builds `sim_env/`; installs the
+dependencies, pre-fetches the Panda MJCF into `~/.cache/robot_descriptions/`,
+and runs the smoke test. Full setup notes, including a fresh machine after a
+`git pull`, are in [`robochem/sim/README.md`](robochem/sim/README.md).
 
 ### Run a skill in the viewer
 
@@ -271,7 +273,7 @@ perception_env/bin/python scripts/smoke_test_sim.py --viewer --speed 2
 | [`progress.md`](progress.md) | Current validated commands, design choices, known issues |
 | [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) | Broader architecture plan |
 | [`SKILLS_ROADMAP.md`](SKILLS_ROADMAP.md) | Skill hardening roadmap |
-| [`robochem/sim/`](robochem/sim/) | MuJoCo preview of the cell (no robot, no cage) |
+| [`robochem/sim/README.md`](robochem/sim/README.md) | MuJoCo preview of the cell: setup, usage, troubleshooting |
 | [`robomail/docs/progress.md`](robomail/docs/progress.md) | Older PLATO / agent-pipeline notes |
 
 ---
