@@ -1,6 +1,6 @@
 # Skills roadmap — what the agent stack needs, and how to build it
 
-Last updated: 2026-09-08
+Last updated: 2026-09-16
 
 Two halves of this project are converging:
 
@@ -30,8 +30,8 @@ ever ask for.
 | --- | --- | --- | --- |
 | `PICKUP` | Grasp an object (tool or container) and lift it | `pick_up` | **Bench-validated** |
 | `POUR` | Tip a held container so its contents flow into a target | `pour` | **Bench-validated** |
-| `PLACE` | Set a held object down and release, freeing the gripper | `place` | **Rewritten, needs bench time** |
-| `SCOOP` | Use a held scoop to transfer a measured quantity of powder | `scoop` | **Rewritten, needs bench time** |
+| `PLACE` | Set a held object down and release, freeing the gripper | `place` | **Bench-validated 2026-09-11** |
+| `SCOOP` | Use a held scoop to transfer a measured quantity of powder | `scoop` | **Bench-tuned 2026-09-16** (4 runs — see §3) |
 | `STIR` | Agitate a container's contents with a held implement | `stir` | **Rewritten, needs bench time** |
 | `PIPETTE_DISPENSE` | Use a held pipette to **draw and release** a small volume | `dispense` | **Rewritten, needs bench time** |
 
@@ -39,7 +39,8 @@ ever ask for.
 none of them had been through the hardening that `pick_up` and `pour` went
 through — they used fire-and-forget motion, misread object height, and returned
 `success=True` regardless of what the arm did. All four are now rewritten
-(§3–§4) and pass 57 offline checks; none has yet run on the robot.
+(§3–§4) and pass 79 offline checks. `place` and `scoop` have since been
+bench-validated; `stir` and `dispense` have not yet run on the robot.
 
 `PLACE` deserves emphasis. The robot profile
 (`robomail_Aliyah/config/robot_profile.py`) states *"Only ONE object may be held
@@ -113,19 +114,30 @@ Tolerances are not uniform, and the reason matters:
 while having commanded 90°. Now the tip is measured after every step and a
 shortfall fails the skill.
 
-Generalise: **measure the thing the skill exists to achieve.** `scoop`'s
-retaining tilt is measured, not assumed — an untilted bowl spills its powder on
-the way out, so an unverified tilt is not a successful scoop.
+Generalise: **measure the thing the skill exists to achieve.** `scoop`'s bite
+tilt is measured before it commits to the powder — pushing level collects
+nothing, so an unverified tilt is not a scoop worth attempting.
+
+**But know what your measurement cannot see.** `tool_tip_deg()` is an `arccos`
+magnitude: it reports *how far* from vertical, never *which way*. A tilt in
+exactly the wrong direction passes it cleanly. `scoop` shipped that bug to the
+bench twice. Where direction matters, check a signed quantity — `pour` checks
+`lean·dir` against its intended lean vector, which is the pattern to copy.
 
 ### P5. Retry a lagging step before giving up
 
 frankapy often needs a second, longer `goto_pose` before the wrist tracks a
 commanded orientation. `pour` retries each tip step up to `step_retries` times
-with a lengthening duration; `scoop` does the same for its tilt.
+with a lengthening duration; `scoop` does the same for its bite tilt.
 
 Retry the **remaining** delta, not the original command —
 `rotate_about_tool_axis` is relative, so re-commanding the full angle stacks
 rotations and overshoots.
+
+Better still, where a *sequence* of orientations is needed, compute them
+analytically against a fixed reference and command absolute targets — see
+`scoop.tool_y_delta` and its use across the push. Absolute targets are
+idempotent under retry; relative nudges are not.
 
 ### P6. Tool-frame rotation for anything gripper-relative
 
@@ -216,60 +228,95 @@ descend to immersion depth → walk N revolutions of discrete waypoints → lift
 
 ### `scoop` — [`robochem/skills/scoop.py`](robochem/skills/scoop.py)
 
-Clear cameras → scan → clamp drag to the opening → hover level (stiff) →
-**tilt forward and verify** → dig tilted (compliant) → drag tilted (compliant)
-→ tilt back to normal → lift level (stiff).
+Clear cameras → scan → clamp stroke to the opening → hover level (stiff) →
+**tilt forward and verify** → plunge in while advancing (tilted, compliant) →
+**push away from the base, rolling back to level over the last stretch**
+(compliant waypoints) → lift level (stiff).
 
-**Bench-corrected 2026-09-11.** The first hardware attempt tilted *after* the
-drag, mirroring how `pour` originally tilted after moving to the pour site.
-That plowed the powder flat instead of collecting it — a scoop has to bite in
-at an angle before it moves through the medium, the way pour tips toward its
-site before liquid can flow. The order is now, explicitly:
+This one took four hardware runs to get right, and every correction is worth
+recording because none of them were visible offline.
 
-1. Hover level above the entry point
-2. Tilt forward `dig_tilt_deg` about the tool axis — the same role pour's tip
-   angle plays — and verify it was actually achieved (same retry pattern as
-   pour, and a hard failure if it stalls: dragging level collects nothing)
-3. Descend into the powder **tilted**, compliant
-4. Drag across the bed **tilted**, compliant
-5. Tilt back to normal (level) — recomputed via `tool_down_rotation()` rather
-   than rotating back by `-achieved`, which self-corrects: rotating about the
-   tool's own y-axis leaves that axis fixed, so re-flattening from wherever
-   the arm ended up recovers the exact pre-tilt orientation instead of
-   compounding drift. Not gated on success, the same as pour's unconditional
-   return to upright — the powder is already collected by this point.
-6. Lift straight out, level
+**Run 1 — the tilt was in the wrong place.** The original design dragged level
+and only tilted *afterwards*, to retain the powder for the lift. That plows the
+powder flat instead of collecting it. A scoop has to bite in at an angle before
+it moves through the medium, the way pour tips toward its site before liquid
+can flow. Moved the tilt ahead of the stroke.
 
-Also still true from the original design:
+**Run 2 — the tilt direction was backwards, and nothing could have caught it.**
+`tool_tip_deg()` measures tilt *magnitude* from vertical via `arccos(-R[2,2])`,
+which is always ≥ 0. It cannot distinguish "tilted forward" from "tilted the
+wrong way" — only how far from vertical. So the verification reported "achieved
+30° of 30° commanded" as a clean success while the wrist leaned the opposite
+way. Fixed by negating the angle into `rotate_about_tool_axis`. **This blind
+spot applies to any skill that verifies a tool-axis rotation by magnitude** —
+pour avoids it by construction, because it tips toward a computed lean vector
+and checks `lean·dir`, not a bare angle.
 
-- Drags **toward the robot base (−X)**, the same direction `pour` tips. Pulling
-  toward the base keeps the elbow inside its comfortable range; pushing away
-  runs into the reach limit `pour` already documented.
-- Dig depth is measured from the top of the cloud *inside* the container, which
-  for a part-full tub is the powder surface, not the rim.
+**Run 2 also — the plunge had no forward component.** It descended straight
+down and only then started moving. Real digging is already moving into the
+medium as it enters. Added `dig_advance`: the entry stroke carries travel.
 
-**Second bench correction, same session.** Two more things showed up on the
-first physical attempt after the reordering above:
+**Run 3 — the push disappeared.** `dig_advance` was subtracted out of a total
+`scoop_distance`, so passing `scoop_distance == dig_advance` silently produced
+a zero-length push. Replaced the derived arithmetic with two independent
+distances, `dig_advance` and `drag_distance`, because a parameter that can
+silently zero out another one is a bad parameter. `scoop_distance` is now
+rejected with a message naming its replacements rather than being ignored.
 
-1. **The tilt direction was backwards.** `tool_tip_deg()` measures tilt
-   *magnitude* from vertical via `arccos(-R[2,2])`, which is always ≥ 0 — it
-   cannot distinguish "tilted forward" from "tilted the wrong way," only how
-   far from vertical. So the verification reported "achieved 30°" as success
-   even while the physical tilt leaned opposite to the drag direction. Fixed
-   by negating the angle passed to `rotate_about_tool_axis` for the dig tilt.
-   This is a real gap in what the magnitude check can catch — worth remembering
-   for any other skill that verifies a tool-axis rotation this way.
-2. **The dig-in motion was a straight vertical plunge with no forward
-   component.** Real digging has to already be moving into the medium as it
-   enters, not descend straight down and only then start dragging. Added
-   `dig_advance` (default 3cm, clamped to `scoop_distance`): the entry stroke
-   now moves to `dig_xy = entry_xy + drag * dig_advance` at `dig_z` in the same
-   tilted, compliant motion, and the subsequent drag covers only the remaining
-   distance to `exit_xy`.
+**Run 4 — direction, and the un-tilt belongs inside the push.** Two changes:
 
-**Not yet bench-validated**: `dig_tilt_deg` (30°, direction now corrected but
-magnitude untried) and `dig_advance` (3cm) are both first-guess defaults —
-nobody has yet confirmed either number for the actual scoop in hand.
+- The stroke now pushes **away from the robot base (+X)**, not toward it. (The
+  earlier note here claiming toward-base was needed for reach was wrong for
+  this motion — that constraint came from `pour`, where the payload is a full
+  container at arm's length, not a scoop inside a cup.)
+- The roll back to level happens **during** the push, blended across the last
+  `untilt_over` metres, rather than as a separate step after the motion stops.
+  Closing the bowl over the powder while it is still moving is what keeps the
+  load on; stopping and then flicking upright drops it back in the cup.
+
+**Run 5 — the push is continuous, not subdivided.** The first version of the
+blend walked eight discrete waypoints and visibly stepped, because each one
+decelerated to a stop. frankapy's `goto_pose` is *already* a min-jerk
+interpolation of translation **and** orientation, so subdivision buys nothing
+here. The push is now two `goto_pose` calls:
+
+| Segment | Motion | Why two, not one |
+| --- | --- | --- |
+| A | translate `drag_distance − untilt_over` at the full bite angle | a single min-jerk segment interpolates orientation monotonically end-to-end, so it cannot hold an angle and *then* roll off |
+| B | translate the last `untilt_over` while rotating to level | |
+
+Setting `untilt_over == drag_distance` collapses this to one unbroken motion
+that rolls level across the whole push. Segment durations split proportionally
+to distance out of `push_seconds`.
+
+Note this does **not** contradict P11 (stir's blocking waypoints). That lesson
+is about a 50 Hz *non-blocking* stream, where frankapy starts and cancels
+hundreds of skills a second. A handful of blocking min-jerk segments is the
+opposite situation — and where the motion should read as continuous, fewer is
+better.
+
+The target orientations are computed analytically — `level_rotation @
+tool_y_delta(-angle)` — rather than by issuing relative nudges and hoping they
+compose. The final target is exactly `level_rotation`, so the stroke ends level
+by construction rather than by a convergence loop.
+
+| Parameter | Default | Role |
+| --- | --- | --- |
+| `dig_advance` | 20 mm | Forward travel during the tilted plunge |
+| `drag_distance` | 40 mm | The push, away from the base |
+| `untilt_over` | 20 mm | Tail of the push across which tilt → level |
+| `dig_tilt_deg` | 30° | Bite angle (direction corrected run 2) |
+| `push_seconds` | 3.0 s | Duration of the push, split across its segments by distance |
+| `wall_clearance` | 10 mm | Lowered from 15 mm — it was clamping strokes that fit |
+
+The whole stroke (`dig_advance + drag_distance`) is clamped to the measured
+opening, scaling both parts together so their ratio survives. Dig depth is
+measured from the top of the cloud *inside* the container, which for a
+part-full tub is the powder surface, not the rim.
+
+**Still not confirmed**: whether 30° is the right bite angle, and whether the
+quantity collected is repeatable. Nothing weighs the scoop — `quantity_measured`
+is `False` for a reason.
 
 ### `dispense` — [`robochem/skills/dispense.py`](robochem/skills/dispense.py)
 
@@ -353,7 +400,7 @@ the bottom of the cup.
 | --- | --- | --- | --- |
 | `wall_clearance` | `stir` | 12 mm | Conservative. A 13 mm-radius cup leaves only 1 mm of usable radius and the skill refuses — lower it once the stirrer's real width is known |
 | `squeeze_amount` | `dispense` | 3 mm | Enough to deform a bulb? Unknown until tried |
-| `scoop_depth` / `scoop_distance` | `scoop` | 15 mm / 40 mm | Both nominal; they set the quantity, which nothing measures |
+| `scoop_depth` | `scoop` | 15 mm | Nominal; with `dig_advance`/`drag_distance` it sets the quantity, which nothing measures |
 | `release_clearance` | `place` | 20 mm | Soft cups may need more; a rigid beaker less |
 
 ---

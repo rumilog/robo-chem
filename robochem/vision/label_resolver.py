@@ -35,6 +35,17 @@ DIRECT_SAM_QUERIES = {
     "small spoon",
     "spoon",
     "scoop",
+    # stir / dispense tools. Without these a pick_up of a stirrer or pipette
+    # burns a full multi-camera capture plus one VLM label read per camera
+    # trying to match the tool name against the reagent labels, before falling
+    # back to the direct prompt anyway.
+    "pipette",
+    "dropper",
+    "eye dropper",
+    "stirrer",
+    "stirring rod",
+    "glass rod",
+    "spatula",
 }
 
 
@@ -72,7 +83,8 @@ def labels_match(requested: str, observed: str) -> bool:
 # Utensil words: any query containing one of these is a physical-object
 # query, never a reagent label. Unlike "cup"/"beaker", these never appear
 # in "cup labeled X" phrasing, so matching on the word alone is safe.
-_DIRECT_SAM_KEYWORDS = {"spoon", "scoop"}
+_DIRECT_SAM_KEYWORDS = {"spoon", "scoop", "pipette", "dropper", "stirrer",
+                        "stirring", "spatula"}
 
 
 def looks_like_label_query(object_name: str) -> bool:

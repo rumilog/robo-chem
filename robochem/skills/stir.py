@@ -5,6 +5,10 @@ Agitates the contents of a container with a held stirrer, without transferring
 anything between containers.
 
 Hardened along the same lines as pick_up / pour:
+  - homes first, still holding the tool, so the uprighting tilt has full wrist
+    travel — from the pose pick_up leaves out over the bench it does not
+  - a 90 deg tilt toward the base stands a flat-grasped spoon up, verified
+    against straight down rather than by an angle magnitude
   - reset_joints before scanning, then measure the rim in the world frame
   - circle radius is clamped to the measured opening, so the stirrer cannot
     scrape the wall or knock the cup over
@@ -16,7 +20,7 @@ Hardened along the same lines as pick_up / pour:
 from typing import Dict, Any, Tuple, List
 import numpy as np
 
-from .base_skill import BaseSkill
+from .base_skill import BaseSkill, _orthonormalize
 
 
 class StirSkill(BaseSkill):
@@ -26,7 +30,7 @@ class StirSkill(BaseSkill):
     Pipeline:
     1. Record held width; the stirrer must survive the whole motion
     2. Clear the cameras, scan the container, measure rim height and radius
-    3. Flatten the wrist so the stirrer hangs vertically
+    3. Tilt toward the base so a flat-grasped spoon stands vertical
     4. Hover over the rim centre, then descend to the immersion depth
     5. Walk a circle as discrete blocking waypoints, for N revolutions
     6. Lift clear, re-centre, and verify the tool is still held
@@ -41,8 +45,41 @@ class StirSkill(BaseSkill):
             "revolutions": 3,          # How many full circles to walk
             "stir_radius": 0.015,      # Requested circle radius (metres)
             "stir_depth": 0.03,        # Immersion below the rim (metres)
-            "waypoints_per_rev": 8,    # Discrete stops around each circle
-            "seconds_per_waypoint": 0.6,
+            # A circle cannot be one min-jerk move (those interpolate straight
+            # lines), so unlike scoop's push this genuinely needs subdividing.
+            # More, shorter waypoints read as smoother.
+            "waypoints_per_rev": 12,
+            "seconds_per_waypoint": 0.4,
+            # Time for the one long move that gets the tool from wherever it is
+            # to the start of the circle. This is NOT a circle step: in-air runs
+            # start at the home pose, which can be 20cm from the circle, and
+            # giving that the per-waypoint dwell asks for ~0.5 m/s and the move
+            # simply does not happen.
+            "approach_seconds": 3.0,
+            # Swing the tool's long axis from horizontal to straight down
+            # before stirring. pick_up grasps a spoon lying FLAT — handle along
+            # +X, away from the base — so without this the "stirrer" is held
+            # horizontally and cannot enter a cup at all.
+            # reset_joints to home BEFORE the orientation swing. pick_up
+            # leaves the arm out over the object it just grasped, which is the
+            # reach where the wrist runs out of range mid-swing; from home it
+            # has its full travel. Safe while holding — pour homes with a full
+            # beaker in the jaws. Does NOT touch the gripper, unlike
+            # run_experiment's --reset flag.
+            "home_first": True,
+            # Tilt the tool toward the base to bring the handle vertical.
+            # pick_up grasps a spoon lying FLAT with the handle pointing away
+            # from the base, so a 90deg tilt toward the base drops it to
+            # straight down. Same primitive and sign convention as scoop's
+            # bite tilt, just a quarter turn instead of 30deg.
+            "verticalize": True,
+            "verticalize_deg": 90.0,
+            "orient_tol_deg": 15.0,
+            "orient_retries": 3,
+            # Demo / dry-run: skip the scan and stir in free space, so the
+            # motion can be watched without a container under the tool.
+            "in_air": False,
+            "air_height": None,        # Z for the in-air circle; None = current
             "approach_height": 0.10,
             "lift_height": 0.10,
             "reset_before_scan": True,
@@ -63,9 +100,12 @@ class StirSkill(BaseSkill):
         }
 
     def check_preconditions(self, params: Dict[str, Any]) -> Tuple[bool, str]:
-        valid, msg = self.validate_params(params)
-        if not valid:
-            return False, msg
+        # An in-air demo has nothing to aim at, so target_container is not
+        # required there — everywhere else it still is.
+        if not params.get("in_air", False):
+            valid, msg = self.validate_params(params)
+            if not valid:
+                return False, msg
 
         if not self.is_gripper_holding():
             return False, "Gripper is not holding anything. Pick up a stirrer first."
@@ -77,7 +117,7 @@ class StirSkill(BaseSkill):
 
     def execute(self, params: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
         params = self.get_params_with_defaults(params)
-        target = params["target_container"]
+        target = params.get("target_container")
         revolutions = int(params["revolutions"])
         requested_radius = float(params["stir_radius"])
         stir_depth = float(params["stir_depth"])
@@ -85,102 +125,201 @@ class StirSkill(BaseSkill):
         dwell = float(params["seconds_per_waypoint"])
         tool_length = float(params["tool_length"])
         wall_clearance = float(params["wall_clearance"])
+        in_air = bool(params["in_air"])
+        verticalize = bool(params["verticalize"])
+        verticalize_deg = float(params["verticalize_deg"])
+        orient_tol = float(params["orient_tol_deg"])
+        orient_retries = max(1, int(params["orient_retries"]))
 
-        print(f"[Stir] Starting stir in '{target}': {revolutions} revolutions")
+        where = "mid air" if in_air else f"'{target}'"
+        print(f"[Stir] Starting stir in {where}: {revolutions} revolutions")
 
         start_width = self.held_width()
         print(f"[Stir] Holding stirrer at {start_width * 1000:.1f}mm")
 
-        # 1. Clear the cameras and scan.
-        if not self.clear_cameras(params, tag="Stir"):
-            return False, {"error": "Failed to clear the cameras before scanning"}
+        # 0. Home first, still holding the tool. The swing below needs wrist
+        # travel that the post-pick pose out over the bench does not have.
+        if bool(params["home_first"]):
+            print("[Stir] reset_joints (home) before orienting — keeping hold "
+                  "of the tool...")
+            if not self.go_home():
+                return False, {"error": "Failed to reset_joints before orienting"}
+            self.wait(0.4)
+            ok, msg = self.check_still_holding(start_width, tag="Stir")
+            if not ok:
+                return False, {"error": f"Lost the stirrer while homing: {msg}"}
 
-        self.vision.clear_cache()
-        located = self.locate_container(target, force_refresh=True)
-        if located is None:
-            return False, {"error": f"Cannot locate '{target}'"}
+        # 1. Stand the spoon up before anything else.
+        #
+        # pick_up takes a spoon lying flat with a top grasp, which leaves the
+        # handle horizontal along +X, pointing away from the base, with tool Z
+        # down. A horizontal spoon cannot go into a cup.
+        if verticalize:
+            # Tilt toward the base about the tool's own closing axis. From the
+            # flat grasp (handle out along +X) a quarter turn drops the handle
+            # to straight down. Negative for the same reason scoop's bite tilt
+            # is negative — the un-negated direction goes the other way.
+            #
+            # Retry the REMAINING angle, never the original command: the wrist
+            # lags, and rotate_about_tool_axis is relative, so re-issuing the
+            # full 90deg would stack rotations past vertical.
+            #
+            # Verified with tool_long_axis_deg, which measures the handle
+            # against straight down and separates 0deg (down) from 180deg (up).
+            # tool_tip_deg would not — it is an arccos magnitude, the blind
+            # spot that let the scoop tilt run backwards while reporting
+            # success.
+            print(f"[Stir] Tilting {verticalize_deg:.0f}° toward the base to "
+                  f"stand the spoon up (handle {self.tool_long_axis_deg():.1f}° "
+                  f"from down)...")
+            for attempt in range(1, orient_retries + 1):
+                remaining = self.tool_long_axis_deg()
+                if remaining <= orient_tol:
+                    break
+                if not self.rotate_about_tool_axis(-remaining, axis="y"):
+                    return False, {"error": "Failed to command the tilt"}
+                self.wait(0.3)
+                print(f"[Stir]   attempt {attempt}/{orient_retries}: handle "
+                      f"{self.tool_long_axis_deg():.1f}° from down")
+
+            handle = self.tool_long_axis_deg()
+            if handle > orient_tol:
+                return False, {
+                    "error": (f"Could not stand the spoon up: handle is "
+                              f"{handle:.1f}° from straight down after "
+                              f"{orient_retries} attempts (tol {orient_tol:.0f}°). "
+                              f"{'It is pointing UP, not down. ' if handle > 120 else ''}"
+                              f"A horizontal spoon cannot enter a container."),
+                    "long_axis_deg": handle,
+                }
+            print(f"[Stir] Spoon vertical ({handle:.1f}° from down)")
+
+        rotation = _orthonormalize(
+            np.asarray(self.get_current_pose().rotation, dtype=float)
+        )
 
         ok, msg = self.check_still_holding(start_width, tag="Stir")
         if not ok:
-            return False, {"error": f"Lost the stirrer before stirring: {msg}"}
+            return False, {"error": f"Lost the stirrer while orienting: {msg}"}
 
-        rim_center = located["rim_center"]
-        rim_z = located["top_z"]
-        rim_radius = located["rim_radius"]
-        print(f"[Stir] '{target}' rim centre {np.round(rim_center, 4)}, "
-              f"z={rim_z:.4f}, radius {rim_radius * 1000:.0f}mm")
+        # 2. Work out where the circle goes.
+        if in_air:
+            # Demo mode: no container, no scan. Stir in free space so the
+            # motion can be watched. Nothing is clamped because nothing is
+            # there to hit — which is exactly why this is not a real stir.
+            here = np.asarray(self.get_current_pose().translation, dtype=float)
+            air_height = params.get("air_height")
+            stir_z = float(air_height) if air_height is not None else float(here[2])
+            center = np.array([here[0], here[1]])
+            radius = requested_radius
+            rim_radius = None
+            print(f"[Stir] IN-AIR DEMO — no container, no scan. Circling "
+                  f"{radius * 1000:.0f}mm at {np.round(center, 4)}, z={stir_z:.4f}")
+        else:
+            if not self.clear_cameras(params, tag="Stir"):
+                return False, {"error": "Failed to clear the cameras before scanning"}
 
-        # 2. Clamp the circle to what the opening can actually take.
-        max_radius = max(0.0, rim_radius - wall_clearance)
-        radius = min(requested_radius, max_radius)
-        if radius < requested_radius:
-            print(f"[Stir] Clamping stir radius {requested_radius * 1000:.0f}mm -> "
-                  f"{radius * 1000:.0f}mm (opening {rim_radius * 1000:.0f}mm minus "
-                  f"{wall_clearance * 1000:.0f}mm wall clearance)")
-        if radius < 0.003:
-            return False, {
-                "error": (f"'{target}' opening is only "
-                          f"{rim_radius * 1000:.0f}mm across — no room to stir "
-                          f"without hitting the wall"),
-                "rim_radius": rim_radius,
-            }
+            self.vision.clear_cache()
+            located = self.locate_container(target, force_refresh=True)
+            if located is None:
+                return False, {"error": f"Cannot locate '{target}'"}
 
-        # 3. Vertical tool, TCP raised by the tool length so the *tip* ends up
-        # at the requested depth rather than the gripper.
-        rotation = self.tool_down_rotation()
-        stir_z = rim_z - stir_depth + tool_length
-        if stir_z < self.workspace_min[2]:
-            return False, {
-                "error": (f"Stir depth would put the wrist at z={stir_z:.3f}, "
-                          f"below the workspace floor {self.workspace_min[2]:.3f}"),
-            }
+            ok, msg = self.check_still_holding(start_width, tag="Stir")
+            if not ok:
+                return False, {"error": f"Lost the stirrer before stirring: {msg}"}
 
-        hover = np.array([rim_center[0], rim_center[1],
-                          rim_z + float(params["approach_height"]) + tool_length])
-        print(f"[Stir] Hovering above the opening at {np.round(hover, 4)}...")
-        if not self.goto_pose_rigid(hover, rotation, duration=3.0):
-            return False, {"error": "Failed to command hover pose"}
-        arrived, err = self.reached(hover, float(params["hover_tol"]))
-        if not arrived:
-            return False, {
-                "error": (f"Hover above '{target}' unreachable "
-                          f"(off by {err * 1000:.0f}mm)"),
-            }
+            center = located["rim_center"]
+            rim_z = located["top_z"]
+            rim_radius = located["rim_radius"]
+            print(f"[Stir] '{target}' rim centre {np.round(center, 4)}, "
+                  f"z={rim_z:.4f}, radius {rim_radius * 1000:.0f}mm")
 
-        # 4. Descend into the container.
-        entry = np.array([rim_center[0], rim_center[1], stir_z])
-        print(f"[Stir] Lowering to z={stir_z:.4f} "
-              f"({stir_depth * 1000:.0f}mm below the rim)...")
-        if not self.goto_pose_rigid(entry, rotation, duration=4.0):
-            return False, {"error": "Failed to command entry pose"}
-        arrived, err = self.reached(entry, float(params["descend_tol"]))
-        if not arrived:
-            print(f"[Stir] Entry stopped {err * 1000:.0f}mm short — lifting out")
-            self.goto_pose_rigid(hover, rotation, duration=3.0)
-            return False, {
-                "error": (f"Could not reach the stir depth inside '{target}' "
-                          f"(off by {err * 1000:.0f}mm) — the stirrer may be "
-                          f"fouling the rim"),
-            }
+            max_radius = max(0.0, rim_radius - wall_clearance)
+            radius = min(requested_radius, max_radius)
+            if radius < requested_radius:
+                print(f"[Stir] Clamping stir radius "
+                      f"{requested_radius * 1000:.0f}mm -> {radius * 1000:.0f}mm "
+                      f"(opening {rim_radius * 1000:.0f}mm minus "
+                      f"{wall_clearance * 1000:.0f}mm wall clearance)")
+            if radius < 0.003:
+                return False, {
+                    "error": (f"'{target}' opening is only "
+                              f"{rim_radius * 1000:.0f}mm across — no room to "
+                              f"stir without hitting the wall"),
+                    "rim_radius": rim_radius,
+                }
+
+            stir_z = rim_z - stir_depth + tool_length
+            if stir_z < self.workspace_min[2]:
+                return False, {
+                    "error": (f"Stir depth would put the wrist at z={stir_z:.3f}, "
+                              f"below the workspace floor "
+                              f"{self.workspace_min[2]:.3f}"),
+                }
+
+        # 3. Get over the circle, then down into it. Skipped in air: the tool
+        # is already at the demo height and there is nothing to descend into.
+        hover = np.array([center[0], center[1], stir_z])
+        if not in_air:
+            hover = np.array([center[0], center[1],
+                              rim_z + float(params["approach_height"]) + tool_length])
+            print(f"[Stir] Hovering above the opening at {np.round(hover, 4)}...")
+            if not self.goto_pose_rigid(hover, rotation, duration=3.0):
+                return False, {"error": "Failed to command hover pose"}
+            arrived, err = self.reached(hover, float(params["hover_tol"]))
+            if not arrived:
+                return False, {
+                    "error": (f"Hover above '{target}' unreachable "
+                              f"(off by {err * 1000:.0f}mm)"),
+                }
+
+            entry = np.array([center[0], center[1], stir_z])
+            print(f"[Stir] Lowering to z={stir_z:.4f} "
+                  f"({stir_depth * 1000:.0f}mm below the rim)...")
+            if not self.goto_pose_rigid(entry, rotation, duration=4.0):
+                return False, {"error": "Failed to command entry pose"}
+            arrived, err = self.reached(entry, float(params["descend_tol"]))
+            if not arrived:
+                print(f"[Stir] Entry stopped {err * 1000:.0f}mm short — lifting out")
+                self.goto_pose_rigid(hover, rotation, duration=3.0)
+                return False, {
+                    "error": (f"Could not reach the stir depth inside '{target}' "
+                              f"(off by {err * 1000:.0f}mm) — the stirrer may be "
+                              f"fouling the rim"),
+                }
 
         # 5. Walk the circle.
-        waypoints = self._circle_waypoints(rim_center, radius, stir_z,
+        waypoints = self._circle_waypoints(center, radius, stir_z,
                                            revolutions, per_rev)
         print(f"[Stir] Stirring: {len(waypoints)} waypoints, "
               f"radius {radius * 1000:.0f}mm, ~{dwell:.1f}s each")
 
         circle_tol = float(params["circle_tol"])
+        approach_seconds = max(0.5, float(params["approach_seconds"]))
         completed = 0
         for i, point in enumerate(waypoints):
-            if not self.goto_pose_rigid(point, rotation, duration=dwell):
+            # Waypoint 1 is an approach, not a circle step — the tool has to
+            # travel from wherever it is to the rim of the circle, which in air
+            # is the whole way down from home. Time it accordingly.
+            if i == 0:
+                gap = float(np.linalg.norm(
+                    np.asarray(self.get_current_pose().translation, dtype=float)
+                    - point))
+                seconds = approach_seconds
+                print(f"[Stir] Approaching the circle start "
+                      f"({gap * 1000:.0f}mm away) over {seconds:.1f}s...")
+            else:
+                seconds = dwell
+            if not self.goto_pose_rigid(point, rotation, duration=seconds):
                 print(f"[Stir] Waypoint {i + 1}/{len(waypoints)} command failed")
                 break
             arrived, err = self.reached(point, circle_tol)
             if not arrived:
                 # Not a hard failure on its own — but a big miss mid-circle
                 # means the stirrer is jammed against something.
+                phase = "approach to the circle" if i == 0 else "circle"
                 print(f"[Stir] Waypoint {i + 1} off by {err * 1000:.0f}mm "
-                      f"(tol {circle_tol * 1000:.0f}mm) — stopping the circle")
+                      f"(tol {circle_tol * 1000:.0f}mm) — stopping the {phase}")
                 break
             completed += 1
 
@@ -199,10 +338,12 @@ class StirSkill(BaseSkill):
 
         revolutions_done = completed / float(per_rev)
 
-        # 6. Lift out along the axis we came in on.
+        # 6. Lift out along the axis we came in on. In air there is no rim to
+        # measure from, so rise from the circle plane itself.
         print(f"[Stir] Lifting out...")
-        lift = np.array([rim_center[0], rim_center[1],
-                         rim_z + float(params["lift_height"]) + tool_length])
+        lift_from = stir_z if in_air else rim_z + tool_length
+        lift = np.array([center[0], center[1],
+                         lift_from + float(params["lift_height"])])
         if not self.goto_pose_rigid(lift, rotation, duration=3.0):
             return False, {
                 "error": "Stirred, but failed to lift the stirrer clear",
@@ -224,10 +365,14 @@ class StirSkill(BaseSkill):
                 "stir_radius": radius,
             }
 
-        print(f"[Stir] Successfully stirred '{target}' "
+        print(f"[Stir] Successfully stirred {where} "
               f"({revolutions} revolutions, {radius * 1000:.0f}mm radius)")
         return True, {
             "stirred_container": target,
+            "in_air": in_air,
+            "center": [float(center[0]), float(center[1])],
+            "verticalized": verticalize,
+            "long_axis_deg": self.tool_long_axis_deg(),
             "revolutions": revolutions,
             "revolutions_completed": revolutions_done,
             "stir_radius": radius,

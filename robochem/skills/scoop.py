@@ -10,25 +10,55 @@ scoop. This is how dry reagents are metered — the profile in robomail_Aliyah's
 Vision segments every white paper cup, reads the labels with a VLM, then scoops
 from the matching instance.
 
-Bench-corrected 2026-09-11: the scoop must tilt forward and dig/drag through
-the powder *tilted*, the way pour tips toward its site before the liquid moves
-— tilting only after the drag just plows the powder flat instead of collecting
-it. Order is now: tilt forward -> dig+drag (tilted, compliant) -> tilt back to
-normal -> lift (level).
+The stroke, as corrected against the bench over 2026-09-11..16:
+
+    hover level -> tilt forward -> plunge in while advancing (tilted)
+                -> push AWAY from the base, rolling back to level over the
+                   last stretch of that push -> lift
+
+Three things that each took a hardware run to find:
+
+  1. **The tilt has to happen before the powder is touched.** Tilting after the
+     stroke just plows the powder flat instead of collecting it.
+  2. **The tilt direction is the opposite of the obvious sign.** See the comment
+     on the negation in ``execute``: ``tool_tip_deg()`` is an arccos magnitude,
+     always >= 0, so it cannot tell "tilted forward" from "tilted backward" and
+     reports a wrong-direction tilt as a clean success. Nothing catches this
+     except a person watching the arm.
+  3. **The un-tilt belongs inside the push, not after it.** Rolling the bowl
+     level *while still moving forward* is what keeps the powder on the scoop —
+     the way a person finishes a scooping stroke. Snapping upright after the
+     motion has already stopped just drops it back in the cup.
 
 Hardened along the same lines as pick_up / pour:
   - reset_joints before scanning, world-frame rim geometry from the pointcloud
-  - the drag is clamped to the measured opening, so the scoop cannot ram the wall
-  - the dig and drag run *compliant* (impedance on) because they are contact
+  - the stroke is clamped to the measured opening, so it cannot ram the wall
+  - the plunge and push run *compliant* (impedance on) because they are contact
     motions; the free-space hover and the lift run stiff and are verified
-  - the forward dig tilt uses tool-axis rotation and is confirmed by
-    measurement, the way pour confirms its tip instead of assuming it
+  - the forward tilt is confirmed by measurement before the scoop commits to
+    the powder, the way pour confirms its tip instead of assuming it
+  - the push is discrete blocking waypoints, not a streamed trajectory, for the
+    same reason stir walks its circle that way (see P11 in SKILLS_ROADMAP.md)
 """
 
 from typing import Dict, Any, Tuple
 import numpy as np
 
 from .base_skill import BaseSkill, _orthonormalize
+
+
+def tool_y_delta(angle_degrees: float) -> np.ndarray:
+    """
+    Rotation about the tool's own y axis, as a right-multiplied delta.
+
+    Mirrors ``BaseSkill.rotate_about_tool_axis(axis="y")`` exactly, but as pure
+    maths with no motion — which is what lets the push schedule a *sequence* of
+    partial tilts analytically instead of issuing relative nudges and hoping
+    they compose.
+    """
+    angle_rad = np.radians(float(angle_degrees))
+    c, s = np.cos(angle_rad), np.sin(angle_rad)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
 
 
 class ScoopSkill(BaseSkill):
@@ -39,12 +69,11 @@ class ScoopSkill(BaseSkill):
     1. Record held width; the scoop must survive the whole motion
     2. Clear the cameras, scan the source, measure rim height / radius
     3. Hover level over the powder (free space, verified strictly)
-    4. Tilt forward about the tool axis — bites into the powder the way pour
-       tips toward its site — and verify the tilt actually happened
-    5. Descend into the powder tilted AND advance forward in the same motion
-       (the entry stroke itself carries travel), then drag any remaining
-       distance across the bed — both compliant
-    6. Tilt back to normal (level) before leaving the powder
+    4. Tilt forward about the tool axis and verify it actually happened —
+       failing here, before the powder is touched, is cheap
+    5. Plunge to the dig depth while advancing forward, tilted, compliant
+    6. Push away from the base in discrete waypoints, rolling the tilt back to
+       level over the last ``untilt_over`` metres of that push
     7. Lift straight out, level
     """
 
@@ -58,33 +87,39 @@ class ScoopSkill(BaseSkill):
             # the top of the fused cloud inside the container, which for a
             # part-full tub is the powder itself, not the rim.
             "scoop_depth": 0.015,
-            # Length of the drag through the powder. Clamped to the opening.
-            "scoop_distance": 0.04,
-            # How far to advance (toward the base, same direction as the drag)
-            # WHILE tilting into the powder — the entry stroke itself carries
-            # forward travel, not just a straight vertical plunge. Clamped to
-            # scoop_distance. Bench feedback 2026-09-11: with this at 0 (the
-            # original behaviour) the dig was a straight-down plunge with no
-            # bite; 3cm is the corrected starting point.
-            "dig_advance": 0.03,
+            # Forward travel during the tilted plunge — the entry stroke itself
+            # carries travel rather than being a straight vertical drop, the
+            # way a shovel is already moving into the ground as it enters.
+            "dig_advance": 0.02,
+            # The push after the plunge, away from the base. In this direction
+            # it is really more of a push than a drag.
+            "drag_distance": 0.04,
+            # Over the last this-many metres of the push, blend the tilt back
+            # to level. Finishing the roll *while still moving* is what makes
+            # the stroke read as a scoop instead of a plow followed by a flick.
+            "untilt_over": 0.02,
+            # Duration of the whole push. frankapy's goto_pose is a min-jerk
+            # interpolation, so the push is one or two continuous motions —
+            # NOT subdivided waypoints. See the comment in execute().
+            "push_seconds": 3.0,
             # Degrees to tilt forward, about the tool's own closing axis (NOT
-            # the base frame — see rotate_about_tool_axis), BEFORE dragging.
-            # This is the "bite" angle — the same role pour's tip angle plays —
-            # and is what lets the drag actually gather powder onto the scoop
-            # rather than push it flat.
+            # the base frame). This is the "bite" angle — the same role pour's
+            # tip angle plays.
             "dig_tilt_deg": 30.0,
             "lift_height": 0.12,
             "approach_height": 0.10,
             "reset_before_scan": True,
-            # Distance kept from the container wall during the drag.
-            "wall_clearance": 0.015,
+            # Distance kept from the container wall across the whole stroke.
+            # 10mm, not 15mm: a 60mm stroke centred in an 86mm cup leaves 13mm
+            # at each end, and the old 15mm was clamping strokes that fit fine.
+            "wall_clearance": 0.010,
             # Offset from the gripper TCP to the scoop bowl, in metres.
             # MEASURE THIS for your scoop. Left at 0 the arm digs with the
             # gripper itself, which is wrong for any tool of real length.
             "tool_length": 0.0,
             "hover_tol": 0.05,
-            # The dig and drag are contact motions: the powder resists, so the
-            # arm legitimately stops short and a tight tolerance would fail
+            # The plunge and push are contact motions: the powder resists, so
+            # the arm legitimately stops short and a tight tolerance would fail
             # every successful scoop. Only a gross miss is a failure.
             "contact_tol": 0.05,
             "tilt_tol_deg": 12.0,
@@ -107,8 +142,9 @@ class ScoopSkill(BaseSkill):
         params = self.get_params_with_defaults(params)
         source = params["powder_source"]
         scoop_depth = float(params["scoop_depth"])
-        requested_distance = float(params["scoop_distance"])
-        requested_dig_advance = float(params["dig_advance"])
+        requested_advance = float(params["dig_advance"])
+        requested_drag = float(params["drag_distance"])
+        requested_untilt = float(params["untilt_over"])
         dig_tilt_deg = float(params["dig_tilt_deg"])
         lift_height = float(params["lift_height"])
         tool_length = float(params["tool_length"])
@@ -116,6 +152,23 @@ class ScoopSkill(BaseSkill):
         contact_tol = float(params["contact_tol"])
         tilt_tol = float(params["tilt_tol_deg"])
         retries = max(1, int(params["tilt_retries"]))
+        push_seconds = max(0.5, float(params["push_seconds"]))
+
+        # scoop_distance used to mean "total travel", and the plunge advance was
+        # subtracted out of it — which silently produced a zero-length push when
+        # the two happened to be equal. Say so rather than ignoring the key.
+        for gone, replacement in (("drag_waypoints", "push_seconds"),
+                                  ("seconds_per_waypoint", "push_seconds")):
+            if params.get(gone) is not None:
+                print(f"[Scoop] NOTE: {gone} is no longer used — the push is one "
+                      f"continuous min-jerk motion now, timed by {replacement}.")
+
+        if params.get("scoop_distance") is not None:
+            print(f"[Scoop] NOTE: scoop_distance="
+                  f"{float(params['scoop_distance']):.3f} is no longer used. The "
+                  f"stroke is now dig_advance ({requested_advance:.3f}) for the "
+                  f"plunge plus drag_distance ({requested_drag:.3f}) for the "
+                  f"push. Pass those instead.")
 
         print(f"[Scoop] Starting scoop from '{source}'")
 
@@ -142,36 +195,44 @@ class ScoopSkill(BaseSkill):
               f"centre {np.round(rim_center, 4)}, "
               f"opening radius {rim_radius * 1000:.0f}mm")
 
-        # 2. Clamp the drag so it stays inside the container. A 50mm drag in a
-        # 35mm-wide reagent tub just rams the far wall and stalls the arm.
+        # 2. Clamp the whole stroke to the measured opening, scaling the plunge
+        # and the push together so their ratio survives the clamp.
+        requested_total = requested_advance + requested_drag
         usable = max(0.0, rim_radius - wall_clearance)
-        distance = min(requested_distance, 2.0 * usable)
-        if distance < requested_distance:
-            print(f"[Scoop] Clamping drag {requested_distance * 1000:.0f}mm -> "
-                  f"{distance * 1000:.0f}mm (opening radius "
-                  f"{rim_radius * 1000:.0f}mm minus "
-                  f"{wall_clearance * 1000:.0f}mm clearance)")
-        if distance < 0.008:
+        max_total = 2.0 * usable
+        if requested_total > max_total and requested_total > 0:
+            scale = max_total / requested_total
+            dig_advance = requested_advance * scale
+            drag_distance = requested_drag * scale
+            untilt_over = requested_untilt * scale
+            print(f"[Scoop] Clamping stroke {requested_total * 1000:.0f}mm -> "
+                  f"{max_total * 1000:.0f}mm (opening radius "
+                  f"{rim_radius * 1000:.0f}mm minus {wall_clearance * 1000:.0f}mm "
+                  f"clearance): plunge {dig_advance * 1000:.0f}mm, "
+                  f"push {drag_distance * 1000:.0f}mm")
+        else:
+            dig_advance = requested_advance
+            drag_distance = requested_drag
+            untilt_over = requested_untilt
+
+        total = dig_advance + drag_distance
+        if total < 0.008:
             return False, {
                 "error": (f"'{source}' opening is only "
-                          f"{rim_radius * 2000:.0f}mm across — no room to drag "
-                          f"the scoop through the powder"),
+                          f"{rim_radius * 2000:.0f}mm across — no room to run a "
+                          f"scoop stroke through the powder"),
                 "rim_radius": rim_radius,
             }
+        # Blending over more than the push itself is meaningless.
+        untilt_over = min(untilt_over, drag_distance)
 
-        # 3. Drag toward the robot base (-X), the same direction pour tips.
-        # Pulling toward the base keeps the elbow inside its comfortable range;
-        # pushing away runs into the reach limit that pour already documented.
-        drag = np.array([-1.0, 0.0])
-        entry_xy = rim_center - drag * (distance / 2.0)
-        exit_xy = rim_center + drag * (distance / 2.0)
-
-        # The entry stroke itself carries forward travel (see dig_advance
-        # above) — clamp it to the overall drag so the dig point can never
-        # overshoot exit_xy.
-        dig_advance = min(requested_dig_advance, distance)
-        dig_xy = entry_xy + drag * dig_advance
-        remaining_drag = distance - dig_advance
+        # 3. Push AWAY from the robot base (+X). Corrected on the bench
+        # 2026-09-16: pulling toward the base scrapes powder toward the near
+        # wall and the bowl comes out the far side of the stroke empty.
+        push = np.array([1.0, 0.0])
+        start_xy = rim_center - push * (total / 2.0)
+        dig_xy = start_xy + push * dig_advance
+        end_xy = start_xy + push * total
 
         level_rotation = self.tool_down_rotation()
         dig_z = surface_z - scoop_depth + tool_length
@@ -181,8 +242,12 @@ class ScoopSkill(BaseSkill):
                           f"the workspace floor {self.workspace_min[2]:.3f}"),
             }
 
-        # 4. Hover above the entry point, level (free space, verified strictly).
-        hover = np.array([entry_xy[0], entry_xy[1],
+        def rotation_at(angle_deg: float) -> np.ndarray:
+            """Wrist rotation for a given forward tilt, 0 = level."""
+            return _orthonormalize(level_rotation @ tool_y_delta(-float(angle_deg)))
+
+        # 4. Hover above the start of the stroke, level (free space, strict).
+        hover = np.array([start_xy[0], start_xy[1],
                           surface_z + float(params["approach_height"]) + tool_length])
         print(f"[Scoop] Hovering above the powder at {np.round(hover, 4)}...")
         if not self.goto_pose_rigid(hover, level_rotation, duration=3.0):
@@ -194,10 +259,13 @@ class ScoopSkill(BaseSkill):
                           f"(off by {err * 1000:.0f}mm)"),
             }
 
-        # 5. Tilt FORWARD before touching the powder — the same role pour's
-        # tip angle plays. Tilting only after the drag (the old order) just
-        # plows the powder flat instead of collecting it onto the scoop; the
-        # forward tilt is what lets the leading edge bite in as it drags.
+        # 5. Tilt FORWARD before touching the powder, and confirm it happened.
+        #
+        # NEGATED on purpose: tool_tip_deg() is an arccos magnitude (always
+        # >= 0), so it cannot tell "tilted forward" from "tilted the wrong way"
+        # — only how far from vertical. Bench feedback 2026-09-11 was that the
+        # un-negated command tilted 30 deg the wrong way while still reading as
+        # "achieved 30 deg" here, because the magnitude was right.
         tilt_before = self.tool_tip_deg()
         print(f"[Scoop] Tilting forward {dig_tilt_deg:.0f}° before entering "
               f"the powder (tip now {tilt_before:.1f}° from vertical)...")
@@ -206,13 +274,6 @@ class ScoopSkill(BaseSkill):
         # needs a second, longer goto_pose before the wrist tracks orientation
         # (the same lag pour retries through). Re-commanding the full angle
         # would stack rotations and overshoot.
-        #
-        # NEGATED on purpose: tool_tip_deg() is an arccos-based magnitude
-        # (always >= 0), so it cannot tell "tilted forward" from "tilted the
-        # wrong way" — only how far from vertical. Bench feedback 2026-09-11
-        # was that the un-negated command tilted 30 deg in the wrong physical
-        # direction while still reading as "achieved 30 deg" here, since the
-        # magnitude was right even though the sign was not.
         achieved = 0.0
         for attempt in range(1, retries + 1):
             remaining = dig_tilt_deg - achieved
@@ -231,40 +292,33 @@ class ScoopSkill(BaseSkill):
               f"(Δ{achieved:+.1f}°, commanded {dig_tilt_deg:.0f}°)")
         if abs(achieved) < dig_tilt_deg - tilt_tol:
             # A scoop that never got the bite angle just pushes powder around
-            # level; that is not a successful scoop, so fail rather than
-            # continue into a drag that will not collect anything. Back off
-            # to level first — we are still above the powder, not in it.
+            # level. Fail before entering the powder — we are still in free
+            # space, so backing off is cheap.
             self.goto_pose_rigid(hover, level_rotation, duration=2.0)
             return False, {
                 "error": (f"Forward dig tilt stalled: commanded {dig_tilt_deg:.0f}° "
                           f"but only achieved {achieved:.1f}° after {retries} "
-                          f"attempts (tol {tilt_tol:.0f}°). Dragging level "
-                          f"through the powder without this tilt would not "
-                          f"collect any onto the scoop."),
+                          f"attempts (tol {tilt_tol:.0f}°). Pushing level through "
+                          f"the powder without this tilt would not collect any "
+                          f"onto the scoop."),
                 "tilt_commanded": dig_tilt_deg,
                 "tilt_achieved": achieved,
             }
 
-        tilted_rotation = _orthonormalize(
-            np.asarray(self.get_current_pose().rotation, dtype=float)
-        )
+        tilted_rotation = rotation_at(dig_tilt_deg)
 
-        # 6. Dig in, tilted — AND advance forward by dig_advance in the same
-        # motion. This is the entry stroke: a straight-down plunge with no
-        # forward component doesn't bite into anything, the way a shovel has
-        # to already be moving into the ground as it goes in. Compliant: the
-        # scoop is entering a granular bed, so the controller should yield
-        # rather than push through at full stiffness.
+        # 6. Plunge in, tilted, advancing forward in the same motion. A
+        # straight-down drop bites into nothing.
         entry = np.array([dig_xy[0], dig_xy[1], dig_z])
-        print(f"[Scoop] Digging in to z={dig_z:.4f} and advancing "
-              f"{dig_advance * 1000:.0f}mm toward the base "
+        print(f"[Scoop] Plunging to z={dig_z:.4f} while advancing "
+              f"{dig_advance * 1000:.0f}mm away from the base "
               f"({scoop_depth * 1000:.0f}mm deep, tilted, compliant)...")
         if not self.goto_pose_rigid(entry, tilted_rotation, duration=3.0,
                                     use_impedance=True):
             return False, {"error": "Failed to command dig pose"}
         arrived, err = self.reached(entry, contact_tol)
         if not arrived:
-            print(f"[Scoop] Dig stopped {err * 1000:.0f}mm short — backing out")
+            print(f"[Scoop] Plunge stopped {err * 1000:.0f}mm short — backing out")
             self.goto_pose_rigid(hover, level_rotation, duration=3.0)
             return False, {
                 "error": (f"Could not enter the powder in '{source}' "
@@ -272,63 +326,81 @@ class ScoopSkill(BaseSkill):
                           f"fouling the rim"),
             }
 
-        # 7. Drag the remaining distance through the powder, still tilted,
-        # still compliant. This is the rest of the motion that gathers powder
-        # onto the scoop, continuing from where the dig's forward advance left
-        # off; a no-op if dig_advance already covered the whole scoop_distance.
-        exit_point = np.array([exit_xy[0], exit_xy[1], dig_z])
-        print(f"[Scoop] Dragging the remaining {remaining_drag * 1000:.0f}mm "
-              f"toward the base to {np.round(exit_point, 4)} (tilted)...")
-        if not self.goto_pose_rigid(exit_point, tilted_rotation, duration=3.0,
-                                    use_impedance=True):
-            return False, {"error": "Failed to command the drag"}
+        # 7. Push away from the base, rolling back to level as it goes.
+        #
+        # ONE smooth motion, or two at most. frankapy's goto_pose is already a
+        # min-jerk interpolation of both translation and orientation, so a
+        # single call is a continuous motion — an earlier version subdivided
+        # this into eight waypoints and it visibly stepped, because each
+        # waypoint decelerated to a stop, not because the controller needed
+        # the subdivision. (stir's P11 lesson is about a 50Hz *non-blocking*
+        # stream, which is a different failure and does not apply here.)
+        #
+        # Two segments, because a single min-jerk segment interpolates
+        # orientation monotonically end-to-end and so cannot hold the bite
+        # angle and then roll off:
+        #   A: translate at the full bite angle (no rotation)
+        #   B: translate the last untilt_over while rotating to level
+        # Set untilt_over == drag_distance to collapse this to one unbroken
+        # motion that rolls level across the whole push.
+        hold_distance = max(0.0, drag_distance - untilt_over)
+        segments = []
+        if hold_distance > 1e-4:
+            segments.append((hold_distance, dig_tilt_deg, "holding the bite angle"))
+        segments.append((drag_distance, 0.0, "rolling back to level"))
+
+        print(f"[Scoop] Pushing {drag_distance * 1000:.0f}mm away from the base "
+              f"over {push_seconds:.1f}s in {len(segments)} smooth "
+              f"{'motion' if len(segments) == 1 else 'motions'}, un-tilting over "
+              f"the last {untilt_over * 1000:.0f}mm...")
+
+        pushed = 0.0
+        angle_now = dig_tilt_deg
+        for target_s, end_angle, label in segments:
+            segment_length = target_s - pushed
+            if segment_length <= 1e-6:
+                continue
+            xy = dig_xy + push * target_s
+            point = np.array([xy[0], xy[1], dig_z])
+            seconds = push_seconds * (segment_length / drag_distance)
+            print(f"[Scoop]   -> {target_s * 1000:.0f}mm, tilt "
+                  f"{angle_now:.0f}° -> {end_angle:.0f}° "
+                  f"({label}, {seconds:.1f}s)")
+            angle_now = end_angle
+            if not self.goto_pose_rigid(point, rotation_at(end_angle),
+                                        duration=max(0.5, seconds),
+                                        use_impedance=True):
+                print(f"[Scoop]   push segment failed — stopping here")
+                break
+            pushed = target_s
+
+        exit_point = np.array([end_xy[0], end_xy[1], dig_z])
         arrived, err = self.reached(exit_point, contact_tol)
         if not arrived:
-            # Worth reporting but not fatal — a partial drag still lifts powder.
-            print(f"[Scoop] Drag ended {err * 1000:.0f}mm short of target "
+            # Not fatal — a partial push still lifts powder.
+            print(f"[Scoop] Push ended {err * 1000:.0f}mm short of target "
                   f"(powder resistance); continuing with a partial scoop")
 
         ok, msg = self.check_still_holding(start_width, tag="Scoop")
         if not ok:
-            return False, {"error": f"Scoop lost while digging: {msg}"}
+            return False, {"error": f"Scoop lost during the push: {msg}"}
 
-        # 8. Tilt back to normal before leaving the powder — the pour-return
-        # equivalent of coming back upright after tipping. Recomputing
-        # tool_down_rotation() rather than rotating back by -achieved is
-        # self-correcting: rotate_about_tool_axis(..., axis="y") leaves the
-        # tool's own y-axis fixed, so flattening from wherever we ended up
-        # recovers the pre-tilt level orientation exactly rather than
-        # compounding drift. Not gated on success, same as pour's return to
-        # upright — the scoop already has whatever it collected; a residual
-        # few degrees here costs some spillage, not the whole attempt.
-        print("[Scoop] Tilting back to normal before lifting...")
-        residual = None
-        for attempt in range(1, retries + 1):
-            normal_rotation = self.tool_down_rotation()
-            if not self.goto_pose_rigid(exit_point, normal_rotation, duration=2.0,
-                                        use_impedance=True):
-                print("[Scoop] Warning: return-to-normal command failed")
-                break
-            self.wait(0.2)
-            residual = self.tool_tip_deg()
-            print(f"[Scoop]   attempt {attempt}/{retries}: residual tilt "
-                  f"{residual:.1f}° from vertical")
-            if residual <= tilt_tol:
-                break
-        if residual is not None and residual > tilt_tol:
-            print(f"[Scoop] Did not fully return to level (residual "
-                  f"{residual:.1f}°) — lifting anyway rather than holding "
-                  f"the scoop tilted in the powder")
+        residual = self.tool_tip_deg()
+        print(f"[Scoop] Push done ({pushed * 1000:.0f}mm travelled), "
+              f"residual tilt {residual:.1f}° from vertical")
+        if residual > tilt_tol:
+            # Worth knowing but not worth aborting: the powder is already on
+            # the scoop, and a few degrees costs spillage, not the attempt.
+            print(f"[Scoop] Did not fully return to level — lifting anyway")
 
-        level_rotation = _orthonormalize(
+        # 8. Lift straight out, level.
+        level_now = _orthonormalize(
             np.asarray(self.get_current_pose().rotation, dtype=float)
         )
-
-        # 9. Lift straight out, level.
         lift = np.asarray(self.get_current_pose().translation, dtype=float).copy()
         lift[2] = surface_z + lift_height + tool_length
         print(f"[Scoop] Lifting clear to z={lift[2]:.4f}...")
-        if not self.goto_pose_rigid(lift, level_rotation, duration=3.0):
+        if not self.goto_pose_rigid(lift, level_now, duration=3.0):
             return False, {"error": "Failed to lift the scoop clear"}
         arrived, err = self.reached(lift, float(params["hover_tol"]))
         if not arrived:
@@ -347,16 +419,19 @@ class ScoopSkill(BaseSkill):
         return True, {
             "scooped_from": source,
             "scoop_depth": scoop_depth,
-            "scoop_distance": distance,
-            "requested_distance": requested_distance,
             "dig_advance": dig_advance,
-            "remaining_drag": remaining_drag,
+            "drag_distance": drag_distance,
+            "pushed": pushed,
+            "untilt_over": untilt_over,
+            "total_stroke": total,
+            "requested_stroke": requested_total,
+            "push_direction": "away_from_base(+X)",
             "rim_radius": rim_radius,
             "surface_z": surface_z,
             "dig_tilt_commanded": dig_tilt_deg,
             "dig_tilt_achieved": achieved,
-            "residual_tilt_after_normalize": residual,
+            "residual_tilt": residual,
             # There is no measurement of how much powder is on the scoop. The
-            # quantity is nominal, set by depth and drag length.
+            # quantity is nominal, set by depth and stroke length.
             "quantity_measured": False,
         }

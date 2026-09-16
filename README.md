@@ -163,6 +163,82 @@ python scripts/run_experiment.py --task "Pour the water into the beaker"
 
 ---
 
+## Simulation (no robot, no cage)
+
+`robochem/sim/` runs the **same skills** against a MuJoCo Franka Panda so motions
+can be watched before they touch hardware. The arm is mujoco_menagerie's vendor
+Panda model with the Franka Hand; the four cage cameras are placed at the
+extrinsics in `calibration_out/`, rendered for depth and segmentation, and
+back-projected through the project's own `ObjectLocalizer` / `VisionSystem`
+fusion — so perception really reconstructs the props from four views, with real
+self-occlusion, and rejects them when the views disagree.
+
+`SimFrankaArm` implements the frankapy surface the skills use and `SimVision`
+the `VisionSystem` surface, so `SkillsExecutor` is unmodified. The simulator has
+**no frankapy and no ROS**, so it runs out of `perception_env` (Python 3.10),
+*not* the robot venv — do **not** `source scripts/env.sh` first.
+
+### Setup (once)
+
+```bash
+perception_env/bin/pip install mujoco robot_descriptions
+```
+
+The Panda MJCF is fetched and cached under `~/.cache/robot_descriptions/` on
+first use.
+
+### Run a skill in the viewer
+
+```bash
+perception_env/bin/python scripts/run_experiment.py --sim \
+  --skill pick_up --params '{"object_name":"plastic beaker","z_offset":0.02,"squeeze":0.013}'
+
+perception_env/bin/python scripts/run_experiment.py --sim --sim-granules \
+  --skill pour --params '{"target_container":"white paper cup","pour_angle":90,"hold_duration":2,"forward_offset":-0.08}'
+
+perception_env/bin/python scripts/run_experiment.py --sim \
+  --workspace-min 0.25 -0.40 -0.13 \
+  --skill scoop --params '{"powder_source":"citric acid","tool_length":0.08}'
+```
+
+| Flag | Effect |
+| --- | --- |
+| `--sim-speed N` | Genuinely moves the arm N× faster (compresses commanded durations). Fling-and-spill at high N is real, not an artifact — use `1.0` when granule behaviour matters. |
+| `--sim-fast` | Keeps commanded durations, just skips the wall-clock wait. This is the flag for "same motion, less waiting". |
+| `--no-viewer` | Headless (CI, remote shells) |
+| `--sim-granules` | Loose particles in the beaker and reagent cups, so pours and scoops move material |
+| `--sim-tool-length M` | Bolt a fixed tool of length M onto the hand and move `franka_tool` out to its tip |
+| `--sim-grasp-mode` | `magnet` (kinematic attach on close, default) or `physics` (friction contacts) |
+| `--sim-hold S` | Seconds to keep the window open afterwards (default: until you close it) |
+
+### From Python
+
+```python
+from robochem.sim import build_cell
+
+cell = build_cell(viewer=True, granules=True)
+cell.skills.execute("pick_up", {"object_name": "plastic beaker", "z_offset": 0.02})
+cell.arm.hold()      # keep watching
+cell.close()
+```
+
+Edit the bench (what is on the table, and where) in `robochem/sim/bench.py`.
+
+### What it is and is not
+
+- Cartesian targets are solved by damped least-squares IK over the seven arm
+  joints and tracked to **under a millimetre**, with gravity compensated as the
+  real controller does. An unreachable target leaves the arm short, so the
+  skills' own arrival checks fire rather than being papered over.
+- Reconstructed centroids land within a few millimetres of truth for the cups;
+  the spoon reads ~25 mm off its body origin because its point cloud includes
+  the bowl.
+- It does **not** model fluid, powder rheology, RealSense noise characteristics,
+  frankapy impedance, or force thresholds. Granules are bouncy spheres — they
+  show *where a stream goes*, not how a powder behaves.
+
+---
+
 ## Smoke tests
 
 ```bash
@@ -175,6 +251,17 @@ python scripts/smoke_test_skills.py
 python scripts/smoke_test_skills.py --pour
 ```
 
+No hardware needed (run these from `perception_env`, without `scripts/env.sh`):
+
+```bash
+# Skill geometry and failure logic against a fake arm
+perception_env/bin/python scripts/test_skills_offline.py
+
+# Perception + motion + pick/pour/scoop against the simulated cell
+perception_env/bin/python scripts/smoke_test_sim.py
+perception_env/bin/python scripts/smoke_test_sim.py --viewer --speed 2
+```
+
 ---
 
 ## Related docs
@@ -184,10 +271,11 @@ python scripts/smoke_test_skills.py --pour
 | [`progress.md`](progress.md) | Current validated commands, design choices, known issues |
 | [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md) | Broader architecture plan |
 | [`SKILLS_ROADMAP.md`](SKILLS_ROADMAP.md) | Skill hardening roadmap |
+| [`robochem/sim/`](robochem/sim/) | MuJoCo preview of the cell (no robot, no cage) |
 | [`robomail/docs/progress.md`](robomail/docs/progress.md) | Older PLATO / agent-pipeline notes |
 
 ---
 
 ## License / attribution
 
-Research software for the Autonomous Robotic Chemist project (Barati Farimani Lab). Robot control depends on frankapy / Franka; perception on Meta SAM 3 and RealSense.
+Research software for the Autonomous Robotic Chemist project (Barati Farimani Lab). Robot control depends on frankapy / Franka; perception on Meta SAM 3 and RealSense; simulation on MuJoCo and the Franka Panda model from DeepMind's mujoco_menagerie (Apache-2.0).

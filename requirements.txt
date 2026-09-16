@@ -19,6 +19,12 @@ open3d>=0.15.0
 # frankapy
 # robomail (install from local ../robomail)
 
+# Simulation (robochem.sim) -- install into perception_env, not the robot venv.
+# The sim deliberately has no frankapy/ROS dependency:
+#   perception_env/bin/pip install mujoco robot_descriptions
+mujoco>=3.2
+robot_descriptions>=1.12
+
 # Development
 pytest>=6.0.0
 black>=21.0.0

@@ -87,6 +87,13 @@ class FakePose(StubRigidTransform):
         return FakePose(self.translation.copy(), self.rotation.copy())
 
 
+#: Wrist rotation for a flat top grasp: handle along +X (away from the base),
+#: closing axis across it, tool Z down. This is what pick_up leaves behind.
+FLAT_GRASP_R = np.array([[1.0, 0.0, 0.0],
+                         [0.0, -1.0, 0.0],
+                         [0.0, 0.0, -1.0]])
+
+
 class FakeArm:
     """
     Minimal FrankaArm stand-in.
@@ -384,6 +391,195 @@ def test_stir_clamps_to_the_opening():
           f"{len(arm2.commands)} goto_pose calls")
 
 
+def test_stir_tilts_a_flat_spoon_upright():
+    """A 90deg tilt toward the base stands a flat-grasped spoon up."""
+    print("\n[stir: flat spoon tilted upright toward the base]")
+    cup = cylinder_cloud([0.50, 0.0], base_z=0.02, height=0.08, radius=0.045)
+    vision = FakeVision({"cup": cup})
+
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    arm.pose.rotation = FLAT_GRASP_R.copy()
+    skill = make(StirSkill, vision, arm)
+    check("the flat grasp starts with the handle horizontal",
+          abs(skill.tool_long_axis_deg() - 90.0) < 1.0,
+          f"long axis={skill.tool_long_axis_deg():.1f} deg")
+
+    ok, result = skill.execute({"target_container": "cup", "revolutions": 1,
+                                "waypoints_per_rev": 6,
+                                "seconds_per_waypoint": 0.0})
+    check("stir succeeds from a flat grasp", ok, f"{result}")
+    check("the handle ends up pointing DOWN, not up",
+          ok and result["long_axis_deg"] < 15.0,
+          f"long axis={result.get('long_axis_deg')}")
+    check("the tilt is reported", ok and result["verticalized"] is True)
+
+    # The closing axis must survive, or the spoon twists in the jaws.
+    R = np.asarray(arm.pose.rotation, dtype=float)
+    check("the closing axis stayed horizontal (grip undisturbed)",
+          abs(R[2, 1]) < 0.05, f"toolY world Z component={R[2, 1]:.3f}")
+
+
+def test_stir_tilt_does_not_overshoot_on_retry():
+    """Retries must chase the REMAINING angle, not re-issue the full 90deg."""
+    print("\n[stir: tilt retries do not stack past vertical]")
+    cup = cylinder_cloud([0.50, 0.0], base_z=0.02, height=0.08, radius=0.045)
+    vision = FakeVision({"cup": cup})
+    # tilt_gain 0.6: each command lands ~60% of the way, forcing retries.
+    arm = FakeArm(tracking=1.0, gripper_width=0.03, tilt_gain=0.6)
+    arm.pose.rotation = FLAT_GRASP_R.copy()
+    skill = make(StirSkill, vision, arm)
+    ok, result = skill.execute({"target_container": "cup", "revolutions": 1,
+                                "waypoints_per_rev": 6, "orient_retries": 5,
+                                "seconds_per_waypoint": 0.0})
+    check("a lagging wrist still converges", ok, f"{result}")
+    check("it converged on vertical without overshooting past it",
+          ok and result["long_axis_deg"] < 15.0,
+          f"long axis={result.get('long_axis_deg')}")
+
+
+def test_stir_refuses_a_spoon_that_will_not_stand_up():
+    print("\n[stir: refuses if the spoon stays horizontal]")
+    cup = cylinder_cloud([0.50, 0.0], base_z=0.02, height=0.08, radius=0.045)
+    vision = FakeVision({"cup": cup})
+    arm = FakeArm(tracking=1.0, gripper_width=0.03, tilt_gain=0.02)
+    arm.pose.rotation = FLAT_GRASP_R.copy()
+    skill = make(StirSkill, vision, arm)
+    ok, result = skill.execute({"target_container": "cup"})
+    check("stir fails when the spoon stays horizontal", not ok, f"{result}")
+    check("the failure says a horizontal spoon cannot enter",
+          "horizontal" in result.get("error", "").lower(),
+          f"{result.get('error')}")
+
+
+def test_stir_homes_before_orienting():
+    """Home first, holding the tool — the swing needs wrist travel."""
+    print("\n[stir: homes before the swing, without dropping the tool]")
+    vision = FakeVision({})
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    # Park the arm out over the bench, as pick_up would leave it.
+    arm.pose.translation = np.array([0.68, -0.15, 0.20])
+    skill = make(StirSkill, vision, arm)
+
+    ok, result = skill.execute({"in_air": True, "revolutions": 1,
+                                "waypoints_per_rev": 6, "stir_radius": 0.02,
+                                "seconds_per_waypoint": 0.0})
+    check("stir succeeds from a far-forward pick pose", ok, f"{result}")
+    check("the gripper was never opened by the homing",
+          not [c for c in arm.gripper_commands if c["width"] > 0.06],
+          f"gripper commands={arm.gripper_commands}")
+    check("the circle is centred at home, not the old pick pose",
+          ok and abs(result["center"][0] - 0.68) > 0.1,
+          f"centre={result.get('center')}")
+
+    arm2 = FakeArm(tracking=1.0, gripper_width=0.03)
+    arm2.pose.translation = np.array([0.68, -0.15, 0.20])
+    skill2 = make(StirSkill, vision, arm2)
+    ok2, _ = skill2.execute({"in_air": True, "home_first": False,
+                             "revolutions": 1, "waypoints_per_rev": 6,
+                             "seconds_per_waypoint": 0.0})
+    check("home_first=false leaves the arm where it was",
+          ok2 and abs(arm2.commands[-1][0][0] - 0.68) < 0.12,
+          f"last commanded x={arm2.commands[-1][0][0]:.3f}")
+
+
+def test_stir_approaches_the_circle_before_walking_it():
+    """Waypoint 1 is a long approach, not a circle step — it needs real time.
+
+    Regression for the first in-air hardware run, which failed on waypoint 1
+    "off by 173mm". The arm was at home, the circle was 17cm below, and the
+    move was given the 0.4s per-waypoint circle dwell — about 0.43 m/s — so it
+    never happened. The reported error was the entire untravelled distance.
+    """
+    print("\n[stir: the circle start is approached, not jumped to]")
+    vision = FakeVision({})
+
+    class SpeedLimitedArm(FakeArm):
+        """Only covers what the commanded duration allows, at MAX_SPEED."""
+
+        MAX_SPEED = 0.15   # m/s, deliberately modest
+
+        def reset_joints(self):
+            # The real Franka home puts the TCP around z=0.47, which is what
+            # makes the circle at z=0.30 a ~17cm trip. The default FakeArm home
+            # sits at z=0.35 and would not reproduce the bench failure.
+            self.pose = FakePose([0.31, 0.0, 0.47], FLAT_GRASP_R.copy())
+
+        def goto_pose(self, pose, duration=3.0, use_impedance=True, block=True):
+            start = self.pose.translation.copy()
+            target = np.asarray(pose.translation, dtype=float)
+            gap = float(np.linalg.norm(target - start))
+            reach = min(gap, self.MAX_SPEED * float(duration))
+            if gap > 1e-9:
+                self.pose.translation = start + (target - start) * (reach / gap)
+            self.pose.rotation = np.asarray(pose.rotation, dtype=float)
+            self.commands.append((target.copy(), duration, use_impedance))
+
+    arm = SpeedLimitedArm(gripper_width=0.03)
+    arm.pose.translation = np.array([0.30, 0.0, 0.47])   # home-ish, well above
+    arm.pose.rotation = FLAT_GRASP_R.copy()
+    skill = make(StirSkill, vision, arm)
+
+    ok, result = skill.execute({"in_air": True, "air_height": 0.30,
+                                "revolutions": 1, "stir_radius": 0.03,
+                                "waypoints_per_rev": 12,
+                                "seconds_per_waypoint": 0.4})
+    check("the circle start is reached despite being 17cm away", ok, f"{result}")
+    check("the full revolution ran", ok and result["revolutions_completed"] == 1.0,
+          f"{result.get('revolutions_completed')}")
+
+    # The approach must get a longer duration than the circle steps.
+    durations = [c[1] for c in arm.commands]
+    circle = durations[-12:]
+    check("waypoint 1 got a longer duration than the circle steps",
+          max(circle) > min(circle),
+          f"durations={[round(d, 2) for d in circle]}")
+
+    # And the same run with the old behaviour must fail, or the test is vacuous.
+    arm2 = SpeedLimitedArm(gripper_width=0.03)
+    arm2.pose.translation = np.array([0.30, 0.0, 0.47])
+    arm2.pose.rotation = FLAT_GRASP_R.copy()
+    ok2, result2 = make(StirSkill, vision, arm2).execute(
+        {"in_air": True, "air_height": 0.30, "revolutions": 1,
+         "stir_radius": 0.03, "waypoints_per_rev": 12,
+         "seconds_per_waypoint": 0.4, "approach_seconds": 0.4})
+    check("with approach_seconds=dwell it fails, as it did on the bench",
+          not ok2, f"{result2}")
+
+
+def test_stir_in_air_needs_no_container():
+    """The demo mode stirs in free space with no scan and no target."""
+    print("\n[stir: in-air demo]")
+    vision = FakeVision({})          # nothing segmentable at all
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    arm.pose.rotation = np.array([[1.0, 0.0, 0.0],
+                                  [0.0, -1.0, 0.0],
+                                  [0.0, 0.0, -1.0]])
+    skill = make(StirSkill, vision, arm)
+
+    can, msg = skill.check_preconditions({"in_air": True})
+    check("in-air needs no target_container", can, msg)
+
+    ok, result = skill.execute({"in_air": True, "revolutions": 2,
+                                "waypoints_per_rev": 8, "stir_radius": 0.03,
+                                "seconds_per_waypoint": 0.0})
+    check("in-air stir succeeds with nothing in the scene", ok, f"{result}")
+    check("it is flagged as an in-air run", ok and result["in_air"] is True)
+    check("no camera scan happened", vision.cleared == 0,
+          f"clear_cache called {vision.cleared} times")
+    check("the tool was still swung upright",
+          ok and result["long_axis_deg"] < 15.0,
+          f"long axis={result.get('long_axis_deg')}")
+    check("the full circle ran", ok and result["revolutions_completed"] == 2.0,
+          f"{result.get('revolutions_completed')}")
+
+    # A real circle, not a point: the commanded XY must actually vary.
+    xs = [c[0][0] for c in arm.commands]
+    ys = [c[0][1] for c in arm.commands]
+    check("the commanded path spans roughly the circle diameter",
+          (max(xs) - min(xs)) > 0.05 and (max(ys) - min(ys)) > 0.05,
+          f"x span={max(xs) - min(xs):.3f}, y span={max(ys) - min(ys):.3f}")
+
+
 def test_stir_detects_a_dropped_stirrer():
     print("\n[stir: dropped stirrer aborts]")
     wide = cylinder_cloud([0.50, 0.0], base_z=0.02, height=0.08, radius=0.045)
@@ -438,16 +634,115 @@ def test_scoop_requires_a_real_tilt():
 
 
 def test_scoop_clamps_the_drag():
-    print("\n[scoop: drag clamped to the opening]")
+    print("\n[scoop: stroke clamped to the opening]")
     small = cylinder_cloud([0.50, 0.10], base_z=0.02, height=0.04, radius=0.02)
     vision = FakeVision({"small tub": small})
     arm = FakeArm(tracking=1.0, gripper_width=0.03)
     skill = make(ScoopSkill, vision, arm)
     ok, result = skill.execute({"powder_source": "small tub",
-                                "scoop_distance": 0.08})
-    check("40mm-wide tub does not get an 80mm drag",
-          (not ok) or result["scoop_distance"] < 0.08,
-          f"ok={ok}, distance={result.get('scoop_distance')}")
+                                "dig_advance": 0.03, "drag_distance": 0.05,
+                                "push_seconds": 0.5})
+    check("40mm-wide tub does not get an 80mm stroke",
+          (not ok) or result["total_stroke"] < 0.08,
+          f"ok={ok}, stroke={result.get('total_stroke')}")
+    check("the clamp keeps the plunge/push ratio",
+          (not ok) or abs((result["dig_advance"] / result["drag_distance"])
+                          - (0.03 / 0.05)) < 0.01,
+          f"plunge={result.get('dig_advance')}, push={result.get('drag_distance')}")
+
+
+def test_scoop_pushes_away_from_the_base():
+    """The stroke runs +X, and the tilt is rolled off during the push."""
+    print("\n[scoop: pushes away from the base, un-tilting as it goes]")
+    tub = cylinder_cloud([0.50, 0.10], base_z=0.02, height=0.05, radius=0.06)
+    vision = FakeVision({"tub": tub})
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    skill = make(ScoopSkill, vision, arm)
+    ok, result = skill.execute({"powder_source": "tub", "dig_advance": 0.02,
+                                "drag_distance": 0.04, "untilt_over": 0.02,
+                                "push_seconds": 0.5})
+    check("scoop succeeds", ok, f"{result}")
+    check("stroke is recorded as away-from-base",
+          ok and result["push_direction"] == "away_from_base(+X)",
+          f"{result.get('push_direction')}")
+
+    # The commanded X targets must increase through the push: pulling toward
+    # the base was the 2026-09-16 bench correction.
+    xs = [c[0][0] for c in arm.commands]
+    push_xs = xs[-3:-1]  # the push segments, before the final lift
+    check("commanded X advances monotonically (+X, away from base)",
+          all(b >= a - 1e-9 for a, b in zip(push_xs, push_xs[1:])),
+          f"push X targets={[round(v, 4) for v in push_xs]}")
+
+    check("the scoop finishes level, not tilted",
+          ok and result["residual_tilt"] < 1.0,
+          f"residual={result.get('residual_tilt')}")
+    check("it travelled the full push", ok and abs(result["pushed"] - 0.04) < 1e-6,
+          f"pushed={result.get('pushed')}")
+
+
+def test_scoop_push_is_continuous():
+    """The push must be one or two min-jerk motions, not subdivided waypoints."""
+    print("\n[scoop: push is continuous, not stepped]")
+    tub = cylinder_cloud([0.50, 0.10], base_z=0.02, height=0.05, radius=0.06)
+    vision = FakeVision({"tub": tub})
+
+    class TiltRecordingArm(FakeArm):
+        """Records commanded tilt magnitude and duration at every motion."""
+
+        def __init__(self):
+            super().__init__(tracking=1.0, gripper_width=0.03)
+            self.tilts = []
+            self.durations = []
+
+        def goto_pose(self, pose, duration=3.0, use_impedance=True, block=True):
+            super().goto_pose(pose, duration, use_impedance, block)
+            R = np.asarray(pose.rotation, dtype=float)
+            self.tilts.append(
+                float(np.degrees(np.arccos(np.clip(-R[2, 2], -1.0, 1.0))))
+            )
+            self.durations.append(duration)
+
+    arm = TiltRecordingArm()
+    skill = make(ScoopSkill, vision, arm)
+    ok, result = skill.execute({"powder_source": "tub", "dig_advance": 0.02,
+                                "drag_distance": 0.04, "untilt_over": 0.02,
+                                "dig_tilt_deg": 30.0, "push_seconds": 3.0})
+    check("scoop succeeds", ok, f"{result}")
+
+    # hover, tilt-in-place, plunge, push A, push B, lift == 6 motions total.
+    check("the whole skill is a handful of motions, not a waypoint stream",
+          len(arm.commands) <= 8, f"{len(arm.commands)} goto_pose calls")
+
+    push = arm.tilts[-3:-1]  # the two push segments, before the lift
+    check("push segment A holds the full bite angle",
+          push and abs(push[0] - 30.0) < 0.5, f"segment A tilt={push[0] if push else None}")
+    check("push segment B ends level",
+          push and push[-1] < 0.5, f"segment B tilt={push[-1] if push else None}")
+
+    # Durations must split proportionally to distance: 20mm hold + 20mm roll
+    # out of a 3.0s push is 1.5s each.
+    push_durations = arm.durations[-3:-1]
+    check("push duration is split by distance, not by waypoint count",
+          all(abs(d - 1.5) < 0.01 for d in push_durations),
+          f"durations={[round(d, 2) for d in push_durations]}")
+
+
+def test_scoop_single_motion_push():
+    """untilt_over == drag_distance collapses the push to one unbroken motion."""
+    print("\n[scoop: untilt_over == drag_distance gives a single motion]")
+    tub = cylinder_cloud([0.50, 0.10], base_z=0.02, height=0.05, radius=0.06)
+    vision = FakeVision({"tub": tub})
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    skill = make(ScoopSkill, vision, arm)
+    ok, result = skill.execute({"powder_source": "tub", "dig_advance": 0.02,
+                                "drag_distance": 0.04, "untilt_over": 0.04,
+                                "push_seconds": 0.5})
+    check("single-motion scoop succeeds", ok, f"{result}")
+    check("one fewer motion than the two-segment default",
+          len(arm.commands) <= 5, f"{len(arm.commands)} goto_pose calls")
+    check("still finishes level", ok and result["residual_tilt"] < 1.0,
+          f"residual={result.get('residual_tilt')}")
 
 
 def test_dispense_never_drops_the_pipette():
@@ -654,9 +949,18 @@ def main():
     test_place_stuck_gripper_retries_then_fails()
     test_stir_and_scoop_refuse_below_workspace_floor()
     test_stir_clamps_to_the_opening()
+    test_stir_tilts_a_flat_spoon_upright()
+    test_stir_tilt_does_not_overshoot_on_retry()
+    test_stir_refuses_a_spoon_that_will_not_stand_up()
+    test_stir_homes_before_orienting()
+    test_stir_approaches_the_circle_before_walking_it()
+    test_stir_in_air_needs_no_container()
     test_stir_detects_a_dropped_stirrer()
     test_scoop_requires_a_real_tilt()
     test_scoop_clamps_the_drag()
+    test_scoop_pushes_away_from_the_base()
+    test_scoop_push_is_continuous()
+    test_scoop_single_motion_push()
     test_dispense_never_drops_the_pipette()
     test_dispense_transfer_mode()
     test_target_not_found_is_a_failure()

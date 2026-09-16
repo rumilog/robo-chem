@@ -419,6 +419,19 @@ class BaseSkill(ABC):
         y = np.cross(z, x)
         return np.column_stack([x, y, z])
 
+    def tool_long_axis_deg(self) -> float:
+        """
+        Angle of the tool's long axis (tool X) from straight down, in degrees.
+
+        Unlike ``tool_tip_deg``, this one is not direction-blind: 0 deg means the
+        handle points down, 90 deg horizontal, 180 deg straight up. The two ends
+        are distinguishable, so it can confirm the tool went vertical the right
+        way round — which is exactly what the scoop tilt bug showed a bare
+        magnitude check cannot do.
+        """
+        R = np.asarray(self.get_current_pose().rotation, dtype=float)
+        return float(np.degrees(np.arccos(np.clip(-R[2, 0], -1.0, 1.0))))
+
     def tool_tip_deg(self) -> float:
         """Angle of the tool axis from straight down, in degrees."""
         R = np.asarray(self.get_current_pose().rotation, dtype=float)
@@ -449,6 +462,118 @@ class BaseSkill(ABC):
         except Exception as e:
             print(f"Oriented motion failed: {e}")
             return False
+
+    def stream_pose_path(self, points, rotation, seconds: float,
+                         rate_hz: float = 50.0, tag: str = "Skill",
+                         cartesian_impedance: bool = False) -> Tuple[bool, str]:
+        """
+        Run a path as ONE continuous frankapy skill, streamed at ``rate_hz``.
+
+        A chain of ``goto_pose`` calls cannot be smooth: frankapy starts a new
+        skill per call and each one decelerates to a stop at its target, so a
+        subdivided curve visibly steps. Dynamic mode instead starts a single
+        skill and feeds it setpoints over the sensor topic, which is how a
+        curve — a stir circle, say — becomes continuous motion.
+
+        Straight lines do not need this; ``goto_pose`` is already min-jerk
+        between two poses. Use it for paths that are not a single segment.
+
+        All the ROS/frankapy imports are deferred to the call so this module
+        stays importable off the robot PC. Returns ``(ok, message)``; a False
+        return is a signal to fall back to blocking waypoints, not a crash.
+
+        Args:
+            points: iterable of [x, y, z], already in execution order
+            rotation: 3x3 wrist rotation held for the whole path
+            seconds: wall-clock duration of the path
+            rate_hz: setpoint publish rate
+            cartesian_impedance: leave False for a stiff path; the pour lesson
+                is that impedance quietly under-tracks.
+        """
+        try:
+            import rospy
+            from frankapy import FrankaConstants as FC, SensorDataMessageType
+            from frankapy.proto_utils import (sensor_proto2ros_msg,
+                                              make_sensor_group_msg)
+            from frankapy.proto import (PosePositionSensorMessage,
+                                        ShouldTerminateSensorMessage)
+            from franka_interface_msgs.msg import SensorDataGroup
+        except Exception as exc:
+            return False, f"dynamic streaming unavailable ({exc})"
+
+        path = [np.asarray(p, dtype=float) for p in points]
+        if len(path) < 2:
+            return False, "a streamed path needs at least two points"
+
+        template = self.get_current_pose()
+        R = _orthonormalize(np.asarray(rotation, dtype=float))
+
+        def as_pose(xyz):
+            pose = template.copy()
+            pose.translation = self._clamp_position(xyz)
+            pose.rotation = R
+            return to_rigid_transform(pose)
+
+        poses = [as_pose(p) for p in path]
+
+        # One publisher per skill instance: a freshly-made rospy.Publisher
+        # needs a moment before its first message is actually delivered.
+        if getattr(self, "_sensor_pub", None) is None:
+            self._sensor_pub = rospy.Publisher(
+                FC.DEFAULT_SENSOR_PUBLISHER_TOPIC, SensorDataGroup, queue_size=1000
+            )
+            self.wait(0.3)
+
+        dt = 1.0 / float(rate_hz)
+        rate = rospy.Rate(float(rate_hz))
+        published = 0
+        try:
+            # buffer_time generously longer than the path: the skill must not
+            # self-terminate before the last setpoint is consumed.
+            self.robot.goto_pose(
+                poses[0], duration=float(seconds), dynamic=True,
+                buffer_time=float(seconds) + 5.0,
+                use_impedance=bool(cartesian_impedance),
+            )
+            init_time = rospy.Time.now().to_time()
+            for i, pose in enumerate(poses[1:], start=1):
+                timestamp = rospy.Time.now().to_time() - init_time
+                traj = PosePositionSensorMessage(
+                    id=i, timestamp=timestamp,
+                    position=pose.translation, quaternion=pose.quaternion,
+                )
+                self._sensor_pub.publish(make_sensor_group_msg(
+                    trajectory_generator_sensor_msg=sensor_proto2ros_msg(
+                        traj, SensorDataMessageType.POSE_POSITION),
+                ))
+                published += 1
+                rate.sleep()
+
+            term = ShouldTerminateSensorMessage(
+                timestamp=rospy.Time.now().to_time() - init_time,
+                should_terminate=True,
+            )
+            self._sensor_pub.publish(make_sensor_group_msg(
+                termination_handler_sensor_msg=sensor_proto2ros_msg(
+                    term, SensorDataMessageType.SHOULD_TERMINATE),
+            ))
+            self.wait(0.2)
+            return True, f"streamed {published + 1} setpoints over {seconds:.1f}s"
+        except Exception as exc:
+            # Never leave a dynamic skill running after an error.
+            try:
+                self.robot.stop_skill()
+            except Exception:
+                pass
+            return False, f"streaming failed after {published} setpoints: {exc}"
+
+    @staticmethod
+    def min_jerk_fraction(t: float, total: float) -> float:
+        """Min-jerk 0->1 easing, so a streamed path starts and ends at rest."""
+        if total <= 0:
+            return 1.0
+        x = min(1.0, max(0.0, float(t) / float(total)))
+        return 10.0 * x ** 3 - 15.0 * x ** 4 + 6.0 * x ** 5
 
     def reached(self, target_xyz: np.ndarray, tol: float) -> Tuple[bool, float]:
         """Did the arm actually get within ``tol`` metres of ``target_xyz``?"""

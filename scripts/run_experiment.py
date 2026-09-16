@@ -16,14 +16,22 @@ Usage:
     python scripts/run_experiment.py --task "Pour the water into the beaker"
     python scripts/run_experiment.py --task "..." --dry-run   # plan only, no motion
     python scripts/run_experiment.py --skill pick_up --params '{"object_name":"white paper cup"}'
+
+With --sim the same skills run against the MuJoCo cell instead of the arm and
+the cage, in a window you can watch. That route has no frankapy and no ROS, so
+it runs out of perception_env rather than the robot venv:
+
+    perception_env/bin/python scripts/run_experiment.py --sim \
+        --skill pick_up --params '{"object_name":"plastic beaker","z_offset":0.02}'
 """
 
 import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
-from frankapy import FrankaArm
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from robochem.skills import SkillsExecutor
 from robochem.vision import VisionSystem
@@ -34,8 +42,37 @@ from robochem.orchestrator.vlm_orchestrator import VLMOrchestrator
 DEFAULT_CAMERAS = [2, 3, 4, 5]
 
 
+def build_sim_stack(args):
+    """
+    Assemble the MuJoCo cell instead of the hardware one.
+
+    Returns the same 4-tuple as :func:`build_stack` so main() does not care
+    which cell it got. ``cameras`` is empty because the simulated cage is
+    rendered on demand rather than held open.
+    """
+    from robochem.sim import build_cell
+
+    print(f"Building the simulated cell (speed x{args.sim_speed}, "
+          f"viewer={'on' if not args.no_viewer else 'off'})")
+    cell = build_cell(
+        viewer=not args.no_viewer,
+        realtime=not args.sim_fast,
+        speed=args.sim_speed,
+        granules=args.sim_granules,
+        tool_length=args.sim_tool_length,
+        grasp_mode=args.sim_grasp_mode,
+        workspace_min=args.workspace_min,
+        workspace_max=args.workspace_max,
+    )
+    if args.reset:
+        cell.reset()
+    return {}, cell.vision, cell.skills, cell.arm
+
+
 def build_stack(args):
     """Open the cameras, connect the arm and assemble the subsystems."""
+    from frankapy import FrankaArm
+
     # Do not hold four RealSense pipelines open. Sequential capture in the
     # localizer starts each camera, takes a frame, and stops it before the
     # next one. Opening all four at once has wedged this machine's USB bus.
@@ -94,6 +131,26 @@ def main() -> int:
     parser.add_argument("--max-object-extent", type=float, default=0.35)
     parser.add_argument("--workspace-min", nargs=3, type=float, default=[0.25, -0.40, 0.015])
     parser.add_argument("--workspace-max", nargs=3, type=float, default=[0.75, 0.40, 0.70])
+
+    sim = parser.add_argument_group("simulation")
+    sim.add_argument("--sim", action="store_true",
+                     help="Run against the MuJoCo cell instead of the robot")
+    sim.add_argument("--sim-speed", type=float, default=1.0,
+                     help="Playback multiplier; 2.0 halves every commanded duration")
+    sim.add_argument("--sim-fast", action="store_true",
+                     help="Step as fast as the machine allows instead of real time")
+    sim.add_argument("--no-viewer", action="store_true",
+                     help="Headless simulation (for tests and remote shells)")
+    sim.add_argument("--sim-granules", action="store_true",
+                     help="Put loose particles in the reagent cups so pours and "
+                          "scoops move material")
+    sim.add_argument("--sim-tool-length", type=float, default=0.0,
+                     help="Length (m) of a fixed tool bolted to the hand")
+    sim.add_argument("--sim-grasp-mode", choices=["magnet", "physics"], default="magnet",
+                     help="Kinematic attach on close (default) or friction contacts")
+    sim.add_argument("--sim-hold", type=float, default=None,
+                     help="Seconds to keep the viewer open after the run "
+                          "(default: until you close the window)")
     args = parser.parse_args()
 
     if not (args.task or args.instruction_image or args.skill):
@@ -103,7 +160,9 @@ def main() -> int:
         print("OPENAI_API_KEY is not set; planning will fail. Run 'source scripts/env.sh'.")
         return 1
 
-    cameras, vision, skills, robot = build_stack(args)
+    cameras, vision, skills, robot = (
+        build_sim_stack(args) if args.sim else build_stack(args)
+    )
 
     try:
         # Single-skill mode: useful for validating one skill on hardware
@@ -146,6 +205,12 @@ def main() -> int:
         return 0 if result.get("success") else 1
 
     finally:
+        if args.sim and not args.no_viewer:
+            print("\nRun finished. Close the viewer window to exit"
+                  + (f" (or wait {args.sim_hold:.0f}s)" if args.sim_hold else "") + ".")
+            robot.hold(args.sim_hold if args.sim_hold is not None else 1e9)
+        if args.sim:
+            robot.close()
         for cam in cameras.values():
             try:
                 cam.stop_pipeline()
