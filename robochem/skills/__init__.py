@@ -17,6 +17,7 @@ from .pick_up import PickUpSkill
 from .place import PlaceSkill
 from .pour import PourSkill
 from .scoop import ScoopSkill
+from .dump import DumpSkill
 from .dispense import DispenseSkill
 from .stir import StirSkill
 from .move_to import MoveToSkill
@@ -36,6 +37,7 @@ SKILL_REGISTRY = {
     "place": PlaceSkill,
     "pour": PourSkill,
     "scoop": ScoopSkill,
+    "dump": DumpSkill,
     "dispense": DispenseSkill,
     "stir": StirSkill,
     "move_to": MoveToSkill,

@@ -44,21 +44,7 @@ Hardened along the same lines as pick_up / pour:
 from typing import Dict, Any, Tuple
 import numpy as np
 
-from .base_skill import BaseSkill, _orthonormalize
-
-
-def tool_y_delta(angle_degrees: float) -> np.ndarray:
-    """
-    Rotation about the tool's own y axis, as a right-multiplied delta.
-
-    Mirrors ``BaseSkill.rotate_about_tool_axis(axis="y")`` exactly, but as pure
-    maths with no motion — which is what lets the push schedule a *sequence* of
-    partial tilts analytically instead of issuing relative nudges and hoping
-    they compose.
-    """
-    angle_rad = np.radians(float(angle_degrees))
-    c, s = np.cos(angle_rad), np.sin(angle_rad)
-    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+from .base_skill import BaseSkill, _orthonormalize, tool_y_delta
 
 
 class ScoopSkill(BaseSkill):
@@ -104,11 +90,25 @@ class ScoopSkill(BaseSkill):
             "push_seconds": 3.0,
             # Degrees to tilt forward, about the tool's own closing axis (NOT
             # the base frame). This is the "bite" angle — the same role pour's
-            # tip angle plays.
-            "dig_tilt_deg": 30.0,
+            # tip angle plays. Raised from 30 to 45 on the bench 2026-09-18:
+            # the shallower entry skated over the powder instead of cutting in.
+            "dig_tilt_deg": 45.0,
+            # Extra descent AFTER the tilted plunge has landed, before the push
+            # starts — the scoop drops its nose in, then digs down a little
+            # further into the bed. Separate from scoop_depth so the entry
+            # angle and the final depth can be tuned independently.
+            "dip_depth": 0.010,
             "lift_height": 0.12,
             "approach_height": 0.10,
             "reset_before_scan": True,
+            # Shift the whole stroke in the robot base frame, same sign
+            # convention as pour and pick_up: +X is forward from the base
+            # toward the workspace, +Y is the robot's left. The stroke is
+            # otherwise centred on the measured rim, which is only right when
+            # the segmentation found the container itself and the tool_offset
+            # is current for the grasp actually being held.
+            "forward_offset": 0.0,
+            "lateral_offset": 0.0,
             # Distance kept from the container wall across the whole stroke.
             # 10mm, not 15mm: a 60mm stroke centred in an 86mm cup leaves 13mm
             # at each end, and the old 15mm was clamping strokes that fit fine.
@@ -116,7 +116,14 @@ class ScoopSkill(BaseSkill):
             # Offset from the gripper TCP to the scoop bowl, in metres.
             # MEASURE THIS for your scoop. Left at 0 the arm digs with the
             # gripper itself, which is wrong for any tool of real length.
+            #
+            # A CRANKED tool needs the full vector, not just a depth: pass
+            # tool_offset [x, y, z] in the TOOL frame (x along the handle,
+            # z down). The printed scoop is [0.045, 0, 0.028] for a mid-grip
+            # grasp. tool_length alone puts the bowl 25mm off the target once
+            # the bite tilt is applied. See BaseSkill.resolve_tool_offset.
             "tool_length": 0.0,
+            "tool_offset": None,
             "hover_tol": 0.05,
             # The plunge and push are contact motions: the powder resists, so
             # the arm legitimately stops short and a tight tolerance would fail
@@ -147,9 +154,11 @@ class ScoopSkill(BaseSkill):
         requested_untilt = float(params["untilt_over"])
         dig_tilt_deg = float(params["dig_tilt_deg"])
         lift_height = float(params["lift_height"])
-        tool_length = float(params["tool_length"])
+        tool_offset = self.resolve_tool_offset(params)
+        tool_length = float(tool_offset[2])   # nominal drop, for logging/limits
         wall_clearance = float(params["wall_clearance"])
         contact_tol = float(params["contact_tol"])
+        dip_depth = max(0.0, float(params["dip_depth"]))
         tilt_tol = float(params["tilt_tol_deg"])
         retries = max(1, int(params["tilt_retries"]))
         push_seconds = max(0.5, float(params["push_seconds"]))
@@ -191,9 +200,19 @@ class ScoopSkill(BaseSkill):
         rim_center = located["rim_center"]
         surface_z = located["top_z"]
         rim_radius = located["rim_radius"]
+        # Print base_z and height too: a container that segments as a few
+        # millimetres tall is almost always the PAPER LABEL under it rather
+        # than the container itself, and surface_z alone hides that.
         print(f"[Scoop] '{source}' surface z={surface_z:.4f}, "
+              f"base z={located['base_z']:.4f}, "
+              f"height {located['height'] * 1000:.0f}mm, "
               f"centre {np.round(rim_center, 4)}, "
               f"opening radius {rim_radius * 1000:.0f}mm")
+        if located["height"] < 0.02:
+            print(f"[Scoop] WARNING: that is only "
+                  f"{located['height'] * 1000:.0f}mm tall. A real cup is "
+                  f"~90mm. This is probably the paper label, not the "
+                  f"container — check the mask before trusting the depth.")
 
         # 2. Clamp the whole stroke to the measured opening, scaling the plunge
         # and the push together so their ratio survives the clamp.
@@ -230,16 +249,25 @@ class ScoopSkill(BaseSkill):
         # 2026-09-16: pulling toward the base scrapes powder toward the near
         # wall and the bowl comes out the far side of the stroke empty.
         push = np.array([1.0, 0.0])
-        start_xy = rim_center - push * (total / 2.0)
+        site = np.asarray(rim_center, dtype=float) + np.array([
+            float(params["forward_offset"]), float(params["lateral_offset"])])
+        if not np.allclose(site, rim_center):
+            print(f"[Scoop] Stroke site shifted by "
+                  f"forward(X)={float(params['forward_offset']):+.3f}m "
+                  f"lateral(Y)={float(params['lateral_offset']):+.3f}m: "
+                  f"rim {np.round(rim_center, 4)} -> {np.round(site, 4)}")
+        start_xy = site - push * (total / 2.0)
         dig_xy = start_xy + push * dig_advance
         end_xy = start_xy + push * total
 
         level_rotation = self.tool_down_rotation()
-        dig_z = surface_z - scoop_depth + tool_length
-        if dig_z < self.workspace_min[2]:
+        dig_z = surface_z - scoop_depth
+        push_z = dig_z - dip_depth          # where the stroke actually runs
+        if push_z < self.workspace_min[2]:
             return False, {
-                "error": (f"Dig depth would put the wrist at z={dig_z:.3f}, below "
-                          f"the workspace floor {self.workspace_min[2]:.3f}"),
+                "error": (f"Dig depth plus dip would put the bowl at "
+                          f"z={push_z:.3f}, below the workspace floor "
+                          f"{self.workspace_min[2]:.3f}"),
             }
 
         def rotation_at(angle_deg: float) -> np.ndarray:
@@ -247,9 +275,11 @@ class ScoopSkill(BaseSkill):
             return _orthonormalize(level_rotation @ tool_y_delta(-float(angle_deg)))
 
         # 4. Hover above the start of the stroke, level (free space, strict).
-        hover = np.array([start_xy[0], start_xy[1],
-                          surface_z + float(params["approach_height"]) + tool_length])
-        print(f"[Scoop] Hovering above the powder at {np.round(hover, 4)}...")
+        hover_tip = np.array([start_xy[0], start_xy[1],
+                              surface_z + float(params["approach_height"])])
+        hover = self.tcp_for_tip(hover_tip, level_rotation, tool_offset)
+        print(f"[Scoop] Hovering with the bowl above the powder at "
+              f"{np.round(hover_tip, 4)} (TCP {np.round(hover, 4)})...")
         if not self.goto_pose_rigid(hover, level_rotation, duration=3.0):
             return False, {"error": "Failed to command hover pose"}
         arrived, err = self.reached(hover, float(params["hover_tol"]))
@@ -309,8 +339,9 @@ class ScoopSkill(BaseSkill):
 
         # 6. Plunge in, tilted, advancing forward in the same motion. A
         # straight-down drop bites into nothing.
-        entry = np.array([dig_xy[0], dig_xy[1], dig_z])
-        print(f"[Scoop] Plunging to z={dig_z:.4f} while advancing "
+        entry = self.tcp_for_tip(np.array([dig_xy[0], dig_xy[1], dig_z]),
+                                 tilted_rotation, tool_offset)
+        print(f"[Scoop] Plunging the bowl to z={dig_z:.4f} while advancing "
               f"{dig_advance * 1000:.0f}mm away from the base "
               f"({scoop_depth * 1000:.0f}mm deep, tilted, compliant)...")
         if not self.goto_pose_rigid(entry, tilted_rotation, duration=3.0,
@@ -325,6 +356,24 @@ class ScoopSkill(BaseSkill):
                           f"(off by {err * 1000:.0f}mm); the scoop is probably "
                           f"fouling the rim"),
             }
+
+        # 6b. Dip: having cut in at the entry angle, drive the bowl a little
+        # deeper before the stroke starts. The plunge sets the angle, this sets
+        # the depth — keeping them separate means the entry can be made sharper
+        # without also making the scoop deeper, and vice versa.
+        if dip_depth > 1e-6:
+            dip = self.tcp_for_tip(np.array([dig_xy[0], dig_xy[1], push_z]),
+                                   tilted_rotation, tool_offset)
+            print(f"[Scoop] Dipping a further {dip_depth * 1000:.0f}mm to "
+                  f"z={push_z:.4f} before pushing...")
+            if not self.goto_pose_rigid(dip, tilted_rotation, duration=2.0,
+                                        use_impedance=True):
+                return False, {"error": "Failed to command the dip"}
+            arrived, err = self.reached(dip, contact_tol)
+            if not arrived:
+                # The bed resisting is expected; only a gross miss matters.
+                print(f"[Scoop] Dip ended {err * 1000:.0f}mm short "
+                      f"(powder resistance); continuing")
 
         # 7. Push away from the base, rolling back to level as it goes.
         #
@@ -361,7 +410,10 @@ class ScoopSkill(BaseSkill):
             if segment_length <= 1e-6:
                 continue
             xy = dig_xy + push * target_s
-            point = np.array([xy[0], xy[1], dig_z])
+            # The offset rotates with the wrist, so the TCP target has to be
+            # recomputed for THIS segment's end orientation, not fixed once.
+            point = self.tcp_for_tip(np.array([xy[0], xy[1], push_z]),
+                                     rotation_at(end_angle), tool_offset)
             seconds = push_seconds * (segment_length / drag_distance)
             print(f"[Scoop]   -> {target_s * 1000:.0f}mm, tilt "
                   f"{angle_now:.0f}° -> {end_angle:.0f}° "
@@ -374,7 +426,8 @@ class ScoopSkill(BaseSkill):
                 break
             pushed = target_s
 
-        exit_point = np.array([end_xy[0], end_xy[1], dig_z])
+        exit_point = self.tcp_for_tip(np.array([end_xy[0], end_xy[1], push_z]),
+                                      rotation_at(0.0), tool_offset)
         arrived, err = self.reached(exit_point, contact_tol)
         if not arrived:
             # Not fatal — a partial push still lifts powder.
@@ -398,7 +451,7 @@ class ScoopSkill(BaseSkill):
             np.asarray(self.get_current_pose().rotation, dtype=float)
         )
         lift = np.asarray(self.get_current_pose().translation, dtype=float).copy()
-        lift[2] = surface_z + lift_height + tool_length
+        lift[2] = surface_z + lift_height + float(tool_offset[2])
         print(f"[Scoop] Lifting clear to z={lift[2]:.4f}...")
         if not self.goto_pose_rigid(lift, level_now, duration=3.0):
             return False, {"error": "Failed to lift the scoop clear"}
@@ -419,6 +472,8 @@ class ScoopSkill(BaseSkill):
         return True, {
             "scooped_from": source,
             "scoop_depth": scoop_depth,
+            "dip_depth": dip_depth,
+            "total_depth": scoop_depth + dip_depth,
             "dig_advance": dig_advance,
             "drag_distance": drag_distance,
             "pushed": pushed,
@@ -428,6 +483,9 @@ class ScoopSkill(BaseSkill):
             "push_direction": "away_from_base(+X)",
             "rim_radius": rim_radius,
             "surface_z": surface_z,
+            "forward_offset": float(params["forward_offset"]),
+            "lateral_offset": float(params["lateral_offset"]),
+            "tool_offset": [float(v) for v in tool_offset],
             "dig_tilt_commanded": dig_tilt_deg,
             "dig_tilt_achieved": achieved,
             "residual_tilt": residual,

@@ -74,6 +74,23 @@ def to_rigid_transform(pose) -> "RigidTransform":
     )
 
 
+def tool_y_delta(angle_degrees: float) -> np.ndarray:
+    """
+    Rotation about the tool's own y axis, as a right-multiplied delta.
+
+    Mirrors ``BaseSkill.rotate_about_tool_axis(axis="y")`` but as pure maths
+    with no motion, so a skill can compute a *sequence* of orientations up
+    front instead of issuing relative nudges and hoping they compose.
+
+    Sign: NEGATIVE tips the tool's nose down — the direction scoop bites into
+    powder and dump tips it back out. See the note on the negation in
+    ScoopSkill.execute for why the intuitive sign is the wrong one.
+    """
+    angle_rad = np.radians(float(angle_degrees))
+    c, s = np.cos(angle_rad), np.sin(angle_rad)
+    return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
+
+
 def to_matrix(pose) -> np.ndarray:
     """
     Convert a pose into a 4x4 numpy matrix.
@@ -221,6 +238,18 @@ class BaseSkill(ABC):
         Returns:
             Complete parameter dictionary with defaults filled in
         """
+        known = set(self.optional_params) | set(self.required_params)
+        unknown = [k for k in params if k not in known]
+        if unknown:
+            # Silently dropping a parameter is the worst failure mode here: the
+            # skill runs, looks plausible, and ignores the thing you asked for.
+            # That cost several bench runs on scoop's forward/lateral offsets
+            # after an edit dropped them from optional_params while the CLI
+            # kept happily accepting them.
+            print(f"[{self.name}] WARNING: ignoring unknown parameter(s) "
+                  f"{unknown} — they do nothing. Known parameters: "
+                  f"{sorted(known)}")
+
         complete_params = self.optional_params.copy()
         complete_params.update(params)
         return complete_params
@@ -574,6 +603,43 @@ class BaseSkill(ABC):
             return 1.0
         x = min(1.0, max(0.0, float(t) / float(total)))
         return 10.0 * x ** 3 - 15.0 * x ** 4 + 6.0 * x ** 5
+
+    @staticmethod
+    def resolve_tool_offset(params: Dict[str, Any]) -> np.ndarray:
+        """
+        TCP -> working-tip offset, in the TOOL frame, as [x, y, z] metres.
+
+        ``tool_length`` only ever expressed "the tip hangs this far below the
+        gripper", which is true for a straight tool and wrong for a cranked one.
+        The printed scoop has its bowl 45mm along the handle AND 28mm below it,
+        so once the wrist tilts, part of that along-handle distance becomes
+        horizontal: at scoop's 30 deg bite the bowl sits 47mm down and 25mm
+        sideways from the TCP. Aiming the TCP at the powder puts the bowl 25mm
+        away from it — outside a 43mm cup for much of the stroke.
+
+        Pass ``tool_offset: [x, y, z]`` for such a tool. ``tool_length`` still
+        works and means ``[0, 0, tool_length]``.
+        """
+        explicit = params.get("tool_offset")
+        if explicit is not None:
+            offset = np.asarray(explicit, dtype=float).reshape(3)
+        else:
+            offset = np.array([0.0, 0.0, float(params.get("tool_length", 0.0))])
+        return offset
+
+    @staticmethod
+    def tcp_for_tip(tip_world: np.ndarray, rotation: np.ndarray,
+                    tool_offset: np.ndarray) -> np.ndarray:
+        """
+        Where the TCP must go to put the tool's tip at ``tip_world``.
+
+        The offset is fixed in the tool frame, so it rotates with the wrist —
+        which is why this has to be recomputed whenever the commanded
+        orientation changes, not applied once as a constant.
+        """
+        R = _orthonormalize(np.asarray(rotation, dtype=float))
+        return np.asarray(tip_world, dtype=float) - R @ np.asarray(
+            tool_offset, dtype=float)
 
     def reached(self, target_xyz: np.ndarray, tol: float) -> Tuple[bool, float]:
         """Did the arm actually get within ``tol`` metres of ``target_xyz``?"""

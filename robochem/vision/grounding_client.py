@@ -20,6 +20,9 @@ import numpy as np
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
+# label_resolver imports nothing from this package, so this cannot cycle.
+from .label_resolver import resolve_sam_prompt
+
 
 class GroundingUnavailable(RuntimeError):
     """Raised when the grounding service cannot be reached."""
@@ -45,6 +48,21 @@ class GroundingClient:
                 f"perception_service/grounding_service.py "
                 f"--backend sam3 --model weights/sam3.pt"
             )
+
+    def _resolve(self, prompt: str) -> str:
+        """
+        Map a project name onto the phrase SAM is actually asked for.
+
+        Applied here, at the HTTP boundary, rather than in VisionSystem — this
+        is the one place every caller funnels through. check_object.py and
+        diagnose_grounding.py both talk to this client directly, and when the
+        alias lived further up they silently sent the unaliased name and got
+        "no masks" while the skills worked fine.
+        """
+        resolved = resolve_sam_prompt(prompt)
+        if resolved != prompt:
+            print(f"[Grounding] prompting with {resolved!r} for {prompt!r} (alias)")
+        return resolved
 
     def _post_segment(
         self,
@@ -94,6 +112,7 @@ class GroundingClient:
             (masks, confidences) keyed by camera ID. Cameras where the concept
             was not found are absent from both dicts.
         """
+        prompt = self._resolve(prompt)
         payload = self._post_segment(images, prompt, conf=conf, return_all=False)
         masks: Dict[int, np.ndarray] = {}
         confidences: Dict[int, float] = {}
@@ -127,6 +146,7 @@ class GroundingClient:
         Returns:
             camera_id -> list of {"mask", "score", "box", "area_px"}
         """
+        prompt = self._resolve(prompt)
         payload = self._post_segment(images, prompt, conf=conf, return_all=True)
         out: Dict[int, List[dict]] = {}
 

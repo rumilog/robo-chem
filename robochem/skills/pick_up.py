@@ -44,6 +44,60 @@ def width_along_closing_axis(points, grasp_pose, slab=0.01,
                  - np.percentile(projected, lo_pct))
 
 
+def measure_tool_offset(points, grasp_pose, min_span=0.015):
+    """
+    Where the working end of a held tool sits, relative to the grasp.
+
+    Returns [x, y, z] in the TOOL frame — the vector ``scoop``/``stir`` want as
+    ``tool_offset``. Computed from the segmented cloud at the moment of the
+    grasp, which is the only place that knows both the tool's shape and where
+    the jaws actually closed on it.
+
+    This exists because that offset is NOT a property of the tool alone: shift
+    the grasp 10mm along the handle and the bowl is 10mm further away. Tuning
+    ``forward_offset`` therefore silently invalidates any hand-measured
+    ``tool_offset``, and the scoop then digs next to the powder instead of in
+    it. Reporting it here keeps the two in step.
+
+    The working end is taken to be the bulkier end of the tool along the
+    gripper's approach-perpendicular axis — for a scoop that is the bowl, which
+    is wider and deeper than the handle it hangs off.
+
+    IMPORTANT — the z component is a LOWER BOUND, not a measurement. The cage
+    cameras look down, so the underside of a bowl is occluded from all of them
+    and the cloud stops at the rim. On the printed scoop this reads ~11mm when
+    the floor that actually digs is 28mm below the grasp: use it far enough
+    shallow and the scoop hovers over the powder and comes up empty. Take x and
+    y from here, and z from the CAD wherever you have it.
+    """
+    points = np.asarray(points, dtype=float)
+    if len(points) < 20:
+        return None
+
+    origin = grasp_pose[:3, 3]
+    R = grasp_pose[:3, :3]
+    local = (points - origin) @ R          # world -> tool frame
+
+    forward = local[:, 0]
+    pos, neg = local[forward > min_span], local[forward < -min_span]
+    # The bowl end is the one with more material hanging off it.
+    if len(pos) == 0 and len(neg) == 0:
+        return None
+    end = pos if len(pos) >= len(neg) else neg
+    if len(end) < 10:
+        return None
+
+    # Within that end, the working point is the far, deepest part of the bowl.
+    far = end[np.abs(end[:, 0]) > np.percentile(np.abs(end[:, 0]), 70)]
+    if len(far) < 5:
+        far = end
+    return np.array([
+        float(np.median(far[:, 0])),
+        float(np.median(far[:, 1])),
+        float(np.percentile(far[:, 2], 95)),   # +Z is down in the tool frame
+    ])
+
+
 def upright_from_pitched(pose: np.ndarray) -> np.ndarray:
     """
     Same XY/closing as a pitched cup grasp, but tool Z straight down.
@@ -108,6 +162,17 @@ class PickUpSkill(BaseSkill):
             # World-Z shift of the grasp, metres. Negative lowers the fingers.
             # Keep near 0 for flat objects (spoons); +0.02 floats above them.
             "z_offset": 0.0,
+            # World-XY shift of the grasp, metres, same sign convention as
+            # pour's site offsets: +X is forward from the base toward the
+            # workspace, so NEGATIVE forward_offset grasps closer to the base.
+            #
+            # Needed for any object whose centroid is not where you want the
+            # jaws. The printed scoop is the case in point: its mass is in the
+            # bowl, so the computed grasp lands on the crank where the handle
+            # bends down — the one spot on the tool where the cross-section is
+            # changing and the jaws cannot seat flat.
+            "forward_offset": 0.0,
+            "lateral_offset": 0.0,
             # Clear the cameras before scanning via frankapy reset_joints
             # (home), not a hardcoded XYZ park.
             "reset_before_scan": True,
@@ -216,6 +281,8 @@ class PickUpSkill(BaseSkill):
             return False, {"error": "Could not compute valid grasp pose"}
 
         z_offset = params["z_offset"]
+        forward_offset = float(params["forward_offset"])
+        lateral_offset = float(params["lateral_offset"])
         grasp_pose = None
         for i, cand in enumerate(candidates):
             pose = cand.copy()
@@ -225,6 +292,14 @@ class PickUpSkill(BaseSkill):
                     self.workspace_min[2],
                     self.workspace_max[2],
                 ))
+            if forward_offset or lateral_offset:
+                shifted = pose[:3, 3] + np.array(
+                    [forward_offset, lateral_offset, 0.0], dtype=float
+                )
+                pose[:3, 3] = self._clamp_position(shifted)
+                print(f"[PickUp] Grasp shifted by forward(X)={forward_offset:+.3f}m "
+                      f"lateral(Y)={lateral_offset:+.3f}m -> "
+                      f"{np.round(pose[:3, 3], 4)}")
 
             tip = pose[:3, 2]
             tip_from_vert = float(np.degrees(np.arccos(np.clip(-tip[2], -1, 1))))
@@ -404,6 +479,18 @@ class PickUpSkill(BaseSkill):
                 "expected_width": expected,
             }
 
+        suggested = measure_tool_offset(object_pc, grasp_pose)
+        if suggested is not None:
+            print(f"[PickUp] Measured tool offset (TCP -> working end, tool "
+                  f"frame): [{suggested[0]:.3f}, {suggested[1]:.3f}, "
+                  f"{suggested[2]:.3f}] m")
+            print(f"[PickUp]   x/y are measured and reliable; it changes "
+                  f"whenever the grasp moves.")
+            print(f"[PickUp]   z={suggested[2]:.3f} is a LOWER BOUND — the "
+                  f"cameras look down, so the underside of a bowl is occluded "
+                  f"and the cloud stops at the rim. Use the CAD depth if you "
+                  f"have it, or the tool will dig too shallow.")
+
         print(f"[PickUp] Successfully picked up '{object_name}'")
         
         # The object has moved, so any cached segmentation is now stale.
@@ -417,6 +504,8 @@ class PickUpSkill(BaseSkill):
             "expected_width": expected,
             "target_width": target_width,
             "grasp_force": grasp_force,
+            "suggested_tool_offset": (None if suggested is None
+                                      else [float(v) for v in suggested]),
             "centroid": centroid.tolist(),
             "dimensions": dimensions.tolist() if dimensions is not None else None,
         }

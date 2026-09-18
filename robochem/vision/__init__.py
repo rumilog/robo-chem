@@ -15,7 +15,8 @@ from .scene_analyzer import SceneAnalyzer
 from .object_localizer import ObjectLocalizer
 from .grasp_analyzer import GraspAnalyzer
 from .instruction_parser import InstructionParser
-from .label_resolver import LabelResolver, looks_like_label_query
+from .label_resolver import (LabelResolver, looks_like_label_query,
+                             resolve_sam_prompt)
 
 
 class VisionSystem:
@@ -194,6 +195,9 @@ class VisionSystem:
         )
 
     def _locate_direct(self, object_name: str):
+        # The name SAM is prompted with may differ from the one we track the
+        # object by; GroundingClient resolves that at the HTTP boundary so
+        # every caller gets it, this one included. See SAM_PROMPT_ALIASES.
         data = self.object_localizer.capture_pointclouds()
         cam_ids = [c for c in self.object_localizer.camera_ids if c in data["images"]]
         images = [data["images"][c] for c in cam_ids]

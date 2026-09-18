@@ -46,7 +46,53 @@ DIRECT_SAM_QUERIES = {
     "stirring rod",
     "glass rod",
     "spatula",
+    # The printed cranked scoop — see SAM_PROMPT_ALIASES for why this wording.
+    "white plastic tool",
 }
+
+
+#: Names this project uses -> the phrase SAM 3 actually responds to.
+#:
+#: SAM 3 is open-vocabulary but not unlimited: a phrase it has no concept for
+#: returns NOTHING, silently and on every camera. "rectangular scoop" found zero
+#: masks across all four cages on 2026-09-18 — the description was accurate and
+#: the model simply had no such concept.
+#:
+#: So the name a skill or an agent uses does not have to be the name SAM is
+#: given. Put the readable name on the left and whatever the prompt sweep
+#: actually found on the right. Both sides bypass the reagent-label path.
+#:
+#: Populate the right-hand side from scripts/sweep_prompts.py — do not guess.
+SAM_PROMPT_ALIASES = {
+    # The printed cranked scoop: an 8mm handle with a 20.5mm open box on the
+    # end. Chosen by scripts/sweep_prompts.py against
+    # scene_captures/new_scoop_20260918_151846 and confirmed by eye on the
+    # overlays — cam5 masks the whole Z-shape, cam2 catches the handle only.
+    #
+    # The sweep is worth reading before changing this. SAM 3 found NOTHING for
+    # "spoon", "spatula", "rectangular scoop" or "square spoon" — plausible
+    # descriptions that simply are not concepts it has. "scoop" alone managed
+    # 2/4 cameras. "white object" scored 0.95 on 4/4 but masked 2% of the
+    # frame: it was matching the paper cups, which is the failure this list
+    # exists to avoid. Do not pick a prompt on score alone.
+    "rectangular scoop": "white plastic tool",
+    "printed scoop": "white plastic tool",
+    # robomail_Aliyah's robot profile names this position "measuring scoop";
+    # the bench object it refers to is the same printed tool.
+    "measuring scoop": "white plastic tool",
+}
+
+
+def resolve_sam_prompt(object_name: str) -> str:
+    """
+    Map a project name onto the phrase SAM 3 is actually given.
+
+    Returns ``object_name`` unchanged when there is no alias, so this is safe to
+    call on every query.
+    """
+    if not object_name:
+        return object_name
+    return SAM_PROMPT_ALIASES.get(normalize_label(object_name), object_name)
 
 
 def normalize_label(text: str) -> str:
@@ -94,6 +140,10 @@ def looks_like_label_query(object_name: str) -> bool:
     """
     key = normalize_label(object_name)
     if not key:
+        return False
+    # Anything with an explicit SAM alias is a physical object we know how to
+    # prompt for, never a reagent label.
+    if key in SAM_PROMPT_ALIASES:
         return False
     if key in {normalize_label(q) for q in DIRECT_SAM_QUERIES}:
         return False

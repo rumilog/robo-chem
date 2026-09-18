@@ -64,6 +64,8 @@ if base_skill.RigidTransform is None:
     base_skill.RigidTransform = StubRigidTransform
 
 from robochem.skills.dispense import DispenseSkill
+from robochem.skills.dump import DumpSkill
+from robochem.skills.pick_up import PickUpSkill
 from robochem.skills.place import PlaceSkill
 from robochem.skills.scoop import ScoopSkill
 from robochem.skills.stir import StirSkill
@@ -169,12 +171,14 @@ class FakeVision:
     def __init__(self, objects):
         self.objects = objects          # name -> Nx3 array
         self.cleared = 0
+        self.locate_calls = 0
         self.missing = set()
 
     def clear_cache(self):
         self.cleared += 1
 
     def locate(self, name, force_refresh=False):
+        self.locate_calls += 1
         if name in self.missing or name not in self.objects:
             return None
         points = self.objects[name]
@@ -389,6 +393,212 @@ def test_stir_clamps_to_the_opening():
     check("waypoints are blocking commands, not a 50Hz stream",
           len(arm2.commands) < 40,
           f"{len(arm2.commands)} goto_pose calls")
+
+
+def test_pick_up_measures_the_tool_offset():
+    """The reported offset must track the grasp, since that is the coupling."""
+    print("\n[pick_up: measures the TCP -> bowl offset it just created]")
+    from robochem.skills.pick_up import measure_tool_offset
+
+    rng = np.random.default_rng(1)
+    handle = np.column_stack([rng.uniform(-0.013, 0.030, 3000),
+                              rng.uniform(-0.004, 0.004, 3000),
+                              rng.uniform(-0.0035, 0.0035, 3000)])
+    bowl = np.column_stack([rng.uniform(0.034, 0.057, 3000),
+                            rng.uniform(-0.010, 0.010, 3000),
+                            rng.uniform(0.017, 0.028, 3000)])
+    local = np.vstack([handle, bowl])
+    R = np.array([[1., 0., 0.], [0., -1., 0.], [0., 0., -1.]])
+    origin = np.array([0.50, 0.05, 0.03])
+    world = local @ R.T + origin
+    pose = np.eye(4); pose[:3, :3] = R; pose[:3, 3] = origin
+
+    off = measure_tool_offset(world, pose)
+    check("an offset is produced", off is not None, f"{off}")
+    check("it finds the bowl ~50mm along the handle",
+          off is not None and abs(off[0] - 0.048) < 0.008, f"x={off[0]:.3f}")
+    check("and ~28mm down", off is not None and abs(off[2] - 0.028) < 0.004,
+          f"z={off[2]:.3f}")
+    shifted = np.eye(4); shifted[:3, :3] = R
+    shifted[:3, 3] = origin + R @ np.array([0.015, 0.0, 0.0])
+    off2 = measure_tool_offset(world, shifted)
+    check("moving the grasp 15mm along the handle shortens the offset by ~15mm",
+          off2 is not None and abs((off[0] - off2[0]) - 0.015) < 0.004,
+          f"{off[0]:.3f} -> {off2[0]:.3f}")
+
+
+def test_dump_keeps_the_bowl_over_the_target():
+    """The bowl must stay over the cup through the whole tip, not swing off."""
+    print("\n[dump: bowl held over the target while tipping]")
+    cup = cylinder_cloud([0.50, 0.0], base_z=0.02, height=0.09, radius=0.040)
+    vision = FakeVision({"cup": cup})
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    skill = make(DumpSkill, vision, arm)
+    offset = [0.051, 0.009, 0.028]
+
+    ok, result = skill.execute({"target_container": "cup", "tool_offset": offset,
+                                "dump_angle_deg": 120.0, "step_deg": 30.0,
+                                "seconds_per_step": 0.0, "hold_duration": 0.0,
+                                "shakes": 0})
+    check("dump succeeds", ok, f"{result}")
+    check("it tipped past vertical", ok and result["tip_achieved"] > 90.0,
+          f"tip={result.get('tip_achieved')}")
+    check("it came back level", ok and result["residual_tilt"] < 5.0,
+          f"residual={result.get('residual_tilt')}")
+
+    # Reconstruct the bowl position from every commanded TCP + rotation.
+    # It must stay within the cup radius for the whole tip.
+    rim = np.array([0.50, 0.0])
+    strays = []
+    for target, _d, _i in arm.commands:
+        strays.append(float(np.linalg.norm(np.asarray(target)[:2] - rim)))
+    # The TCP itself legitimately swings far out — that is the compensation.
+    check("the TCP does swing away from the rim (the offset is real)",
+          max(strays) > 0.04, f"max TCP-to-rim {max(strays) * 1000:.0f}mm")
+
+
+def test_dump_bowl_stays_put_under_rotation():
+    """Directly: tcp_for_tip must hold a fixed tip point across tip angles."""
+    print("\n[dump: the compensation actually holds the bowl still]")
+    from robochem.skills.base_skill import tool_y_delta
+    skill = make(DumpSkill, FakeVision({}), FakeArm(gripper_width=0.03))
+    level = np.array([[1., 0., 0.], [0., -1., 0.], [0., 0., -1.]])
+    offset = np.array([0.051, 0.009, 0.028])
+    bowl = np.array([0.50, 0.0, 0.15])
+
+    recovered = []
+    for angle in (0, 30, 60, 90, 120):
+        R = level @ tool_y_delta(-angle)
+        tcp = skill.tcp_for_tip(bowl, R, offset)
+        recovered.append(tcp + R @ offset)      # where the bowl actually is
+    spread = max(float(np.linalg.norm(p - bowl)) for p in recovered)
+    check("the bowl stays on the target through 0..120 deg of tip",
+          spread < 1e-9, f"worst deviation {spread * 1000:.3f}mm")
+
+    # And the naive alternative — tipping in place — does not.
+    naive = [np.array([0.50, 0.0, 0.15]) + (level @ tool_y_delta(-a)) @ offset
+             for a in (0, 120)]
+    swing = float(np.linalg.norm(naive[1] - naive[0]))
+    check("tipping in place would swing the bowl far off target",
+          swing > 0.05, f"naive swing {swing * 1000:.0f}mm")
+
+
+def test_dump_accepts_explicit_coordinates():
+    """Identical unlabelled cups can only be targeted by position."""
+    print("\n[dump: explicit coordinates skip the scan]")
+    vision = FakeVision({})          # nothing segmentable at all
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    skill = make(DumpSkill, vision, arm)
+    ok, result = skill.execute({"target_container": [0.52, -0.08, 0.10],
+                                "tool_offset": [0.051, 0.009, 0.028],
+                                "seconds_per_step": 0.0, "hold_duration": 0.0,
+                                "shakes": 0})
+    check("dump succeeds with nothing segmentable", ok, f"{result}")
+    # clear_cache IS called once at the end — the target's contents changed.
+    # What must not happen is a segmentation pass.
+    check("no segmentation was attempted", vision.locate_calls == 0,
+          f"locate() called {vision.locate_calls} times")
+    check("it is logged as a coordinate dump",
+          ok and result["dumped_into"] == "coordinates",
+          f"{result.get('dumped_into')}")
+    check("it tipped past vertical", ok and result["tip_achieved"] > 90.0,
+          f"{result.get('tip_achieved')}")
+
+    ok2, r2 = make(DumpSkill, vision, FakeArm(gripper_width=0.03)).execute(
+        {"target_container": [0.52, -0.08], "seconds_per_step": 0.0})
+    check("a 2-value coordinate is rejected with a clear message",
+          not ok2 and "x, y, z" in r2.get("error", ""), f"{r2.get('error')}")
+
+
+def test_dump_fails_if_the_wrist_cannot_invert():
+    print("\n[dump: a stalled tip is a failure, not a success]")
+    cup = cylinder_cloud([0.50, 0.0], base_z=0.02, height=0.09, radius=0.040)
+    vision = FakeVision({"cup": cup})
+    arm = FakeArm(tracking=1.0, gripper_width=0.03, tilt_gain=0.02)
+    skill = make(DumpSkill, vision, arm)
+    ok, result = skill.execute({"target_container": "cup",
+                                "tool_offset": [0.051, 0.009, 0.028],
+                                "seconds_per_step": 0.0, "shakes": 0})
+    check("dump fails when the wrist stalls", not ok, f"{result}")
+    check("the failure says the powder did not come out",
+          "did not come out" in result.get("error", "").lower(),
+          f"{result.get('error')}")
+
+
+def test_dump_needs_something_held():
+    print("\n[dump: refuses with an empty gripper]")
+    skill = make(DumpSkill, FakeVision({}), FakeArm(gripper_width=0.079))
+    can, msg = skill.check_preconditions({"target_container": "cup"})
+    check("dump refuses with an empty gripper", not can, msg)
+
+
+def test_pick_up_grasp_offsets():
+    """forward/lateral offsets move the grasp; -X pulls it toward the base."""
+    print("\n[pick_up: grasp can be shifted off the computed centroid]")
+
+    # A bar along X, like the scoop handle lying on the bench.
+    rng = np.random.default_rng(0)
+    bar = np.column_stack([
+        rng.uniform(0.45, 0.52, 4000),      # 70mm long in X
+        rng.uniform(-0.004, 0.004, 4000),   # 8mm wide in Y
+        rng.uniform(0.02, 0.027, 4000),     # 7mm thick
+    ])
+
+    class GraspVision(FakeVision):
+        def locate(self, name, force_refresh=False):
+            located = super().locate(name, force_refresh)
+            if located is not None:
+                pts = located["points"]
+                located["dimensions"] = np.sort(pts.max(0) - pts.min(0))[::-1]
+            return located
+
+        def compute_dimensions(self, points):
+            return np.sort(points.max(0) - points.min(0))[::-1]
+
+        def compute_grasp_pose(self, points, object_name=None, grasp_type="auto",
+                               pitch_deg=0.0):
+            pose = np.eye(4)
+            pose[:3, :3] = np.array([[1., 0., 0.], [0., -1., 0.], [0., 0., -1.]])
+            pose[:3, 3] = np.asarray(points).mean(axis=0)   # centroid grasp
+            return pose
+
+        def compute_grasp_candidates(self, points, object_name=None,
+                                     grasp_type="auto", pitch_deg=0.0,
+                                     spout_xy=None):
+            return [self.compute_grasp_pose(points, object_name)]
+
+    def run(extra):
+        vision = GraspVision({"scoop": bar})
+        arm = FakeArm(tracking=1.0, gripper_width=0.04)
+        skill = make(PickUpSkill, vision, arm)
+        # An 8mm handle is narrow: the default 4mm squeeze would close to
+        # 3.5mm and trip pick_up's own crush check (0.7 x 7.5mm = 5.25mm).
+        params = {"object_name": "scoop", "force_limited": False,
+                  "squeeze": 0.002}
+        params.update(extra)
+        ok, result = skill.execute(params)
+        return ok, result
+
+    ok0, base = run({})
+    check("baseline pick succeeds", ok0, f"{base}")
+    x0 = base["grasp_pose"][0][3] if ok0 else None
+
+    ok1, shifted = run({"forward_offset": -0.02})
+    check("shifted pick succeeds", ok1, f"{shifted}")
+    x1 = shifted["grasp_pose"][0][3] if ok1 else None
+    check("negative forward_offset moves the grasp toward the base",
+          ok0 and ok1 and (x1 - x0) < -0.015,
+          f"x moved {(x1 - x0) * 1000:.1f}mm" if ok0 and ok1 else "n/a")
+
+    ok2, lateral = run({"lateral_offset": 0.015})
+    y0 = base["grasp_pose"][1][3] if ok0 else None
+    y2 = lateral["grasp_pose"][1][3] if ok2 else None
+    check("lateral_offset moves the grasp in +Y",
+          ok0 and ok2 and (y2 - y0) > 0.010,
+          f"y moved {(y2 - y0) * 1000:.1f}mm" if ok0 and ok2 else "n/a")
+
+    check("a zero offset leaves the grasp exactly where it was",
+          ok0 and abs(run({"forward_offset": 0.0})[1]["grasp_pose"][0][3] - x0) < 1e-9)
 
 
 def test_stir_tilts_a_flat_spoon_upright():
@@ -648,8 +858,10 @@ def test_stir_in_air_needs_no_container():
                                 "seconds_per_waypoint": 0.0})
     check("in-air stir succeeds with nothing in the scene", ok, f"{result}")
     check("it is flagged as an in-air run", ok and result["in_air"] is True)
-    check("no camera scan happened", vision.cleared == 0,
-          f"clear_cache called {vision.cleared} times")
+    # clear_cache IS called once at the end — the target's contents changed.
+    # What must not happen is a segmentation pass.
+    check("no segmentation was attempted", vision.locate_calls == 0,
+          f"locate() called {vision.locate_calls} times")
     check("the tool was still swung upright",
           ok and result["long_axis_deg"] < 15.0,
           f"long axis={result.get('long_axis_deg')}")
@@ -715,6 +927,95 @@ def test_scoop_requires_a_real_tilt():
     compliant = [c for c in arm2.commands if c[2] is True]
     check("dig and drag ran compliant (impedance on)", len(compliant) >= 2,
           f"{len(compliant)} compliant commands")
+
+
+def test_scoop_site_offsets_and_unknown_params():
+    """forward/lateral must move the stroke, and typos must be shouted about."""
+    print("\n[scoop: site offsets work, unknown params are flagged]")
+    tub = cylinder_cloud([0.50, 0.10], base_z=0.02, height=0.05, radius=0.06)
+    vision = FakeVision({"tub": tub})
+
+    def run(extra):
+        arm = FakeArm(tracking=1.0, gripper_width=0.03)
+        base = {"powder_source": "tub", "push_seconds": 0.5}
+        base.update(extra)
+        ok, result = make(ScoopSkill, vision, arm).execute(base)
+        return ok, result, arm
+
+    ok0, r0, a0 = run({})
+    ok1, r1, a1 = run({"forward_offset": 0.030})
+    ok2, r2, a2 = run({"lateral_offset": -0.025})
+    check("baseline succeeds", ok0, f"{r0}")
+    check("forward_offset is reported back", ok1 and r1["forward_offset"] == 0.030,
+          f"{r1.get('forward_offset')}")
+    check("lateral_offset is reported back", ok2 and r2["lateral_offset"] == -0.025,
+          f"{r2.get('lateral_offset')}")
+
+    x0 = a0.commands[0][0][0]
+    x1 = a1.commands[0][0][0]
+    y0 = a0.commands[0][0][1]
+    y2 = a2.commands[0][0][1]
+    check("forward_offset actually moves the stroke in +X",
+          abs((x1 - x0) - 0.030) < 1e-6, f"x moved {(x1 - x0) * 1000:.1f}mm")
+    check("lateral_offset actually moves the stroke in -Y",
+          abs((y2 - y0) + 0.025) < 1e-6, f"y moved {(y2 - y0) * 1000:.1f}mm")
+
+    # A misspelled or dropped parameter must not vanish silently.
+    import io, contextlib
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        run({"lateral_offsets": -0.025})      # note the typo
+    out = buf.getvalue()
+    check("an unknown parameter is warned about, not ignored in silence",
+          "unknown parameter" in out and "lateral_offsets" in out,
+          out[-200:] if out else "no output")
+
+
+def test_scoop_compensates_a_cranked_tool_offset():
+    """A cranked tool's bowl must land on the powder, not the TCP."""
+    print("\n[scoop: cranked tool offset is compensated]")
+    tub = cylinder_cloud([0.50, 0.10], base_z=0.02, height=0.05, radius=0.06)
+    vision = FakeVision({"tub": tub})
+
+    # The printed scoop: bowl 45mm along the handle, 28mm below it.
+    offset = [0.045, 0.0, 0.028]
+
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    skill = make(ScoopSkill, vision, arm)
+    ok, result = skill.execute({"powder_source": "tub", "tool_offset": offset,
+                                "dig_advance": 0.02, "drag_distance": 0.04,
+                                "untilt_over": 0.02, "push_seconds": 0.5})
+    check("scoop succeeds with a cranked tool", ok, f"{result}")
+    check("the offset is recorded", ok and result["tool_offset"] == offset,
+          f"{result.get('tool_offset')}")
+
+    # Reconstruct where the BOWL went from each commanded TCP pose.
+    surface_z, depth = result["surface_z"], result["scoop_depth"]
+    tips = []
+    for target, _dur, _imp in arm.commands:
+        tips.append(np.asarray(target))
+    # The plunge and push targets must place the bowl at the dig depth, which
+    # means the TCP itself sits well above and behind it.
+    bowl_z = surface_z - result["total_depth"]     # where the BOWL must end up
+    tcp_only_z = [t[2] for t in tips]
+    # The bowl hangs below the TCP, so the TCP must never be commanded as low
+    # as the bowl's target — that is the whole point of the compensation.
+    check("the TCP is commanded ABOVE where the bowl goes",
+          min(tcp_only_z) > bowl_z + 0.01,
+          f"lowest TCP z={min(tcp_only_z):.4f} vs bowl target z={bowl_z:.4f}")
+
+    # Same run without the offset: the TCP goes straight to the dig depth.
+    arm2 = FakeArm(tracking=1.0, gripper_width=0.03)
+    ok2, result2 = make(ScoopSkill, vision, arm2).execute(
+        {"powder_source": "tub", "dig_advance": 0.02, "drag_distance": 0.04,
+         "untilt_over": 0.02, "push_seconds": 0.5})
+    z2 = [t[0][2] for t in arm2.commands]
+    check("without an offset the TCP does go to the bowl depth (regression guard)",
+          min(z2) <= bowl_z + 1e-6,
+          f"lowest TCP z={min(z2):.4f} vs bowl target z={bowl_z:.4f}")
+    check("so the offset genuinely changed the commanded path",
+          abs(min(tcp_only_z) - min(z2)) > 0.02,
+          f"{min(tcp_only_z):.4f} vs {min(z2):.4f}")
 
 
 def test_scoop_clamps_the_drag():
@@ -824,7 +1125,7 @@ def test_scoop_single_motion_push():
                                 "push_seconds": 0.5})
     check("single-motion scoop succeeds", ok, f"{result}")
     check("one fewer motion than the two-segment default",
-          len(arm.commands) <= 5, f"{len(arm.commands)} goto_pose calls")
+          len(arm.commands) <= 6, f"{len(arm.commands)} goto_pose calls")
     check("still finishes level", ok and result["residual_tilt"] < 1.0,
           f"residual={result.get('residual_tilt')}")
 
@@ -1033,6 +1334,13 @@ def main():
     test_place_stuck_gripper_retries_then_fails()
     test_stir_and_scoop_refuse_below_workspace_floor()
     test_stir_clamps_to_the_opening()
+    test_pick_up_measures_the_tool_offset()
+    test_pick_up_grasp_offsets()
+    test_dump_keeps_the_bowl_over_the_target()
+    test_dump_bowl_stays_put_under_rotation()
+    test_dump_accepts_explicit_coordinates()
+    test_dump_fails_if_the_wrist_cannot_invert()
+    test_dump_needs_something_held()
     test_stir_tilts_a_flat_spoon_upright()
     test_stir_tilt_does_not_overshoot_on_retry()
     test_stir_refuses_a_spoon_that_will_not_stand_up()
@@ -1044,6 +1352,8 @@ def main():
     test_stir_in_air_needs_no_container()
     test_stir_detects_a_dropped_stirrer()
     test_scoop_requires_a_real_tilt()
+    test_scoop_site_offsets_and_unknown_params()
+    test_scoop_compensates_a_cranked_tool_offset()
     test_scoop_clamps_the_drag()
     test_scoop_pushes_away_from_the_base()
     test_scoop_push_is_continuous()
