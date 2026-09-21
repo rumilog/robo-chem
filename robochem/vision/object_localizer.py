@@ -347,6 +347,46 @@ class ObjectLocalizer:
         points = np.stack([x, y, z], axis=-1)
         return points
     
+    def project_world_point(self, point_world, cam_id: int,
+                            intrinsics=None):
+        """
+        Where a world-frame 3D point lands in one camera's image.
+
+        The exact inverse of the ``_depth_to_points`` + ``_transform_points``
+        path this class already uses to go the other way, so it relies on
+        nothing new: the same extrinsics and the same fx/fy/cx/cy.
+
+        This is what lets ONE camera identify a container and every other
+        camera be told where it is, rather than each re-identifying it from
+        scratch and sometimes disagreeing about which cup it found.
+
+        Returns (u, v) as floats, or None if the point is behind the camera.
+        """
+        if intrinsics is None:
+            if cam_id not in self.cameras:
+                return None
+            intrinsics = get_live_intrinsics(self.cameras[cam_id])
+
+        extr = self._extrinsics(cam_id)
+        T = extr if isinstance(extr, np.ndarray) else (
+            extr.matrix() if hasattr(extr, "matrix") else np.eye(4))
+        # _transform_points applies camera->world, so invert for world->camera.
+        cam_pt = (np.linalg.inv(T) @ np.append(np.asarray(point_world, float), 1.0))[:3]
+        if cam_pt[2] <= 1e-6:
+            return None                       # behind the camera
+
+        fx = getattr(intrinsics, "fx", None)
+        fy = getattr(intrinsics, "fy", None)
+        cx = getattr(intrinsics, "cx", getattr(intrinsics, "ppx", None))
+        cy = getattr(intrinsics, "cy", getattr(intrinsics, "ppy", None))
+        if None in (fx, fy, cx, cy):
+            raise ValueError(
+                f"Could not read fx/fy/cx/cy from intrinsics of type "
+                f"{type(intrinsics).__name__}"
+            )
+        return (float(cam_pt[0] * fx / cam_pt[2] + cx),
+                float(cam_pt[1] * fy / cam_pt[2] + cy))
+
     def _transform_points(
         self, 
         points: np.ndarray, 

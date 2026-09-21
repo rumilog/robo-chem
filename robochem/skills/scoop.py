@@ -101,6 +101,11 @@ class ScoopSkill(BaseSkill):
             "lift_height": 0.12,
             "approach_height": 0.10,
             "reset_before_scan": True,
+            # SAM category to search when the target is identified by a
+            # written label. The label path only considers instances of this
+            # category, so a labelled CLEAR cup is invisible under the default
+            # "white paper cup" and the query quietly finds nothing.
+            "container_category": None,
             # Shift the whole stroke in the robot base frame, same sign
             # convention as pour and pick_up: +X is forward from the base
             # toward the workspace, +Y is the robot's left. The stroke is
@@ -189,7 +194,8 @@ class ScoopSkill(BaseSkill):
             return False, {"error": "Failed to clear the cameras before scanning"}
 
         self.vision.clear_cache()
-        located = self.locate_container(source, force_refresh=True)
+        located = self.locate_container(source, force_refresh=True,
+                                        category=params.get("container_category"))
         if located is None:
             return False, {"error": f"Cannot locate '{source}'"}
 
