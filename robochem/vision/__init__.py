@@ -62,6 +62,16 @@ class VisionSystem:
         # Drop labelled-cup / multi-instance masks below this SAM score before
         # 3D consensus (cam 2 once matched baking soda at 0.39 on the wrong blob).
         self.min_instance_score = 0.5
+        #: Cameras that read the label themselves before the position is
+        #: propagated to the rest by projection. >1 so a single misread seed
+        #: is caught rather than pushed onto every other camera.
+        self.projection_seed_cameras = 2
+        #: How far apart two seed cameras may put the same container (metres)
+        #: before their agreement is not worth trusting.
+        self.projection_seed_tolerance = 0.05
+        #: A projection landing this close to an instance still counts as that
+        #: instance — masks stop at the visible edge, projections do not.
+        self.projection_pixel_slack = 40.0
         
         # Initialize components
         self.scene_analyzer = SceneAnalyzer(
@@ -182,17 +192,157 @@ class VisionSystem:
             print(f"[VisionSystem] No {category!r} instances found")
             return None
 
-        masks, confidences, observed = self.label_resolver.resolve(
-            images, instances, label
+        masks, confidences, observed, how = self._resolve_by_projection(
+            label, images, instances, data
         )
+        if not masks:
+            print(f"[VisionSystem] Projection path found nothing; falling back "
+                  f"to reading labels on every camera")
+            masks, confidences, observed = self.label_resolver.resolve(
+                images, instances, label
+            )
+            how = "per-camera label reads (fallback)"
         if not masks:
             print(f"[VisionSystem] No cup labelled {label!r} in any camera")
             return None
 
         return self._fuse_masks(
             label, masks, confidences, data,
-            extra={"label_matches": observed, "category": category},
+            extra={"label_matches": observed, "category": category,
+                   "resolved_by": how},
         )
+
+    def _resolve_by_projection(self, label, images, instances, data):
+        """
+        Identify the container ONCE, then tell the other cameras where it is.
+
+        Reading the label independently in every camera means every camera can
+        disagree, and they did: on 2026-09-21 one camera matched "TONIC Water",
+        another returned the same label for two different cups, and three of
+        four were rejected for disagreeing in 3D. The 3D check can only discard
+        a bad identification after the fact — it cannot help a camera identify
+        correctly.
+
+        So: read labels on the ``seed_cameras`` most confident views and
+        require them to AGREE (the mitigation — one misread seed would
+        otherwise be propagated everywhere). Take that container's 3D centroid,
+        project it into every remaining camera, and pick the instance whose
+        mask contains the projected pixel. Geometry, not another label read.
+
+        A camera whose projection lands in no instance is skipped, loudly. That
+        is the honest outcome: either the container is occluded there, or the
+        extrinsics are off — both worth knowing, neither worth guessing past.
+
+        Returns (masks, confidences, observed_labels, description).
+        """
+        seed_n = max(1, int(self.projection_seed_cameras))
+        cam_ids = list(images.keys())
+
+        # Seed on the cameras whose best instance scored highest — the ones
+        # most likely to have a clean, readable view.
+        def best_score(cam):
+            return max((float(i.get("score") or 0.0)
+                        for i in instances.get(cam, [])), default=0.0)
+        ranked = sorted((c for c in cam_ids if instances.get(c)),
+                        key=best_score, reverse=True)
+        seeds = ranked[:seed_n]
+        if not seeds:
+            return {}, {}, {}, "no instances"
+
+        seed_masks, seed_conf, seed_obs = self.label_resolver.resolve(
+            {c: images[c] for c in seeds},
+            {c: instances[c] for c in seeds},
+            label,
+        )
+        if not seed_masks:
+            print(f"[VisionSystem] No seed camera could read {label!r}")
+            return {}, {}, {}, "seed read failed"
+
+        # Mitigation: when more than one seed read it, make them agree in 3D
+        # before trusting either. A seed that is wrong about WHICH cup would
+        # otherwise drag every other camera onto the wrong container.
+        seed_points = self.object_localizer.get_object_points_by_camera(
+            seed_masks, depth_images=data["depth_images"],
+            intrinsics=data["intrinsics"],
+        )
+        seed_points = {c: p for c, p in (seed_points or {}).items() if len(p)}
+        if not seed_points:
+            print("[VisionSystem] Seed cameras produced no 3D points")
+            return {}, {}, {}, "seed reconstruction failed"
+
+        centroids = {c: p.mean(axis=0) for c, p in seed_points.items()}
+        if len(centroids) > 1:
+            cams = list(centroids)
+            spread = max(
+                float(np.linalg.norm(centroids[a] - centroids[b]))
+                for i, a in enumerate(cams) for b in cams[i + 1:]
+            )
+            if spread > self.projection_seed_tolerance:
+                print(f"[VisionSystem] Seed cameras {cams} disagree by "
+                      f"{spread * 1000:.0f}mm on where {label!r} is (tolerance "
+                      f"{self.projection_seed_tolerance * 1000:.0f}mm) — not "
+                      f"propagating a position the seeds cannot agree on")
+                return {}, {}, {}, "seeds disagreed"
+            print(f"[VisionSystem] Seed cameras {cams} agree within "
+                  f"{spread * 1000:.0f}mm")
+
+        anchor = np.mean(np.stack(list(centroids.values())), axis=0)
+        print(f"[VisionSystem] {label!r} anchored at "
+              f"{np.round(anchor, 4)} from {sorted(centroids)}; "
+              f"projecting into the other cameras")
+
+        masks = dict(seed_masks)
+        confidences = dict(seed_conf)
+        observed = dict(seed_obs)
+
+        for cam in cam_ids:
+            if cam in masks or not instances.get(cam):
+                continue
+            uv = self.object_localizer.project_world_point(
+                anchor, cam, intrinsics=data["intrinsics"].get(cam))
+            if uv is None:
+                print(f"[VisionSystem] cam {cam}: {label!r} projects behind "
+                      f"the camera; skipping")
+                continue
+            u, v = int(round(uv[0])), int(round(uv[1]))
+
+            hit = None
+            for inst in instances[cam]:
+                m = inst["mask"]
+                if 0 <= v < m.shape[0] and 0 <= u < m.shape[1] and m[v, u]:
+                    hit = inst
+                    break
+            if hit is None:
+                # Nearest instance centre, if it is close enough to be the
+                # same object rather than a different cup entirely.
+                best, best_d = None, None
+                for inst in instances[cam]:
+                    ys, xs = np.where(inst["mask"])
+                    if not len(xs):
+                        continue
+                    d = float(np.hypot(xs.mean() - u, ys.mean() - v))
+                    if best_d is None or d < best_d:
+                        best, best_d = inst, d
+                if best is not None and best_d <= self.projection_pixel_slack:
+                    hit = best
+                    print(f"[VisionSystem] cam {cam}: projection at ({u},{v}) "
+                          f"fell just outside a mask; using the instance "
+                          f"{best_d:.0f}px away")
+
+            if hit is None:
+                print(f"[VisionSystem] cam {cam}: {label!r} projects to "
+                      f"({u},{v}), which is inside no {'' if instances[cam] else '(no) '}"
+                      f"instance — occluded there, or the extrinsics are off")
+                continue
+
+            masks[cam] = hit["mask"]
+            confidences[cam] = float(hit.get("score") or 0.0)
+            observed[cam] = f"(projected from {sorted(centroids)})"
+            print(f"[VisionSystem] cam {cam}: matched by projection at "
+                  f"({u},{v}), score {confidences[cam]:.2f}")
+
+        return (masks, confidences, observed,
+                f"projection from cameras {sorted(centroids)}")
 
     def _locate_direct(self, object_name: str):
         # The name SAM is prompted with may differ from the one we track the

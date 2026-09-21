@@ -59,6 +59,11 @@ class DumpSkill(BaseSkill):
             # How far past level to tip. Powder needs the bowl actually
             # inverted — at 90 degrees it sits in the corner and stays there.
             "dump_angle_deg": 120.0,
+            # Good enough to empty the bowl, even if dump_angle_deg is not
+            # reached. The wrist saturates near 90 deg at some reaches, and a
+            # bowl on its side does pour — so stalling there is a successful
+            # dump, not a failure. Below this it really has not tipped out.
+            "min_tip_deg": 85.0,
             "step_deg": 30.0,
             "seconds_per_step": 1.5,
             "hold_duration": 1.0,
@@ -74,6 +79,11 @@ class DumpSkill(BaseSkill):
             "lift_height": 0.12,
             "home_first": True,
             "reset_before_scan": True,
+            # SAM category to search when the target is identified by a
+            # written label. The label path only considers instances of this
+            # category, so a labelled CLEAR cup is invisible under the default
+            # "white paper cup" and the query quietly finds nothing.
+            "container_category": None,
             # TCP -> bowl offset in the TOOL frame. Same value scoop used; it
             # is what keeps the bowl over the target through the whole tip.
             "tool_length": 0.0,
@@ -113,6 +123,7 @@ class DumpSkill(BaseSkill):
         clearance = float(params["clearance"])
         tool_offset = self.resolve_tool_offset(params)
         tip_tol = float(params["tip_tol_deg"])
+        min_tip = float(params["min_tip_deg"])
         retries = max(1, int(params["step_retries"]))
 
         print(f"[Dump] Emptying the scoop into '{target}'")
@@ -150,7 +161,8 @@ class DumpSkill(BaseSkill):
                 return False, {"error": "Failed to clear the cameras before scanning"}
 
             self.vision.clear_cache()
-            located = self.locate_container(target, force_refresh=True)
+            located = self.locate_container(target, force_refresh=True,
+                                            category=params.get("container_category"))
             if located is None:
                 return False, {"error": f"Cannot locate '{target}'"}
 
@@ -210,6 +222,7 @@ class DumpSkill(BaseSkill):
             waypoints.append(dump_angle)
 
         achieved = self.tool_tip_deg()
+        stalled_short = False
         for goal in waypoints:
             goal = float(goal)
             reached_step = False
@@ -229,6 +242,15 @@ class DumpSkill(BaseSkill):
                     reached_step = True
                     break
             if not reached_step:
+                if achieved >= min_tip:
+                    # Past the point where the bowl is on its side and
+                    # emptying. The wrist has hit its limit for this reach,
+                    # not failed at the task.
+                    print(f"[Dump] Wrist stalled at {achieved:.1f}° (wanted "
+                          f"{goal:.0f}°), but that is past min_tip_deg="
+                          f"{min_tip:.0f}° — dumping from here")
+                    stalled_short = True
+                    break
                 print(f"[Dump] Giving up at {goal:.0f}° (measured "
                       f"{achieved:.1f}°) — returning level")
                 self.goto_pose_rigid(
@@ -236,8 +258,9 @@ class DumpSkill(BaseSkill):
                     level_rotation, duration=3.0)
                 return False, {
                     "error": (f"Tip stalled at {achieved:.1f}° of "
-                              f"{dump_angle:.0f}° — the scoop never inverted, "
-                              f"so the powder did not come out"),
+                              f"{dump_angle:.0f}°, short of min_tip_deg="
+                              f"{min_tip:.0f}° — the bowl never got far enough "
+                              f"over for the powder to come out"),
                     "tip_achieved": achieved,
                     "tip_commanded": dump_angle,
                 }
@@ -250,19 +273,36 @@ class DumpSkill(BaseSkill):
         shake_deg = abs(float(params["shake_deg"]))
         if shakes and shake_deg > 0.5:
             print(f"[Dump] Shaking {shakes}x +/-{shake_deg:.0f}° to dislodge...")
+            shake_about = min(dump_angle, achieved)
             for i in range(shakes):
-                for angle in (dump_angle - shake_deg, dump_angle):
+                for angle in (shake_about - shake_deg, shake_about):
                     R = rotation_at(angle)
                     self.goto_pose_rigid(
                         self.tcp_for_tip(bowl_target, R, tool_offset), R,
                         duration=float(params["shake_seconds"]))
 
         # 6. Back to level, then clear.
+        # Come back level, and CHECK. Commanding it once is not enough: a wrist
+        # that needed three tries to tip will not always untip in one, and an
+        # unverified return left the scoop hanging inverted through the lift
+        # (residual 111 deg on the 2026-09-21 bench run) — which then hands the
+        # next skill a tool pointing the wrong way.
         print("[Dump] Returning level...")
-        self.goto_pose_rigid(
-            self.tcp_for_tip(bowl_target, level_rotation, tool_offset),
-            level_rotation, duration=3.0)
         residual = self.tool_tip_deg()
+        for attempt in range(1, retries + 1):
+            self.goto_pose_rigid(
+                self.tcp_for_tip(bowl_target, level_rotation, tool_offset),
+                level_rotation, duration=3.0 + 1.0 * (attempt - 1))
+            self.wait(0.2)
+            residual = self.tool_tip_deg()
+            print(f"[Dump]   attempt {attempt}/{retries}: "
+                  f"residual tilt {residual:.1f}°")
+            if residual <= tip_tol:
+                break
+        if residual > tip_tol:
+            print(f"[Dump] WARNING: still {residual:.1f}° from level after "
+                  f"{retries} attempts. The scoop is lifting away tipped — "
+                  f"re-home before the next skill.")
 
         lift_tip = np.array([site[0], site[1],
                              rim_z + float(params["lift_height"])])
@@ -285,6 +325,10 @@ class DumpSkill(BaseSkill):
             "dumped_into": (target if isinstance(target, str) else "coordinates"),
             "tip_commanded": dump_angle,
             "tip_achieved": achieved,
+            # True when the wrist hit its limit before dump_angle_deg but was
+            # still past min_tip_deg — the bowl emptied, it just could not go
+            # as far as asked. Worth logging: it is not a clean success.
+            "tip_stalled_short": stalled_short,
             "residual_tilt": residual,
             "shakes": shakes,
             "rim_radius": rim_radius,

@@ -307,7 +307,8 @@ class BaseSkill(ABC):
     
     def locate_container(self, object_name: str,
                          force_refresh: bool = True,
-                         rim_band: float = 0.015) -> Optional[Dict[str, Any]]:
+                         rim_band: float = 0.015,
+                         category: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Localize a container and measure the geometry skills actually need.
 
@@ -322,12 +323,21 @@ class BaseSkill(ABC):
             force_refresh: Re-segment rather than trusting the cache. Default
                 True because containers move between skills.
             rim_band: Thickness of the top slab used to estimate the opening.
+            category: SAM category to search when resolving a written label.
+                Defaults to white paper cups. A label on a CLEAR cup will not
+                be found without this — the label path only ever looks at
+                instances of the category, so the cup is never a candidate and
+                the query silently falls through to a direct prompt.
 
         Returns:
             Dict with points, centroid, top_z, base_z, height, rim_center
             (XY of the opening) and rim_radius, or None if not located.
         """
-        located = self.vision.locate(object_name, force_refresh=force_refresh)
+        if category:
+            located = self.vision.locate(object_name, force_refresh=force_refresh,
+                                         category=category)
+        else:
+            located = self.vision.locate(object_name, force_refresh=force_refresh)
         if located is None:
             return None
 

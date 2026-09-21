@@ -96,6 +96,11 @@ FLAT_GRASP_R = np.array([[1.0, 0.0, 0.0],
                          [0.0, 0.0, -1.0]])
 
 
+def _tool_y(deg):
+    a = np.radians(deg); c, sn = np.cos(a), np.sin(a)
+    return np.array([[c, 0.0, sn], [0.0, 1.0, 0.0], [-sn, 0.0, c]])
+
+
 class FakeArm:
     """
     Minimal FrankaArm stand-in.
@@ -427,6 +432,235 @@ def test_pick_up_measures_the_tool_offset():
           f"{off[0]:.3f} -> {off2[0]:.3f}")
 
 
+def test_world_point_projection_round_trips():
+    """project_world_point must invert the depth->world path exactly."""
+    print("\n[vision: world->pixel projection inverts the unprojection]")
+    from robochem.vision.object_localizer import ObjectLocalizer
+
+    class Intr:
+        fx, fy, cx, cy = 600.0, 600.0, 424.0, 240.0
+
+    # A camera looking down the world +X axis from 1m up, with a yaw.
+    th = np.radians(25.0)
+    R = np.array([[np.cos(th), -np.sin(th), 0.0],
+                  [np.sin(th), np.cos(th), 0.0],
+                  [0.0, 0.0, 1.0]])
+    T = np.eye(4); T[:3, :3] = R; T[:3, 3] = [0.4, -0.2, 0.9]
+
+    loc = ObjectLocalizer.__new__(ObjectLocalizer)
+    loc.cameras = {}
+    loc._extrinsics = lambda cam_id: T
+
+    intr = Intr()
+    for pixel in [(424.0, 240.0), (300.0, 180.0), (700.0, 400.0)]:
+        for depth in (0.5, 0.8, 1.2):
+            # unproject exactly as _depth_to_points does, then to world
+            x = (pixel[0] - intr.cx) * depth / intr.fx
+            y = (pixel[1] - intr.cy) * depth / intr.fy
+            world = (T @ np.array([x, y, depth, 1.0]))[:3]
+            back = loc.project_world_point(world, 2, intrinsics=intr)
+            check(f"pixel {pixel} at {depth}m round-trips",
+                  back is not None and abs(back[0] - pixel[0]) < 1e-6
+                  and abs(back[1] - pixel[1]) < 1e-6,
+                  f"got {tuple(round(v, 3) for v in back) if back else None}")
+
+    behind = (T @ np.array([0.0, 0.0, -0.5, 1.0]))[:3]
+    check("a point behind the camera returns None",
+          loc.project_world_point(behind, 2, intrinsics=intr) is None)
+
+
+def _projection_rig(seed_labels, seed_points, instance_masks):
+    """A VisionSystem with just enough wired up to exercise the projection."""
+    from robochem.vision import VisionSystem
+
+    vs = VisionSystem.__new__(VisionSystem)
+    vs.projection_seed_cameras = 2
+    vs.projection_seed_tolerance = 0.05
+    vs.projection_pixel_slack = 40.0
+
+    class Resolver:
+        calls = []
+
+        def resolve(self, images, instances, label):
+            Resolver.calls.append(sorted(images))
+            m, c, o = {}, {}, {}
+            for cam in images:
+                if cam in seed_labels:
+                    idx = seed_labels[cam]
+                    m[cam] = instance_masks[cam][idx]
+                    c[cam] = 0.9
+                    o[cam] = "A 10 ML WATER"
+            return m, c, o
+
+    class Loc:
+        def get_object_points_by_camera(self, masks, depth_images=None,
+                                        intrinsics=None):
+            return {cam: seed_points[cam] for cam in masks if cam in seed_points}
+
+        def project_world_point(self, pt, cam_id, intrinsics=None):
+            # Every non-seed camera projects onto the middle of instance 1.
+            return (60.0, 60.0)
+
+    vs.label_resolver = Resolver()
+    vs.object_localizer = Loc()
+    return vs, Resolver
+
+
+def _mask(cx, cy, r=12, shape=(120, 120)):
+    m = np.zeros(shape, bool)
+    yy, xx = np.mgrid[:shape[0], :shape[1]]
+    m[(xx - cx) ** 2 + (yy - cy) ** 2 <= r * r] = True
+    return m
+
+
+def test_projection_identifies_once_and_propagates():
+    """One camera reads the label; the rest are told where to look."""
+    print("\n[vision: identify once, propagate by projection]")
+    inst_masks = {c: [_mask(20, 20), _mask(60, 60)] for c in (2, 3, 4, 5)}
+    instances = {c: [{"mask": m, "score": 0.8 - 0.1 * i}
+                     for i, m in enumerate(inst_masks[c])] for c in (2, 3, 4, 5)}
+    pts = np.array([[0.50, -0.10, 0.03]] * 40)
+    vs, Resolver = _projection_rig({2: 1, 3: 1}, {2: pts, 3: pts}, inst_masks)
+    Resolver.calls = []
+
+    masks, conf, obs, how = vs._resolve_by_projection(
+        "a 10 ml water", {c: None for c in (2, 3, 4, 5)}, instances,
+        {"depth_images": {}, "intrinsics": {c: None for c in (2, 3, 4, 5)}})
+
+    check("all four cameras end up contributing", sorted(masks) == [2, 3, 4, 5],
+          f"got {sorted(masks)}")
+    check("labels were only read on the seed cameras",
+          Resolver.calls == [[2, 3]], f"resolver called with {Resolver.calls}")
+    check("the non-seed cameras picked the instance under the projection",
+          all(masks[c] is inst_masks[c][1] for c in (4, 5)))
+    check("it reports how it resolved", "projection" in how, how)
+
+
+def test_projection_refuses_when_seeds_disagree():
+    """Two seeds that disagree in 3D must not have their guess propagated."""
+    print("\n[vision: disagreeing seeds are not propagated]")
+    inst_masks = {c: [_mask(20, 20), _mask(60, 60)] for c in (2, 3, 4, 5)}
+    instances = {c: [{"mask": m, "score": 0.8} for m in inst_masks[c]]
+                 for c in (2, 3, 4, 5)}
+    near = np.array([[0.50, -0.10, 0.03]] * 40)
+    far = np.array([[0.50, 0.20, 0.03]] * 40)        # 30cm away
+    vs, _ = _projection_rig({2: 1, 3: 0}, {2: near, 3: far}, inst_masks)
+
+    masks, conf, obs, how = vs._resolve_by_projection(
+        "a 10 ml water", {c: None for c in (2, 3, 4, 5)}, instances,
+        {"depth_images": {}, "intrinsics": {c: None for c in (2, 3, 4, 5)}})
+    check("nothing is propagated from disagreeing seeds", masks == {}, f"{masks}")
+    check("the reason is reported", how == "seeds disagreed", how)
+
+
+def test_projection_skips_a_camera_that_cannot_see_it():
+    """A projection landing in no instance is skipped, not guessed."""
+    print("\n[vision: a camera with no instance under the projection is skipped]")
+    inst_masks = {2: [_mask(60, 60)], 3: [_mask(60, 60)],
+                  4: [_mask(20, 20)]}          # cam4's only cup is far away
+    instances = {c: [{"mask": m, "score": 0.8} for m in inst_masks[c]]
+                 for c in inst_masks}
+    pts = np.array([[0.50, -0.10, 0.03]] * 40)
+    vs, _ = _projection_rig({2: 0, 3: 0}, {2: pts, 3: pts}, inst_masks)
+
+    masks, conf, obs, how = vs._resolve_by_projection(
+        "a 10 ml water", {c: None for c in inst_masks}, instances,
+        {"depth_images": {}, "intrinsics": {c: None for c in inst_masks}})
+    check("the seeds still contribute", sorted(masks) == [2, 3], f"{sorted(masks)}")
+    check("the camera that cannot see it is left out, not guessed",
+          4 not in masks)
+
+
+def test_label_crop_excludes_neighbours():
+    """The crop must not reach a neighbouring container's paper."""
+    print("\n[labels: crop is tight and masks neighbours]")
+    from robochem.vision.label_resolver import crop_around_instance
+
+    img = np.full((480, 848, 3), 200, np.uint8)
+    a = {"box": [300, 200, 360, 260], "mask": None}      # the target
+    b = {"box": [420, 200, 480, 260], "mask": None}      # 60px to its right
+
+    crop = crop_around_instance(img, a, neighbours=[a, b])
+    h, w = crop.shape[:2]
+    check("the crop is tight enough to be about one container",
+          w < 200 and h < 200, f"crop is {w}x{h}px")
+
+    # If the neighbour lands inside the crop it must be greyed out.
+    grey = np.all(np.abs(crop.astype(int) - 128) < 3, axis=2)
+    ax1 = 300 - int(max(0, (300 + 360) / 2 - max((360 - 300) * 0.9, 30)))
+    check("the neighbour is greyed out when it falls inside the crop",
+          (not (b["box"][0] < ax1 + w)) or grey.any(),
+          f"{grey.sum()} grey px in a {w}x{h} crop")
+
+    # A container with no neighbours nearby must be left untouched.
+    lone = crop_around_instance(img, a, neighbours=[a])
+    lone_grey = np.all(np.abs(lone.astype(int) - 128) < 3, axis=2)
+    check("a lone container's crop has nothing greyed out",
+          not lone_grey.any(), f"{lone_grey.sum()} grey px")
+
+
+def test_duplicate_labels_are_flagged():
+    """Two containers reading the same label means the crop bled."""
+    print("\n[labels: duplicate reads are flagged, not silently resolved]")
+    from robochem.vision.label_resolver import pick_matching_instance
+    import io, contextlib
+
+    instances = [{"score": 0.6}, {"score": 0.9}]
+    labels = ["A 10 ML WATER", "A 10 ML WATER"]     # the crop-bleed signature
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        inst, lab = pick_matching_instance(instances, labels, "a 10 ml water")
+    check("a duplicate label is called out", "DUPLICATE" in buf.getvalue(),
+          buf.getvalue().strip() or "no warning")
+
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        pick_matching_instance([{"score": 0.8}], ["A 10 ML WATER"], "a 10 ml water")
+    check("a single clean match says nothing",
+          "DUPLICATE" not in buf2.getvalue() and "AMBIGUOUS" not in buf2.getvalue(),
+          buf2.getvalue().strip() or "(silent)")
+
+
+def test_label_matching_distinguishes_replicates():
+    """A/B replicate labels must not be conflated — the experiment needs both."""
+    print("\n[labels: A and B replicates stay distinct]")
+    from robochem.vision.label_resolver import labels_match, pick_matching_instance
+
+    # The case that sent powder into the wrong cup on 2026-09-21.
+    check("'a 10 ml water' matches A", labels_match("a 10 ml water", "A 10 ML WATER"))
+    check("'a 10 ml water' does NOT match B",
+          not labels_match("a 10 ml water", "B 10 ML WATER"))
+    check("'b 10 ml water' matches B", labels_match("b 10 ml water", "B 10 ML WATER"))
+    check("'b 10 ml water' does NOT match A",
+          not labels_match("b 10 ml water", "A 10 ML WATER"))
+
+    # Useful partial matches must survive the tightening.
+    check("'red cabbage' still finds RED CABBAGE POWDER",
+          labels_match("red cabbage", "RED CABBAGE POWDER"))
+    check("'citric acid' still matches", labels_match("citric acid", "CITRIC ACID"))
+    check("'baking soda' still matches", labels_match("baking soda", "BAKING SODA"))
+    check("a request may not contradict the label",
+          not labels_match("citric acid", "BAKING SODA"))
+
+    # An under-specified request matches both, and must say so rather than
+    # silently picking the higher-scoring mask.
+    import io, contextlib
+    instances = [{"score": 0.6}, {"score": 0.9}]
+    labels = ["A 10 ML WATER", "B 10 ML WATER"]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        inst, lab = pick_matching_instance(instances, labels, "10 ml water")
+    check("an ambiguous request is flagged", "AMBIGUOUS" in buf.getvalue(),
+          buf.getvalue().strip() or "no warning")
+
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        inst2, lab2 = pick_matching_instance(instances, labels, "b 10 ml water")
+    check("a specific request picks exactly that one and is not flagged",
+          lab2 == "B 10 ML WATER" and "AMBIGUOUS" not in buf2.getvalue(),
+          f"picked {lab2!r}; {buf2.getvalue().strip()}")
+
+
 def test_dump_keeps_the_bowl_over_the_target():
     """The bowl must stay over the cup through the whole tip, not swing off."""
     print("\n[dump: bowl held over the target while tipping]")
@@ -483,6 +717,41 @@ def test_dump_bowl_stays_put_under_rotation():
           swing > 0.05, f"naive swing {swing * 1000:.0f}mm")
 
 
+def test_dump_verifies_the_return_to_level():
+    """Commanding level once is not enough — it must be checked and retried."""
+    print("\n[dump: return to level is verified]")
+    cup = cylinder_cloud([0.50, 0.0], base_z=0.02, height=0.09, radius=0.040)
+    vision = FakeVision({"cup": cup})
+
+    class LaggyUntipArm(FakeArm):
+        """Untips only partway per command, like the real wrist."""
+
+        def goto_pose(self, pose, duration=3.0, use_impedance=True, block=True):
+            R = np.asarray(pose.rotation, dtype=float)
+            want = float(np.degrees(np.arccos(np.clip(-R[2, 2], -1.0, 1.0))))
+            now = float(np.degrees(np.arccos(
+                np.clip(-np.asarray(self.pose.rotation)[2, 2], -1.0, 1.0))))
+            if want < now - 1.0:                       # an untip command
+                reached = now - (now - want) * 0.7     # only 70% of the way
+                capped = FakePose(pose.translation,
+                                  FLAT_GRASP_R @ _tool_y(-reached))
+                super().goto_pose(capped, duration, use_impedance, block)
+                return
+            super().goto_pose(pose, duration, use_impedance, block)
+
+    arm = LaggyUntipArm(tracking=1.0, gripper_width=0.03)
+    skill = make(DumpSkill, vision, arm)
+    ok, result = skill.execute({"target_container": "cup",
+                                "tool_offset": [0.051, 0.009, 0.028],
+                                "dump_angle_deg": 90.0, "min_tip_deg": 85.0,
+                                "seconds_per_step": 0.0, "hold_duration": 0.0,
+                                "shakes": 0, "step_retries": 4})
+    check("dump succeeds", ok, f"{result}")
+    check("it keeps retrying until the wrist is actually level",
+          ok and result["residual_tilt"] < 20.0,
+          f"residual={result.get('residual_tilt'):.1f} deg")
+
+
 def test_dump_accepts_explicit_coordinates():
     """Identical unlabelled cups can only be targeted by position."""
     print("\n[dump: explicit coordinates skip the scan]")
@@ -521,8 +790,56 @@ def test_dump_fails_if_the_wrist_cannot_invert():
                                 "seconds_per_step": 0.0, "shakes": 0})
     check("dump fails when the wrist stalls", not ok, f"{result}")
     check("the failure says the powder did not come out",
-          "did not come out" in result.get("error", "").lower(),
+          "come out" in result.get("error", "").lower(),
           f"{result.get('error')}")
+
+
+def test_dump_accepts_a_wrist_that_stalls_near_90():
+    """A wrist that saturates at ~90deg has still emptied the bowl."""
+    print("\n[dump: a stall past min_tip_deg is a success, not a failure]")
+    cup = cylinder_cloud([0.50, 0.0], base_z=0.02, height=0.09, radius=0.040)
+    vision = FakeVision({"cup": cup})
+
+    class CappedWristArm(FakeArm):
+        """Tracks orientation fine up to CAP degrees, then refuses to go on."""
+
+        CAP = 89.0
+
+        def goto_pose(self, pose, duration=3.0, use_impedance=True, block=True):
+            # Clamp rather than refuse: the real wrist partially tracks an
+            # over-range command (asked 90 deg, reached 85.5; asked 120,
+            # reached 89.4), it does not simply ignore it.
+            R = np.asarray(pose.rotation, dtype=float)
+            want = float(np.degrees(np.arccos(np.clip(-R[2, 2], -1.0, 1.0))))
+            if want > self.CAP:
+                capped = FakePose(pose.translation,
+                                  FLAT_GRASP_R @ _tool_y(-self.CAP))
+                super().goto_pose(capped, duration, use_impedance, block)
+                return
+            super().goto_pose(pose, duration, use_impedance, block)
+
+    arm = CappedWristArm(tracking=1.0, gripper_width=0.03)
+    skill = make(DumpSkill, vision, arm)
+    ok, result = skill.execute({"target_container": "cup",
+                                "tool_offset": [0.051, 0.009, 0.028],
+                                "dump_angle_deg": 120.0, "min_tip_deg": 85.0,
+                                "seconds_per_step": 0.0, "hold_duration": 0.0,
+                                "shakes": 1})
+    check("a wrist capped at 89 deg still counts as dumped", ok, f"{result}")
+    check("it records that the tip stalled short",
+          ok and result["tip_stalled_short"] is True,
+          f"{result.get('tip_stalled_short')}")
+    check("and reports the angle it actually reached",
+          ok and 80.0 < result["tip_achieved"] < 95.0,
+          f"{result.get('tip_achieved')}")
+
+    # Below min_tip_deg it must still fail — the allowance is not a blanket pass.
+    arm2 = CappedWristArm(tracking=1.0, gripper_width=0.03)
+    arm2.CAP = 40.0
+    ok2, r2 = make(DumpSkill, vision, arm2).execute(
+        {"target_container": "cup", "tool_offset": [0.051, 0.009, 0.028],
+         "min_tip_deg": 85.0, "seconds_per_step": 0.0, "shakes": 0})
+    check("a wrist capped at 40 deg still fails", not ok2, f"{r2}")
 
 
 def test_dump_needs_something_held():
@@ -1336,10 +1653,19 @@ def main():
     test_stir_clamps_to_the_opening()
     test_pick_up_measures_the_tool_offset()
     test_pick_up_grasp_offsets()
+    test_world_point_projection_round_trips()
+    test_projection_identifies_once_and_propagates()
+    test_projection_refuses_when_seeds_disagree()
+    test_projection_skips_a_camera_that_cannot_see_it()
+    test_label_crop_excludes_neighbours()
+    test_duplicate_labels_are_flagged()
+    test_label_matching_distinguishes_replicates()
     test_dump_keeps_the_bowl_over_the_target()
     test_dump_bowl_stays_put_under_rotation()
+    test_dump_verifies_the_return_to_level()
     test_dump_accepts_explicit_coordinates()
     test_dump_fails_if_the_wrist_cannot_invert()
+    test_dump_accepts_a_wrist_that_stalls_near_90()
     test_dump_needs_something_held()
     test_stir_tilts_a_flat_spoon_upright()
     test_stir_tilt_does_not_overshoot_on_retry()
