@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import mujoco
 import numpy as np
@@ -39,8 +39,11 @@ HOME_JOINTS = np.array([0.0, -math.pi / 4, 0.0, -3 * math.pi / 4,
 ARM_JOINTS = [f"joint{i}" for i in range(1, 8)]
 FINGER_JOINTS = ["finger_joint1", "finger_joint2"]
 
-# D435 depth stream at 640x480: 42.5 degrees vertical gives fy ~= 617, which is
-# what the real intrinsics report, so simulated deprojection matches the cage.
+# The cage cameras stream colour at 848x480 with depth aligned to it. A 42.5
+# degree vertical field gives fy ~= 617 at 480 rows -- what the D435 colour
+# intrinsics report -- and, across an 848-wide frame, the 69 degree horizontal
+# field of the real sensor. So a simulated camera sees what a real one sees, and
+# deprojection runs on the same numbers.
 DEFAULT_FOVY = 42.5
 DEFAULT_CAMERA_IDS = (2, 3, 4, 5)
 
@@ -49,6 +52,10 @@ DEFAULT_CAMERA_IDS = (2, 3, 4, 5)
 CV_TO_MJ = np.diag([1.0, -1.0, -1.0])
 
 WALL_SEGMENTS = 16
+
+# Prop meshes are named relative to the repo root, so a bench entry reads the
+# same whatever directory the run was launched from.
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _panda_mjcf() -> str:
@@ -188,6 +195,63 @@ def _add_rod(spec, prop: Prop, table_z: float):
     return body
 
 
+def _add_mesh_scoop(spec, prop: Prop, table_z: float):
+    """
+    A prop whose visible shape is its CAD file.
+
+    The mesh geom is what the cameras see and what perception reconstructs;
+    it carries no contacts, because MuJoCo collides meshes by their convex
+    hull and the hull of an open scoop is a solid block -- granules could
+    never enter the bowl. Contact comes from primitives in group 3, which the
+    renderer does not draw, so the segmentation buffer stays mesh-only: a
+    floor and four walls around the bowl, plus a box for the handle the jaws
+    close on.
+    """
+    bowl = np.asarray(prop.bowl_size, float)
+    centre = np.asarray(prop.bowl_offset, float)
+    wall = prop.wall / 2                       # panel half-thickness
+    rest = -(centre[2] - bowl[2])              # body origin above the table
+
+    body = spec.worldbody.add_body(
+        name=prop.body, pos=[prop.pos[0], prop.pos[1], table_z + rest]
+    )
+    body.add_freejoint()
+
+    body.add_geom(
+        type=mujoco.mjtGeom.mjGEOM_MESH,
+        meshname=prop.body + "_mesh",
+        pos=list(prop.mesh_pos),
+        rgba=list(prop.rgba),
+        contype=0, conaffinity=0, density=0,   # seen, never touched
+        group=2,
+    )
+
+    def panel(size, pos, name):
+        # Named, because when a stroke clips the cup the useful question is
+        # WHICH part of the tool touched: "the bowl's leading wall" says
+        # shorten the sweep, "the crank" says the tilt is wrong.
+        body.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=list(size),
+                      name=f"{prop.body}_{name}",
+                      pos=list(pos), rgba=list(prop.rgba), density=1200,
+                      condim=4, friction=[1.2, 0.01, 0.001], group=3)
+
+    # Handle, centred on the body origin so the grasp check and the jaws agree.
+    panel([prop.height / 2, prop.wall, prop.wall], [0, 0, 0], "handle")
+    # The crank between handle and bowl.
+    crank_x = (prop.height / 2 + centre[0] - bowl[0]) / 2
+    panel([(centre[0] - bowl[0] - prop.height / 2) / 2, prop.wall,
+           abs(centre[2]) / 2], [crank_x + prop.height / 2, 0, centre[2] / 2],
+          "crank")
+    # Bowl floor and four walls.
+    panel([bowl[0], bowl[1], wall], centre + [0, 0, -bowl[2] + wall], "bowl_floor")
+    for sx, sy, name in ((1, 0, "bowl_lead"), (-1, 0, "bowl_back"),
+                         (0, 1, "bowl_left"), (0, -1, "bowl_right")):
+        size = [wall, bowl[1], bowl[2]] if sx else [bowl[0], wall, bowl[2]]
+        panel(size, centre + [sx * (bowl[0] - wall), sy * (bowl[1] - wall), 0],
+              name)
+    return body
+
+
 def _add_label(spec, prop: Prop, table_z: float):
     """The handwritten paper a reagent cup stands on."""
     body = spec.worldbody.add_body(
@@ -202,25 +266,54 @@ def _add_label(spec, prop: Prop, table_z: float):
     return body
 
 
+def _grain_sites(inner: float, radius: float, rng) -> List[Tuple[float, float]]:
+    """
+    Where one layer of granules can sit without overlapping.
+
+    A hex lattice with a little jitter, not random placement. Dropping grains at
+    random positions packs them dense enough to intersect at spawn, and MuJoCo
+    resolves that intersection by flinging them: a cup of 110 granules emptied
+    itself across the bench and left perception unable to find anything. The
+    lattice guarantees the gap, the jitter keeps the bed from looking machined.
+    """
+    pitch = 2.3 * radius
+    usable = max(0.0, inner - radius)
+    sites = []
+    rows = int(usable * 2 / (pitch * 0.866)) + 1
+    for row in range(-rows, rows + 1):
+        y = row * pitch * 0.866
+        offset = (pitch / 2) if row % 2 else 0.0
+        cols = int(usable * 2 / pitch) + 1
+        for col in range(-cols, cols + 1):
+            x = col * pitch + offset
+            if math.hypot(x, y) <= usable:
+                sites.append((x + rng.uniform(-0.15, 0.15) * radius,
+                              y + rng.uniform(-0.15, 0.15) * radius))
+    rng.shuffle(sites)
+    return sites
+
+
 def _add_grains(spec, prop: Prop, table_z: float) -> List[str]:
     """Loose granules resting in a reagent cup, so pours and scoops show flow."""
     names = []
     rng = np.random.default_rng(abs(hash(prop.name)) % (2**32))
     inner = prop.radius - prop.wall * 2
+    sites = _grain_sites(inner, prop.grain_radius, rng)
+    if not sites:
+        return names
     for i in range(prop.fill):
-        r = inner * math.sqrt(rng.random()) * 0.85
-        a = rng.uniform(0, 2 * math.pi)
+        x, y = sites[i % len(sites)]
         name = f"{prop.body}_grain{i}"
         body = spec.worldbody.add_body(
             name=name,
-            pos=[prop.pos[0] + r * math.cos(a),
-                 prop.pos[1] + r * math.sin(a),
-                 table_z + prop.wall * 2 + 0.006 + 0.010 * (i // 8)],
+            pos=[prop.pos[0] + x, prop.pos[1] + y,
+                 table_z + prop.wall * 2 + prop.grain_radius * 2
+                 + 2.3 * prop.grain_radius * (i // len(sites))],
         )
         body.add_freejoint()
         body.add_geom(
             type=mujoco.mjtGeom.mjGEOM_SPHERE,
-            size=[0.0035, 0, 0],
+            size=[prop.grain_radius, 0, 0],
             rgba=list(prop.fill_rgba),
             density=1200,
             condim=4,
@@ -327,11 +420,24 @@ def build_scene(
 
     _add_cameras(spec, extrinsics, fovy)
 
+    for prop in bench.props:
+        if prop.mesh:
+            path = Path(prop.mesh)
+            if not path.is_absolute():
+                path = REPO_ROOT / path
+            if not path.exists():
+                raise FileNotFoundError(f"{prop.name!r} wants a mesh that is "
+                                        f"not there: {path}")
+            spec.add_mesh(name=prop.body + "_mesh", file=str(path),
+                          scale=[prop.mesh_scale] * 3)
+
     grain_names: Dict[str, List[str]] = {}
     for prop in bench.props:
         if prop.label:
             _add_label(spec, prop, bench.table_z)
-        if prop.kind == "rod":
+        if prop.mesh:
+            _add_mesh_scoop(spec, prop, bench.table_z)
+        elif prop.kind == "rod":
             _add_rod(spec, prop, bench.table_z)
         else:
             _add_container(spec, prop, bench.table_z)

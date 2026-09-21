@@ -17,6 +17,7 @@ from .pick_up import PickUpSkill
 from .place import PlaceSkill
 from .pour import PourSkill
 from .scoop import ScoopSkill
+from .arc_scoop import ArcScoopSkill
 from .dump import DumpSkill
 from .dispense import DispenseSkill
 from .stir import StirSkill
@@ -37,6 +38,9 @@ SKILL_REGISTRY = {
     "place": PlaceSkill,
     "pour": PourSkill,
     "scoop": ScoopSkill,
+    # A second scooping stroke, curved rather than straight. Deliberately a
+    # separate skill: "scoop" is tuned against the bench and stays that way.
+    "arc_scoop": ArcScoopSkill,
     "dump": DumpSkill,
     "dispense": DispenseSkill,
     "stir": StirSkill,

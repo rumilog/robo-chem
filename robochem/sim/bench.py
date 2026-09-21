@@ -33,7 +33,21 @@ class Prop:
     label: Optional[str] = None     # reagent written on the paper under a cup
     fill: int = 0                   # granules to drop in at reset
     fill_rgba: Tuple[float, float, float, float] = (0.95, 0.95, 0.9, 1.0)
+    grain_radius: float = 0.0035   # coarse grains cost fewer bodies for a given bed
     static: bool = False            # True = welded to the table, never moves
+
+    # A prop whose real shape matters to perception carries its CAD instead of
+    # being approximated. The mesh is what the cameras see; MuJoCo would only
+    # collide with its convex hull, which fills an open bowl solid, so contact
+    # still comes from the primitives below.
+    mesh: Optional[str] = None      # STL path, relative to the repo root
+    mesh_scale: float = 1.0         # 0.001 for a CAD file authored in mm
+    mesh_pos: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+    # An open box the granules can actually sit in, built from five thin
+    # panels. Half-extents and centre, in the body frame.
+    bowl_size: Optional[Tuple[float, float, float]] = None
+    bowl_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     @property
     def body(self) -> str:
@@ -90,35 +104,46 @@ def default_bench() -> List[Prop]:
         Prop(
             name="citric acid cup",
             pos=(0.38, -0.26),
-            radius=0.038,
-            height=0.09,
-            wall=0.0015,
+            radius=0.0345,     # 65mm inner diameter + a 2mm wall
+            height=0.031,      # the lab's reagent cups are shallow dishes
+            wall=0.002,
             rgba=(0.97, 0.97, 0.97, 1.0),
             mass=0.01,
             label="citric acid",
-            fill=25,
+            fill=90,           # a bed to scoop from, not a scatter
+            grain_radius=0.003,
             fill_rgba=(0.98, 0.98, 0.94, 1.0),
         ),
         Prop(
             name="baking soda cup",
             pos=(0.38, 0.26),
-            radius=0.038,
-            height=0.09,
-            wall=0.0015,
+            radius=0.0345,
+            height=0.031,
+            wall=0.002,
             rgba=(0.97, 0.97, 0.97, 1.0),
             mass=0.01,
             label="baking soda",
-            fill=25,
+            fill=90,
+            grain_radius=0.003,
             fill_rgba=(1.0, 1.0, 1.0, 1.0),
         ),
+        # The lab's printed scoop, straight off spoon.stl: a 30mm flat handle,
+        # a crank down, and a 27x20mm open bowl. Every number below is measured
+        # from that file (authored in mm, hence mesh_scale), with the body
+        # origin put at the middle of the handle -- where the jaws close.
         Prop(
             name="larger spoon",
             kind="rod",
             pos=(0.58, -0.02),
-            radius=0.016,      # bowl radius
-            height=0.16,       # handle length
-            wall=0.0035,       # handle half-thickness -> ~7mm jaw width
-            rgba=(0.8, 0.8, 0.85, 1.0),
+            mesh="spoon.stl",
+            mesh_scale=0.001,
+            mesh_pos=(-0.015, 0.0, 0.0035),
+            radius=0.01025,    # bowl half-width
+            height=0.030,      # handle length
+            wall=0.004,        # handle half-width -> 8mm jaw width
+            bowl_size=(0.01375, 0.01025, 0.00575),
+            bowl_offset=(0.0408, 0.0, -0.0223),
+            rgba=(0.88, 0.88, 0.90, 1.0),
             mass=0.01,
         ),
     ]

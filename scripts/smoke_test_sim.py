@@ -137,6 +137,12 @@ def main() -> int:
                         help="Playback multiplier (default 6x)")
     parser.add_argument("--granules", action="store_true",
                         help="Loose particles in the reagent cups")
+    parser.add_argument("--only", default=None,
+                        help="Run just the groups whose name contains this, "
+                             "e.g. --only scoop")
+    parser.add_argument("--hold", type=float, default=5.0,
+                        help="Seconds to keep the viewer open at the end; "
+                             "0 waits until you close the window")
     args = parser.parse_args()
 
     cell = build_cell(
@@ -148,17 +154,27 @@ def main() -> int:
         workspace_min=[0.25, -0.40, -0.13],
     )
 
+    groups = {
+        "perception": test_perception,
+        "motion": test_reach,
+        "pick + pour": test_pick_and_pour,
+        "pick + scoop": test_spoon_and_scoop,
+        "failure handling": test_empty_gripper_refuses_to_scoop,
+    }
+    if args.only:
+        wanted = {k: v for k, v in groups.items() if args.only.lower() in k}
+        if not wanted:
+            print(f"--only {args.only!r} matches none of: "
+                  + ", ".join(groups))
+            cell.close()
+            return 2
+        groups = wanted
+
     try:
-        results = {
-            "perception": test_perception(cell),
-            "motion": test_reach(cell),
-            "pick + pour": test_pick_and_pour(cell),
-            "pick + scoop": test_spoon_and_scoop(cell),
-            "failure handling": test_empty_gripper_refuses_to_scoop(cell),
-        }
+        results = {name: test(cell) for name, test in groups.items()}
     finally:
         if args.viewer:
-            cell.arm.hold(5)
+            cell.arm.hold(args.hold if args.hold > 0 else 1e9)
         cell.close()
 
     print("\n" + "=" * 52)

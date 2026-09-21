@@ -28,9 +28,19 @@ from robochem.vision import VisionSystem
 from .bench import Prop
 from .scene import SimScene
 
-DEFAULT_WIDTH = 640
+# The cage streams colour at 848x480 (robomail CameraClass defaults) with depth
+# aligned to it, so that is the frame every real mask and depth image arrives in.
+# Rendering narrower would give the simulated cameras a 54-degree horizontal field
+# where the real ones see 69, and a prop near the edge of a real frame would fall
+# outside the simulated one.
+DEFAULT_WIDTH = 848
 DEFAULT_HEIGHT = 480
 MIN_MASK_PIXELS = 40
+
+# Geoms in this group exist for contact only: the collision proxies that give a
+# mesh prop a hollow bowl MuJoCo can collide with. They are never drawn, and
+# never belong in a mask.
+COLLISION_GROUP = 3
 
 
 class _SimCamera:
@@ -69,7 +79,9 @@ class SimVision(VisionSystem):
         """
         Args:
             scene: Compiled scene from :func:`robochem.sim.scene.build_scene`
-            width/height: Render resolution; 640x480 matches the D435 stream
+            width/height: Render resolution; 848x480 is the cage stream, which
+                with a 42.5-degree fovy reproduces the D435 colour intrinsics
+                (fx = fy ~= 617, cx = 424, cy = 240)
             noise_m: Gaussian depth noise, metres. The real cage calibrates to
                 a 3-5 mm residual, so a noiseless sim would let geometry
                 tolerances pass that hardware would not.
@@ -103,7 +115,26 @@ class SimVision(VisionSystem):
         }
         self.cameras = self.object_localizer.cameras
 
+        # MuJoCo sizes its offscreen framebuffer from the model, and the default
+        # is 640x480 -- one pixel short of the cage frame fails the Renderer.
+        vis = scene.model.vis.global_
+        vis.offwidth = max(int(vis.offwidth), self.width)
+        vis.offheight = max(int(vis.offheight), self.height)
+
         self._renderer = mujoco.Renderer(scene.model, self.height, self.width)
+
+        # Render the depth and segmentation passes with EVERY geom group on.
+        #
+        # Not for the picture -- collision-only geoms are dropped from the mask
+        # a few lines below -- but because MuJoCo's segmentation decoder indexes
+        # a table sized by the number of geoms *in the scene* using ids that
+        # count every geom in the *model*. Hide a group and those two stop
+        # matching, and the render dies with an IndexError as soon as a visible
+        # geom's id exceeds the visible count: here, the moment a cup held more
+        # than ~90 granules. Keeping every geom in the scene keeps the ids dense.
+        self._all_groups = mujoco.MjvOption()
+        self._all_groups.geomgroup[:] = 1
+
         self._intrinsics = self._build_intrinsics()
 
     # ---------------------------------------------------------------- render
@@ -123,18 +154,24 @@ class SimVision(VisionSystem):
         name = f"cam{cam_id}"
         self._renderer.disable_segmentation_rendering()
         self._renderer.enable_depth_rendering()
-        self._renderer.update_scene(self.scene.data, camera=name)
+        self._renderer.update_scene(self.scene.data, camera=name,
+                                    scene_option=self._all_groups)
         depth = np.array(self._renderer.render(), dtype=float)
 
         self._renderer.disable_depth_rendering()
         self._renderer.enable_segmentation_rendering()
-        self._renderer.update_scene(self.scene.data, camera=name)
+        self._renderer.update_scene(self.scene.data, camera=name,
+                                    scene_option=self._all_groups)
         seg = np.array(self._renderer.render())
 
         geom_id = seg[..., 0]
         body = np.full(geom_id.shape, -1, dtype=int)
         valid = geom_id >= 0
         body[valid] = self.scene.model.geom_bodyid[geom_id[valid]]
+        # Collision-only geoms carry no appearance; a camera must not see them.
+        hidden = np.zeros(geom_id.shape, dtype=bool)
+        hidden[valid] = self.scene.model.geom_group[geom_id[valid]] == COLLISION_GROUP
+        body[hidden] = -1
         return depth, body
 
     def render_rgb(self, cam_id: int) -> np.ndarray:

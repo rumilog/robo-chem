@@ -26,6 +26,7 @@ it runs out of perception_env rather than the robot venv:
 """
 
 import argparse
+import ast
 import json
 import os
 import sys
@@ -40,6 +41,40 @@ from robochem.utils.logging_utils import ExperimentLogger
 from robochem.orchestrator.vlm_orchestrator import VLMOrchestrator
 
 DEFAULT_CAMERAS = [2, 3, 4, 5]
+
+
+def parse_params(raw: str) -> dict:
+    """
+    Turn ``--params`` into a dict, tolerating the shell it had to be typed in.
+
+    Windows PowerShell 5.1 does not pass a JSON argument through: it eats the
+    inner double quotes, and the CRT then splits what is left at the space in
+    "plastic beaker", so the documented bash form arrives as two broken
+    arguments and cannot be escaped around. Single quotes survive it intact, so
+    a Python dict literal is accepted as well, and ``@file.json`` for anything
+    long enough that quoting is not worth the argument.
+    """
+    raw = raw.strip()
+    if raw.startswith("@"):
+        raw = Path(raw[1:]).expanduser().read_text(encoding="utf-8").strip()
+
+    try:
+        params = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            params = ast.literal_eval(raw)
+        except (ValueError, SyntaxError):
+            raise SystemExit(
+                f"--params is neither JSON nor a Python dict literal: {raw!r}\n"
+                "In PowerShell the double quotes do not survive, so use single "
+                "ones:\n"
+                "  --params \"{'object_name':'plastic beaker','z_offset':0.02}\"\n"
+                "or read them from a file: --params @params.json"
+            )
+
+    if not isinstance(params, dict):
+        raise SystemExit(f"--params must be a mapping, got {type(params).__name__}")
+    return params
 
 
 def build_sim_stack(args):
@@ -61,6 +96,7 @@ def build_sim_stack(args):
         granules=args.sim_granules,
         tool_length=args.sim_tool_length,
         grasp_mode=args.sim_grasp_mode,
+        calib_dir=args.sim_calib_dir,
         workspace_min=args.workspace_min,
         workspace_max=args.workspace_max,
     )
@@ -113,7 +149,9 @@ def main() -> int:
     parser.add_argument("--task", help="Natural language task description")
     parser.add_argument("--instruction-image", help="Image containing written instructions")
     parser.add_argument("--skill", help="Run a single skill instead of a full task")
-    parser.add_argument("--params", default="{}", help="JSON params for --skill")
+    parser.add_argument("--params", default="{}",
+                        help="Params for --skill: JSON, a Python dict literal "
+                             "(which is what survives PowerShell), or @file.json")
     parser.add_argument("--cameras", nargs="+", type=int, default=DEFAULT_CAMERAS)
     parser.add_argument(
         "--grounding-url",
@@ -148,6 +186,10 @@ def main() -> int:
                      help="Length (m) of a fixed tool bolted to the hand")
     sim.add_argument("--sim-grasp-mode", choices=["magnet", "physics"], default="magnet",
                      help="Kinematic attach on close (default) or friction contacts")
+    sim.add_argument("--sim-calib-dir", default="calibration_out",
+                     help="Directory of realsense_cameraNw.npy to place the "
+                          "simulated cage at. Point this at robomail's calib/ to "
+                          "reproduce whatever extrinsics the robot is running")
     sim.add_argument("--sim-hold", type=float, default=None,
                      help="Seconds to keep the viewer open after the run "
                           "(default: until you close the window)")
@@ -168,7 +210,7 @@ def main() -> int:
         # Single-skill mode: useful for validating one skill on hardware
         # without involving the planner.
         if args.skill:
-            params = json.loads(args.params)
+            params = parse_params(args.params)
             print(f"\nExecuting skill {args.skill!r} with {params}")
             if args.dry_run:
                 print("(dry run: resolving perception only, not moving)")

@@ -168,10 +168,12 @@ python scripts/run_experiment.py --task "Pour the water into the beaker"
 `robochem/sim/` runs the **same skills** against a MuJoCo Franka Panda so motions
 can be watched before they touch hardware. The arm is mujoco_menagerie's vendor
 Panda model with the Franka Hand; the four cage cameras are placed at the
-extrinsics in `calibration_out/`, rendered for depth and segmentation, and
-back-projected through the project's own `ObjectLocalizer` / `VisionSystem`
-fusion — so perception really reconstructs the props from four views, with real
-self-occlusion, and rejects them when the views disagree.
+extrinsics in `calibration_out/` and given the cage's frame geometry (848x480 at
+a 42.5° vertical field, so fx = fy ≈ 617 as the D435 reports), rendered for
+depth and segmentation, and back-projected through the project's own
+`ObjectLocalizer` / `VisionSystem` fusion — so perception really reconstructs
+the props from four views, with real self-occlusion, and rejects them when the
+views disagree.
 
 `SimFrankaArm` implements the frankapy surface the skills use and `SimVision`
 the `VisionSystem` surface, so `SkillsExecutor` is unmodified. The simulator has

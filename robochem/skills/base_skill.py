@@ -91,6 +91,27 @@ def tool_y_delta(angle_degrees: float) -> np.ndarray:
     return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
 
 
+def _rotations_for(rotation, count: int):
+    """
+    Normalize ``rotation`` to one orthonormal 3x3 per path point.
+
+    Accepts a single rotation (held for the whole path, which is what stir
+    wants) or a sequence of them (one per point, which is what a scoop's
+    rolling wrist wants).
+    """
+    array = np.asarray(rotation, dtype=float)
+    if array.ndim == 3:
+        mats = [_orthonormalize(m) for m in array]
+    elif isinstance(rotation, (list, tuple)) and len(rotation) and \
+            np.asarray(rotation[0]).ndim == 2:
+        mats = [_orthonormalize(np.asarray(m, dtype=float)) for m in rotation]
+    else:
+        return [_orthonormalize(array)] * count
+    if len(mats) != count:
+        mats = [mats[min(i, len(mats) - 1)] for i in range(count)]
+    return mats
+
+
 def to_matrix(pose) -> np.ndarray:
     """
     Convert a pose into a 4x4 numpy matrix.
@@ -513,12 +534,28 @@ class BaseSkill(ABC):
 
         Args:
             points: iterable of [x, y, z], already in execution order
-            rotation: 3x3 wrist rotation held for the whole path
+            rotation: one 3x3 wrist rotation held for the whole path, or one
+                per point. Per-point rotations are what a scooping wrist needs:
+                the roll has to happen *during* the sweep. Each setpoint already
+                carries its own quaternion, so this costs nothing extra.
             seconds: wall-clock duration of the path
             rate_hz: setpoint publish rate
             cartesian_impedance: leave False for a stiff path; the pour lesson
                 is that impedance quietly under-tracks.
         """
+        # A simulated arm has no ROS and no dynamic mode, but it can run the
+        # whole path as one motion, which is the point of this method. Ask it
+        # first, so a skill written for the robot previews faithfully.
+        follow = getattr(self.robot, "follow_pose_path", None)
+        if follow is not None:
+            path = [self._clamp_position(np.asarray(p, dtype=float))
+                    for p in points]
+            if len(path) < 2:
+                return False, "a streamed path needs at least two points"
+            ok = follow(path, _rotations_for(rotation, len(path)),
+                        duration=float(seconds))
+            return bool(ok), f"followed {len(path)} points over {seconds:.1f}s"
+
         try:
             import rospy
             from frankapy import FrankaConstants as FC, SensorDataMessageType
@@ -535,15 +572,15 @@ class BaseSkill(ABC):
             return False, "a streamed path needs at least two points"
 
         template = self.get_current_pose()
-        R = _orthonormalize(np.asarray(rotation, dtype=float))
+        mats = _rotations_for(rotation, len(path))
 
-        def as_pose(xyz):
+        def as_pose(xyz, R):
             pose = template.copy()
             pose.translation = self._clamp_position(xyz)
             pose.rotation = R
             return to_rigid_transform(pose)
 
-        poses = [as_pose(p) for p in path]
+        poses = [as_pose(p, R) for p, R in zip(path, mats)]
 
         # One publisher per skill instance: a freshly-made rospy.Publisher
         # needs a moment before its first message is actually delivered.

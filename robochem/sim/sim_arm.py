@@ -163,6 +163,10 @@ class SimFrankaArm:
             gc.collect()
             time.sleep(0.2)
 
+    def settle(self, seconds: float = 0.5):
+        """Run physics for a while without a viewer, so free props stop moving."""
+        self._step(max(1, int(seconds / self.model.opt.timestep)))
+
     def hold(self, seconds: float = 1e9):
         """Keep the window open and the physics ticking after a run finishes."""
         if self._viewer is None:
@@ -243,9 +247,22 @@ class SimFrankaArm:
             self._follow_attached()
 
     def _follow_attached(self):
-        """Carry welded props along with the hand."""
+        """
+        Carry welded props along with the hand.
+
+        The pose is set directly, but the velocity is set to match it rather
+        than to zero. A body whose position jumps every step while it reports
+        standing still is one the solver resolves by flinging whatever rests on
+        it: a scoop carried that way reaches the top of the stroke empty every
+        single time, however good the stroke was. Measured on the same lift,
+        same bed: 0 granules carried with the velocity zeroed, 4 with it set.
+
+        Nothing else notices -- ``_settle`` watches the arm's joints, not the
+        prop's -- but anything resting in a held container now behaves.
+        """
         if not self._attached:
             return
+        dt = self.model.opt.timestep
         pos, mat = self._tcp()
         tcp = np.eye(4)
         tcp[:3, :3], tcp[:3, 3] = mat, pos
@@ -254,10 +271,24 @@ class SimFrankaArm:
             adr = self.scene.prop_qpos[name]
             quat = np.zeros(4)
             mujoco.mju_mat2Quat(quat, np.ascontiguousarray(world[:3, :3]).reshape(9))
+
+            was_pos = self.data.qpos[adr:adr + 3].copy()
+            was_quat = self.data.qpos[adr + 3:adr + 7].copy()
             self.data.qpos[adr:adr + 3] = world[:3, 3]
             self.data.qpos[adr + 3:adr + 7] = quat
+
             dof = self.model.jnt_dofadr[self.model.body_jntadr[self.scene.prop_bodies[name]]]
-            self.data.qvel[dof:dof + 6] = 0.0
+            step = world[:3, 3] - was_pos
+            if np.linalg.norm(step) > 0.02:
+                # The prop was just snapped into the jaws from where it sat on
+                # the table. That is a re-seat, not motion; implying a velocity
+                # from it would launch it across the bench.
+                self.data.qvel[dof:dof + 6] = 0.0
+                continue
+            omega = np.zeros(3)
+            mujoco.mju_subQuat(omega, quat, was_quat)
+            self.data.qvel[dof:dof + 3] = step / dt
+            self.data.qvel[dof + 3:dof + 6] = omega / dt
         mujoco.mj_forward(self.model, self.data)
 
     def _run(self, duration: float, ctrl_fn):
@@ -332,6 +363,61 @@ class SimFrankaArm:
         def ctrl(t):
             idx = min(int(t * waypoints), waypoints - 1)
             self.data.ctrl[:7] = plan[idx]
+
+        self._run(duration, ctrl)
+        self._settle()
+        return True
+
+    def follow_pose_path(self, points, rotations=None, duration: float = 3.0,
+                         **kwargs):
+        """
+        Run a whole path as ONE motion, the way frankapy's dynamic mode does.
+
+        A chain of ``goto_pose`` calls cannot be smooth here for the same reason
+        it cannot be smooth on the robot: each one ends with ``_settle`` waiting
+        for the servos to stop, so a subdivided curve becomes a staircase of
+        pauses. Filming a 16-point arc made that unmissable -- 2.5s of commanded
+        sweep took 26s of simulated time, stopping dead 16 times.
+
+        ``rotations`` may be one 3x3 held for the path, or one per point, which
+        is what a scooping wrist needs: the roll has to happen *during* the
+        sweep, not between two stops.
+
+        This is the sim's half of :meth:`BaseSkill.stream_pose_path`; the skills
+        call that and get whichever exists.
+        """
+        pts = [np.asarray(p, float) for p in points]
+        if len(pts) < 2:
+            return False
+        mats = rotations if rotations is not None else self._tcp()[1]
+        mats = ([np.asarray(m, float) for m in mats]
+                if isinstance(mats, (list, tuple)) or getattr(mats, "ndim", 2) == 3
+                else [np.asarray(mats, float)] * len(pts))
+        if len(mats) != len(pts):
+            mats = [mats[0]] * len(pts)
+
+        start_pos, start_mat = self._tcp()
+        self.commands.append({"path": len(pts), "duration": float(duration)})
+        if self.verbose:
+            print(f"[sim] follow_pose_path: {len(pts)} points ({duration:.1f}s)")
+
+        # One joint plan through every point, solved before any of it runs, so
+        # the motion never pauses to think.
+        seed = self.get_joints()
+        plan = []
+        per_point = max(int(duration * 20 / max(len(pts) - 1, 1)), 2)
+        prev_pos, prev_mat = start_pos, start_mat
+        for pos, mat in zip(pts, mats):
+            for k in range(1, per_point + 1):
+                frac = k / per_point
+                seed = self._solve_ik(prev_pos + (pos - prev_pos) * frac,
+                                      _slerp(prev_mat, mat, frac), seed)
+                plan.append(seed.copy())
+            prev_pos, prev_mat = pos, mat
+        plan = np.asarray(plan)
+
+        def ctrl(t):
+            self.data.ctrl[:7] = plan[min(int(t * len(plan)), len(plan) - 1)]
 
         self._run(duration, ctrl)
         self._settle()
