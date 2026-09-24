@@ -11,6 +11,8 @@ objective number available for a scoop.
     sim_env/bin/python scripts/film_sim_skill.py --skill scoop --label baseline
     sim_env/bin/python scripts/film_sim_skill.py --skill arc_scoop \
         --params "{'exit_angle_deg': 70, 'cup_tilt_deg': 25}"
+    sim_env/bin/python scripts/film_sim_skill.py --skill scoop --then dump \
+        --target "white paper cup"
 
 Frames are captured off the physics loop, so the filmstrip is the motion as it
 actually ran, not a re-enactment of the commanded poses.
@@ -34,6 +36,7 @@ from dataclasses import replace
 
 from robochem.sim import build_cell
 from robochem.sim.bench import Bench
+from robochem.sim.powder import ScoopTally, bed_from_prop
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -195,7 +198,19 @@ class ContactWatch:
         self.data = cell.scene.data
         self.tool = cell.scene.prop_bodies[tool_prop.name]
         self.cup = cell.scene.prop_bodies[cup_prop.name]
+        # The arm and hand too: "no collision" means the robot as well as the
+        # tool, and in a shallow dish it is the fingers that come close.
+        hand = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand")
+        root = self.model.body_rootid[hand]
+        self.robot = {b for b in range(self.model.nbody)
+                      if self.model.body_rootid[b] == root}
         self.hits = []                   # (t, contact point relative to the cup)
+        self.robot_hits = []             # (t, body name) for arm/hand/finger touches
+        # Everything else the arm or the tool touches -- a forearm swinging
+        # into a neighbouring beaker is as much a collision as a bowl in the
+        # rim, and watching only the cup would never see it.
+        self.mine = self.robot | {self.tool}
+        self.other_hits = {}             # (ours, theirs) -> [steps, t0, t1]
         self._original = None
         # A picture of the first touch. Counts say a stroke clips; only the
         # picture says whether it is the rim, the wall or the floor.
@@ -236,6 +251,21 @@ class ContactWatch:
                                   mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(gid))
                                   or f"geom{int(gid)}"))
                 self._capture()
+            elif self.cup in (b1, b2) and ({b1, b2} - {self.cup}) & self.robot:
+                other = b1 if b2 == self.cup else b2
+                self.robot_hits.append((float(data.time), mujoco.mj_id2name(
+                    model, mujoco.mjtObj.mjOBJ_BODY, int(other))))
+                self._capture()
+            elif (b1 in self.mine) != (b2 in self.mine):
+                ours, theirs = (b1, b2) if b1 in self.mine else (b2, b1)
+                # Body 0 is the world, which is what the table is part of.
+                key = (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, int(ours)),
+                       "table" if theirs == 0 else
+                       mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, int(theirs)))
+                t = float(data.time)
+                entry = self.other_hits.setdefault(key, [0, t, t])
+                entry[0] += 1
+                entry[2] = t
 
     def start(self):
         arm = self.cell.arm
@@ -243,6 +273,12 @@ class ContactWatch:
 
         def stepped(n=1):
             self._original(n)
+            # The arm refreshes only poses after it moves a held prop, so
+            # data.contact is from the start of the step. Recompute contacts
+            # for the post-step state (collision only: it writes nothing the
+            # integrator reads, and costs ~2 ms against the ~20-50 ms full
+            # forward pass the arm used to do here) so hits keep their timing.
+            mujoco.mj_fwdPosition(self.model, self.data)
             self._scan()
 
         arm._step = stepped
@@ -252,9 +288,23 @@ class ContactWatch:
             self.cell.arm._step = self._original
             self._original = None
 
+    def other_report(self):
+        if not self.other_hits:
+            return "no contact between the arm/scoop and anything else"
+        return "CONTACT WITH OTHER THINGS: " + ", ".join(
+            f"{a} x {b} ({n} steps, t={t0:.2f}..{t1:.2f}s)"
+            for (a, b), (n, t0, t1) in sorted(self.other_hits.items(),
+                                              key=lambda kv: -kv[1][0]))
+
     def report(self):
+        from collections import Counter
+        robot = ("no contact between the arm/hand and the cup" if not self.robot_hits
+                 else f"{len(self.robot_hits)} arm/hand contacts with the cup: "
+                      + ", ".join(f"{k} x{v}" for k, v in
+                                  Counter(h[1] for h in self.robot_hits).most_common()))
+        robot += "\n  " + self.other_report()
         if not self.hits:
-            return "no contact between the scoop and the cup"
+            return "no contact between the scoop and the cup\n  " + robot
         pts = np.array([h[1] for h in self.hits])
         from collections import Counter
         parts = Counter(h[2] for h in self.hits)
@@ -268,6 +318,7 @@ class ContactWatch:
                 lines.append(f"    {len(side):4d} on the side {name}: "
                              f"x {side[:, 0].min() * 1000:+.0f}..{side[:, 0].max() * 1000:+.0f}mm, "
                              f"z {side[:, 2].min() * 1000:.0f}..{side[:, 2].max() * 1000:.0f}mm")
+        lines.append("  " + robot)
         return "\n".join(lines)
 
 
@@ -364,6 +415,90 @@ def grains_in_bowl(cell, source_name, spoon_name="larger spoon", margin=0.004):
     return inside
 
 
+def run_then(args, cell, tool_prop, tool_offset, tally, out):
+    """
+    Run the follow-on skill -- a dump -- with the tool still in the jaws and
+    the load the first skill left in it, and measure it the same way: contacts
+    with the target, whether the target moved, where the powder went.
+    """
+    target_prop = cell.scene.bench.find(args.target)
+    if target_prop is None:
+        print(f"\n--target {args.target!r} matches nothing on the bench")
+        return {"skill": args.then, "success": False,
+                "error": f"no target {args.target!r}"}
+    params = {"target_container": args.target}
+    if tool_offset is not None:
+        # The ground-truth offset the scoop was aimed with: it is what keeps
+        # the bowl, not the wrist, over the target through the whole tip.
+        params["tool_offset"] = [float(v) for v in tool_offset]
+    if tool_prop is not None and tool_prop.bowl_size is not None:
+        # The bowl's outside, from that offset (its bottom) up to the mouth:
+        # what the dump keeps above the rim at every tilt.
+        params["bowl_length"] = float(2 * tool_prop.bowl_size[0])
+        params["bowl_width"] = float(2 * tool_prop.bowl_size[1])
+        params["bowl_depth"] = float(2 * tool_prop.bowl_size[2])
+    params.update(parse_params(args.then_params))
+
+    body = cell.scene.prop_bodies[target_prop.name]
+    start = cell.scene.data.xpos[body].copy()
+    watch = (ContactWatch(cell, tool_prop, target_prop,
+                          shot_path=out / "then_first_contact.png")
+             if tool_prop else None)
+    film = None if args.no_film else Film(cell, args.view, every=args.every)
+    if film:
+        # Frame the rim and the space above it, where the bowl tips: the dump
+        # happens several centimetres over the target, not inside it.
+        film.look_at(np.array([start[0], start[1],
+                               cell.scene.bench.table_z + target_prop.height + 0.05]))
+        film.camera.distance *= 1.5
+        film.see_through(target_prop)
+        if tool_prop is not None and tool_prop.bowl_size is not None:
+            film.track_bowl(tool_prop)
+    if watch:
+        watch.start()
+    if tally:
+        tally.start()             # same tally: it carries the load over
+    if film:
+        film.start()
+    ok, result = cell.skills.execute(args.then, params)
+    if film:
+        film.stop()
+    if tally:
+        tally.stop()
+    if watch:
+        watch.stop()
+
+    shift = cell.scene.data.xpos[body] - start
+    moved = float(np.linalg.norm(shift))
+    print(f"\n{args.then}: {'SUCCESS' if ok else 'FAILED'}")
+    if not ok:
+        print(f"  {result.get('error', result)}")
+    if tally:
+        print("  " + tally.report_dump(target_prop.name))
+    print(f"  {target_prop.name} moved: {moved * 1000:.1f} mm "
+          f"(dx {shift[0] * 1000:+.1f}, dy {shift[1] * 1000:+.1f}, "
+          f"dz {shift[2] * 1000:+.1f})")
+    if watch:
+        print("  " + watch.report())
+    if film:
+        clip = film.video(out / "then_motion.mp4", fps=args.fps)
+        if clip is not None:
+            print(f"  video -> {clip}")
+        strip = film.strip(args.frames)
+        if strip is not None:
+            cv2.imwrite(str(out / "then_filmstrip.png"), strip)
+            print(f"  {len(film.frames)} frames -> {out / 'then_filmstrip.png'}")
+        film.close()
+    return {"skill": args.then, "success": bool(ok), "target": target_prop.name,
+            "powder_estimate": tally.result() if tally else None,
+            "robot_target_contacts": len(watch.robot_hits) if watch else None,
+            "tool_target_contacts": len(watch.hits) if watch else None,
+            "other_contacts": ({f"{a} x {b}": v[0] for (a, b), v in watch.other_hits.items()}
+                               if watch else None),
+            "target_moved_mm": round(moved * 1000, 2),
+            "params": params, "result": result}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -396,18 +531,35 @@ def main() -> int:
                              "the end. 0 waits until you close it")
     parser.add_argument("--save-frames", action="store_true",
                         help="Write every captured frame, not just the strip")
+    parser.add_argument("--granules", action="store_true",
+                        help="Simulate the powder as physical granules (slow, and "
+                             "coarser than any powder). Default: a drawn powder "
+                             "bed with no contacts, and a geometric estimate of "
+                             "what the scoop collects (robochem.sim.powder)")
+    parser.add_argument("--powder-level", type=float, default=None,
+                        help="Powder depth above the dish's inside floor, metres "
+                             "(default: the bench's, 0.018)")
+    parser.add_argument("--density", type=float, default=0.9,
+                        help="Powder bulk density in g/ml, to express the estimate "
+                             "as a mass")
     parser.add_argument("--fill", type=int, default=90,
-                        help="Granules in the source cup. The bench default is a "
-                             "sparse scatter; a scoop needs a BED, so this fills "
-                             "the cup for the test")
+                        help="With --granules: granules in the source cup")
     parser.add_argument("--grain-radius", type=float, default=0.006,
-                        help="Coarse grains cost fewer bodies for a given bed depth")
+                        help="With --granules: grain radius; coarse grains cost "
+                             "fewer bodies for a given bed depth")
     parser.add_argument("--surface", type=float, default=None,
                         help="Powder surface in world z. Default: measured from "
                              "the granules. With --fill 0, set it by hand to test "
                              "the stroke shape without paying for the physics")
     parser.add_argument("--opaque", action="store_true",
                         help="Do not make the source cup translucent")
+    parser.add_argument("--then", default=None, choices=["dump"],
+                        help="A second skill to run after --skill with the "
+                             "same tool and its load, e.g. --skill scoop --then dump")
+    parser.add_argument("--then-params", default=None,
+                        help="Params for the --then skill, same format as --params")
+    parser.add_argument("--target", default="white paper cup",
+                        help="Container --then dump empties the scoop into")
     args = parser.parse_args()
 
     out = ROOT / args.out / (args.label or args.skill)
@@ -417,12 +569,16 @@ def main() -> int:
     # surface is the rim and the stroke never meets any powder, which tells you
     # nothing about the stroke.
     bench = Bench()
-    bench.props = [replace(p, fill=args.fill, grain_radius=args.grain_radius)
-                   if p.label and args.source.lower() in (p.label or "").lower()
-                   else p for p in bench.props]
+    is_source = lambda p: p.label and args.source.lower() in (p.label or "").lower()
+    if args.granules:
+        bench.props = [replace(p, fill=args.fill, grain_radius=args.grain_radius)
+                       if is_source(p) else p for p in bench.props]
+    elif args.powder_level is not None:
+        bench.props = [replace(p, powder_level=args.powder_level)
+                       if is_source(p) else p for p in bench.props]
 
     cell = build_cell(bench=bench, viewer=args.viewer, realtime=args.viewer,
-                      speed=args.speed, granules=True, verbose=False,
+                      speed=args.speed, granules=args.granules, verbose=False,
                       workspace_min=[0.25, -0.40, -0.13])
     film = None if args.no_film else Film(cell, args.view, every=args.every)
     try:
@@ -454,14 +610,26 @@ def main() -> int:
         # Where the powder actually is, for the path plot -- ground truth,
         # independent of what the skill's own perception decided.
         grains = cell.scene.grain_bodies.get(source_prop.name, [])
-        bed_z = (max(float(cell.scene.data.xpos[g][2]) for g in grains)
-                 + source_prop.grain_radius) if grains else (
-                     args.surface if args.surface is not None else cup_xyz[2])
+        bed = None if args.granules else bed_from_prop(cell.scene, source_prop)
+        if grains:
+            bed_z = (max(float(cell.scene.data.xpos[g][2]) for g in grains)
+                     + source_prop.grain_radius)
+        elif bed is not None and source_prop.powder_level > 0:
+            bed_z = bed.surface_z
+        else:
+            bed_z = args.surface if args.surface is not None else cup_xyz[2]
         rim_z = cell.scene.bench.table_z + source_prop.height
         print(f"bed surface z={bed_z:.4f}, cup rim z={rim_z:.4f}, "
-              f"{len(grains)} granules")
+              + (f"{len(grains)} granules" if args.granules else
+                 f"drawn powder bed {source_prop.powder_level * 1000:.0f}mm deep, "
+                 f"dish inside radius {(source_prop.radius - source_prop.wall) * 1000:.1f}mm"))
 
         before = grains_in_bowl(cell, args.source, args.pick or "larger spoon")
+        # Where the cup starts. A stroke that shoves the cup has not just made
+        # a mess -- it has invalidated the scan every following skill relies on,
+        # so "did the cup stay put" is a pass/fail number, not a nicety.
+        cup_start = cell.scene.data.xpos[
+            cell.scene.prop_bodies[source_prop.name]].copy()
         # The true offset from the TCP to the bowl, straight out of the sim.
         # Printed next to what perception measured, because a stroke aimed with
         # the wrong one cannot be judged by how it looks.
@@ -497,19 +665,47 @@ def main() -> int:
             # to reserve the half-diagonal, not the half-length.
             params["tool_span"] = float(2 * np.hypot(tool_prop.bowl_size[0],
                                                      tool_prop.bowl_size[1]))
+            # How far the tool reaches back from the jaws. The handle length is
+            # a deliberate over-estimate of jaws-to-handle-end: erring long
+            # only makes the clearance check stricter, and the handle end is
+            # what swings into the near wall when the wrist rolls nose-up.
+            params["tool_back_reach"] = float(tool_prop.height)
+            # The bowl's own length and inside depth, as distinct from the
+            # circumscribed tool_span above: length sets how far the leading
+            # edge drops when the bowl tilts, depth sets how deep the stroke
+            # must go before the MOUTH is under the powder rather than the
+            # edge alone.
+            params["bowl_length"] = float(2 * tool_prop.bowl_size[0])
+            params["bowl_depth"] = float(2 * tool_prop.bowl_size[2])
         if measured_offset is not None:
             params["tool_offset"] = [float(v) for v in measured_offset]
         # Hand the skill the real powder surface. The measured container top is
         # the rim, so without this the stroke is aimed tens of millimetres above
         # the bed and nothing about the motion can be judged.
-        surface = args.surface if args.surface is not None else (bed_z if grains else None)
-        if surface is not None and args.skill == "arc_scoop":
+        surface = args.surface if args.surface is not None else (
+            bed_z if (grains or (bed is not None and source_prop.powder_level > 0))
+            else None)
+        if surface is not None and args.skill in ("arc_scoop", "scoop"):
             params["powder_surface_z"] = float(surface)
         elif surface is not None:
-            # `scoop` has no such parameter: convert to a depth below the rim
-            # so the two skills are compared digging to the same place.
+            # A skill with no surface parameter: convert to a depth below the
+            # rim so the skills are compared digging to the same place.
             params["scoop_depth"] = float(rim_z - surface) + float(
                 parse_params(args.params).get("scoop_depth", 0.015))
+        if args.skill == "scoop":
+            # The dish's INSIDE floor and inside radius, from the model:
+            # scene._add_container stands the cup on a base disc 2*wall thick
+            # and rings it with a wall `wall` thick. Perception can see neither
+            # under a bed (its lowest points are the outer bottom, ~1 mm low;
+            # its "opening radius" is the outside of the rim plus the centre
+            # error), so hand the truth in, as with the surface: the test is of
+            # the stroke, not of the estimates.
+            params["container_floor_z"] = float(cell.scene.bench.table_z
+                                                + 2 * source_prop.wall)
+            params["container_radius"] = float(source_prop.radius - source_prop.wall)
+            params["container_center"] = [float(v) for v in cup_xyz[:2]]
+            if tool_prop is not None and tool_prop.bowl_size is not None:
+                params["bowl_width"] = float(2 * tool_prop.bowl_size[1])
         params.update(parse_params(args.params))
 
         watch = (ContactWatch(cell, tool_prop, source_prop,
@@ -517,20 +713,38 @@ def main() -> int:
                  if tool_prop else None)
         if watch:
             watch.start()          # wraps _step; Film wraps whatever it finds
+        # What the stroke collects from the drawn bed, estimated geometrically
+        # (robochem.sim.powder), since the bed has no particles to count.
+        tally = (ScoopTally(cell, tool_prop, bed, bulk_density=args.density)
+                 if bed is not None and source_prop.powder_level > 0
+                 and tool_prop is not None and tool_prop.bowl_size is not None
+                 else None)
+        if tally:
+            tally.start()
         if film:
             film.start()
         ok, result = cell.skills.execute(args.skill, params)
         if film:
             film.stop()
+        if tally:
+            tally.stop()
         if watch:
             watch.stop()
 
         after = grains_in_bowl(cell, args.source, args.pick or "larger spoon")
+        cup_shift = cell.scene.data.xpos[
+            cell.scene.prop_bodies[source_prop.name]] - cup_start
+        cup_moved = float(np.linalg.norm(cup_shift))
         print(f"\n{args.skill}: {'SUCCESS' if ok else 'FAILED'}")
         if not ok:
             print(f"  {result.get('error', result)}")
-        if after is not None:
+        if after is not None and args.granules:
             print(f"  granules in the bowl: {after} (was {before})")
+        if tally:
+            print("  " + tally.report())
+        print(f"  cup moved: {cup_moved * 1000:.1f} mm "
+              f"(dx {cup_shift[0] * 1000:+.1f}, dy {cup_shift[1] * 1000:+.1f}, "
+              f"dz {cup_shift[2] * 1000:+.1f})")
         if watch is not None:
             print("  " + watch.report())
 
@@ -560,11 +774,24 @@ def main() -> int:
             for i, (t, frame) in enumerate(film.frames):
                 cv2.imwrite(str(out / f"f{i:04d}.png"), frame)
 
+        then = None
+        if args.then and ok:
+            then = run_then(args, cell, tool_prop, measured_offset, tally, out)
+        elif args.then:
+            print(f"\n{args.then}: skipped, {args.skill} failed")
+
         summary = {"skill": args.skill, "success": bool(ok),
-                   "granules_in_bowl": after, "params": params, "result": result}
+                   "powder_estimate": tally.result() if tally else None,
+                   "robot_cup_contacts": len(watch.robot_hits) if watch else None,
+                   "tool_cup_contacts": len(watch.hits) if watch else None,
+                   "other_contacts": ({f"{a} x {b}": v[0] for (a, b), v in watch.other_hits.items()}
+                                      if watch else None),
+                   "granules_in_bowl": after,
+                   "cup_moved_mm": round(cup_moved * 1000, 2),
+                   "params": params, "result": result, "then": then}
         (out / "result.json").write_text(
             json.dumps(summary, indent=2, default=str), encoding="utf-8")
-        return 0 if ok else 1
+        return 0 if ok and (then is None or then["success"]) else 1
     finally:
         if args.viewer:
             print("\nClose the window when you have seen enough."

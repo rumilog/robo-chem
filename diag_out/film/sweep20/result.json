@@ -1,0 +1,54 @@
+{
+  "skill": "scoop",
+  "success": true,
+  "granules_in_bowl": 0,
+  "cup_moved_mm": 1.2,
+  "params": {
+    "powder_source": "citric acid",
+    "tool_span": 0.03430014577228499,
+    "tool_back_reach": 0.03,
+    "tool_offset": [
+      0.024601971766289064,
+      -4.6734727785210356e-05,
+      0.02930941141170506
+    ],
+    "powder_surface_z": 0.02388183234906867,
+    "sweep_advance": 0.02,
+    "roll_late": 2.2
+  },
+  "result": {
+    "scooped_from": "citric acid",
+    "scoop_depth": 0.015,
+    "effective_depth": 0.015,
+    "cutting_edge_z": 0.008881832349068669,
+    "surface_z": 0.02388183234906867,
+    "surface_given": true,
+    "dig_tilt_deg": 45.0,
+    "sweep_end_tilt_deg": 0.0,
+    "cup_tilt_deg": 15.0,
+    "exit_tilt_deg": -15.0,
+    "handle_clearance": 0.005,
+    "tool_back_reach": 0.03,
+    "sweep_lift_forced": 0.0,
+    "effective_dig_after_clearance": 0.015,
+    "roll_late": 2.2,
+    "sweep_advance": 0.02,
+    "sweep_rise": 0.005,
+    "sweep_waypoints": 12,
+    "swept_waypoints": 12,
+    "final_tilt_deg": 0.0,
+    "envelope_reach": 0.0271500728861247,
+    "allowed_reach": 0.030675968222939706,
+    "rim_radius": 0.038675968222939706,
+    "tool_span": 0.03430014577228499,
+    "tool_offset": [
+      0.024601971766289064,
+      -4.6734727785210356e-05,
+      0.02930941141170506
+    ],
+    "forward_offset": 0.0,
+    "lateral_offset": 0.0,
+    "residual_from_level_deg": -14.997984352803073,
+    "quantity_measured": false
+  }
+}

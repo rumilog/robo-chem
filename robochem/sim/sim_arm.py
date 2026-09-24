@@ -71,6 +71,58 @@ def _slerp(r_a: np.ndarray, r_b: np.ndarray, t: float) -> np.ndarray:
     return out.reshape(3, 3)
 
 
+def _lerp_plan(q_start: np.ndarray, plan: np.ndarray, t: float) -> np.ndarray:
+    """
+    Joint target at fraction ``t`` of a plan whose k-th sample (1-based) is due
+    at t = k/len(plan), ramped linearly from ``q_start``.
+
+    Holding each sample instead (zero-order hold) stepped the servo target by
+    up to 0.045 rad every few dozen steps: the wrist hit its 12 Nm torque limit,
+    the held tool was kicked, and each kick flipped hundreds of contact states
+    in the solver. The endpoint is returned exactly, so the final target -- and
+    what _settle converges to -- is unchanged.
+    """
+    n = len(plan)
+    if t >= 1.0:
+        return plan[-1].copy()
+    s = max(t, 0.0) * n
+    k = int(s)
+    a = q_start if k == 0 else plan[k - 1]
+    return a + (plan[k] - a) * (s - k)
+
+
+def _hermite_plan(q_start: np.ndarray, plan: np.ndarray):
+    """
+    A C1 joint reference through ``q_start`` and every plan sample (sample k
+    due at u = k/len(plan)), returning ``ref(u) -> (q, dq/du)``.
+
+    Cubic Hermite segments with Catmull-Rom tangents inside and ZERO tangent at
+    both ends, so the path starts and ends at rest and its velocity never
+    jumps. The velocity is what the feed-forward in follow_pose_path is built
+    from; a piecewise-linear reference would make it jump at every sample and
+    those jumps saturate the wrist exactly as the old staircase did.
+    """
+    knots = np.vstack([q_start, plan])
+    n = len(knots) - 1
+    h = 1.0 / n
+    tangents = np.zeros_like(knots)
+    tangents[1:-1] = (knots[2:] - knots[:-2]) / (2.0 * h)
+
+    def ref(u: float):
+        s = min(max(u, 0.0), 1.0) * n
+        k = min(int(s), n - 1)
+        x = s - k
+        p0, p1 = knots[k], knots[k + 1]
+        m0, m1 = tangents[k] * h, tangents[k + 1] * h
+        q = ((2 * x**3 - 3 * x**2 + 1) * p0 + (x**3 - 2 * x**2 + x) * m0
+             + (-2 * x**3 + 3 * x**2) * p1 + (x**3 - x**2) * m1)
+        dq_dx = ((6 * x**2 - 6 * x) * p0 + (3 * x**2 - 4 * x + 1) * m0
+                 + (-6 * x**2 + 6 * x) * p1 + (3 * x**2 - 2 * x) * m1)
+        return q, dq_dx * n
+
+    return ref
+
+
 def _rotation_error(current: np.ndarray, target: np.ndarray) -> np.ndarray:
     """Rotation vector taking ``current`` onto ``target``, in world axes."""
     q_cur, q_tgt, q_err, vel = np.zeros(4), np.zeros(4), np.zeros(4), np.zeros(3)
@@ -121,6 +173,44 @@ class SimFrankaArm:
 
         self._attached: Dict[str, np.ndarray] = {}   # prop name -> TCP^-1 * prop pose
         self._held_width: Optional[float] = None
+        self.last_settle: Tuple[int, str] = (0, "none")   # (steps, why it ended)
+        self._last_sync = 0.0                              # wall clock of the last frame
+
+        # Velocity feed-forward gain per arm joint. A position servo
+        # (kp, kv) with joint damping b trails a ramp by (kv + b)/kp * velocity:
+        # 0.1 s here on every joint, so a 1 s scoop roll ran 6-14 deg behind
+        # its command, and the tip -- whose height depends most on the tilt
+        # near level -- went up to 7 mm below its plan and into the cup floor.
+        # Commanding q + gain * qdot cancels that ramp lag, which is what the
+        # real controller's feed-forward does.
+        kp = self.model.actuator_gainprm[:7, 0]
+        kv = -self.model.actuator_biasprm[:7, 2]
+        damping = np.array([
+            self.model.dof_damping[self.model.jnt_dofadr[
+                mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, j)]]
+            for j in ARM_JOINTS])
+        self._ff_gain = (kv + damping) / kp
+
+        # Collision bits so a MAGNET-held prop stops touching the hand that
+        # carries it. MuJoCo pairs two geoms when (contype1 & conaffinity2) or
+        # (contype2 & conaffinity1). Hand and finger geoms move to contype 2 /
+        # conaffinity 3, which pairs them with everything exactly as before;
+        # a prop, while held, goes to contype 4 / conaffinity 1, which still
+        # pairs it with the cup, the table and the other props but not with
+        # the hand. Why: the held prop is placed by teleport a step behind the
+        # hand, so when the wrist turns fast its handle sinks into the finger
+        # pads and the contact shoves the ARM -- at --speed 2 it pushed the arm
+        # 17 mm sideways during a settle, onto the rim of the dish.
+        self._hand_geoms = [
+            g for g in range(self.model.ngeom)
+            if self.model.geom_contype[g] or self.model.geom_conaffinity[g]
+            if mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY,
+                                 self.model.geom_bodyid[g])
+            in ("hand", "left_finger", "right_finger")]
+        for g in self._hand_geoms:
+            self.model.geom_contype[g] = 2
+            self.model.geom_conaffinity[g] = 3
+        self._held_bits: Dict[str, List[Tuple[int, int, int]]] = {}
         self._viewer = None
         if viewer:
             self._open_viewer()
@@ -146,6 +236,18 @@ class SimFrankaArm:
     def _sync(self):
         if self._viewer is not None and self._viewer.is_running():
             self._viewer.sync()
+        self._last_sync = time.time()
+
+    # Viewer frames are paced by WALL clock. They used to be paced by sim time
+    # (one sync per 1/60 s = 8 steps), which tied the frame rate to the cost of
+    # a step: with a powder bed a step costs 20-100 ms, so a dig showed one
+    # frame every 0.2-0.8 s. Now a step that crosses a 1/60 s wall boundary is
+    # shown, whatever it cost. Headless, _sync does nothing, so nothing changes.
+    FRAME_WALL_S = 1 / 60
+
+    def _frame(self):
+        if time.time() - self._last_sync >= self.FRAME_WALL_S:
+            self._sync()
 
     def close(self):
         """
@@ -174,6 +276,7 @@ class SimFrankaArm:
         end = time.time() + seconds
         while time.time() < end and self._viewer.is_running():
             self._step(1)
+            self._frame()
             time.sleep(self.model.opt.timestep)
 
     # ------------------------------------------------------------ kinematics
@@ -289,28 +392,54 @@ class SimFrankaArm:
             mujoco.mju_subQuat(omega, quat, was_quat)
             self.data.qvel[dof:dof + 3] = step / dt
             self.data.qvel[dof + 3:dof + 6] = omega / dt
-        mujoco.mj_forward(self.model, self.data)
+        # Refresh POSES only. Everything read between steps -- the viewer,
+        # get_pose, Film/SimVision renders, grains_in_bowl -- needs body, geom,
+        # site, camera and light poses, and mj_step re-runs the full forward
+        # pass itself from qpos/qvel. A trailing mj_forward here repeated the
+        # ~1000-contact constraint solve for nothing: it doubled the cost of
+        # every step with a prop in the jaws and changed the trajectory by
+        # exactly zero bits (checked over a full 1083-step sweep and settle).
+        # data.contact / efc_* / actuator_force are therefore left from
+        # mj_step's own pass, one step old; film_sim_skill's ContactWatch
+        # refreshes contacts itself for that reason.
+        mujoco.mj_kinematics(self.model, self.data)
+        mujoco.mj_comPos(self.model, self.data)
+        mujoco.mj_camlight(self.model, self.data)
 
     def _run(self, duration: float, ctrl_fn):
         """Step physics for ``duration`` seconds, calling ``ctrl_fn(t)`` each step."""
         dt = self.model.opt.timestep
         span = max(duration / max(self.speed, 1e-6), dt)
         steps = max(int(round(span / dt)), 1)
-        sync_every = max(int(round(1 / 60 / dt)), 1)
         start = time.time()
 
         for i in range(steps):
             ctrl_fn(min((i + 1) / steps, 1.0))
             self._step(1)
-            if i % sync_every == 0:
-                self._sync()
-                if self.realtime:
-                    lag = (i * dt) - (time.time() - start)
-                    if lag > 0:
-                        time.sleep(lag)
+            if self.realtime:
+                # Hold wall = sim when steps are cheaper than realtime; sleep in
+                # chunks of at least 4 ms rather than every 2 ms step.
+                lag = (i + 1) * dt - (time.time() - start)
+                if lag > 0.004:
+                    time.sleep(lag)
+            self._frame()
         self._sync()
 
-    def _settle(self, max_seconds: float = 1.5, tol: float = 2e-4):
+    def _servo_pose_error(self) -> Tuple[float, float]:
+        """
+        How far the TCP is (metres, radians) from where the servos are driving
+        it: forward kinematics of ctrl on the arm-only IK model.
+        """
+        model, data, sid = self.scene.ik_model, self.scene.ik_data, self.scene.ik_tool_site
+        data.qpos[:7] = self.data.ctrl[:7]
+        mujoco.mj_kinematics(model, data)
+        pos, mat = self._tcp()
+        return (float(np.linalg.norm(data.site_xpos[sid] - pos)),
+                float(np.linalg.norm(_rotation_error(mat, data.site_xmat[sid].reshape(3, 3)))))
+
+    def _settle(self, max_seconds: float = 1.5, tol: float = 2e-4, window: float = 0.1,
+                min_gain: float = 0.2, stall_pos_tol: float = 1e-3,
+                stall_rot_tol: float = 5e-3):
         """
         Let the servos converge on the last commanded joint target.
 
@@ -319,16 +448,41 @@ class SimFrankaArm:
         that pose back through their own arrival checks. Settling is timed in
         simulated seconds and is deliberately not scaled by ``speed``: it is
         convergence, not part of the motion being previewed.
+
+        It also stops when waiting has stopped helping. A free servo here is
+        overdamped with its slow pole at kp/kv = 10/s on every joint, so its
+        joint error falls by about e^-1 per 0.1 s window. If a window's peak
+        error is not at least ``min_gain`` below the previous window's AND the
+        TCP is already within ``stall_pos_tol`` / ``stall_rot_tol`` of FK(ctrl),
+        more time cannot move it. That was the held scoop in a powder bed: the
+        plain test never held, and every dig burned the full 1.5 s. In free
+        space the plain test always fires first, so behaviour there is
+        unchanged; an arm that is blocked or still slewing is far from
+        FK(ctrl) and runs to the timeout as before.
+
+        Why it ended is kept in ``last_settle`` as (steps, reason), so a test
+        can notice the stall branch starting to fire somewhere new.
         """
         dt = self.model.opt.timestep
-        sync_every = max(int(round(1 / 60 / dt)), 1)
+        win = max(int(round(window / dt)), 1)
+        prev_peak, peak = None, 0.0
+        steps, reason = int(max_seconds / dt), "timeout"
         for i in range(int(max_seconds / dt)):
             self._step(1)
-            if i % sync_every == 0:
-                self._sync()
-            if (np.abs(self.data.qvel[:7]).max() < 1e-3
-                    and np.abs(self.data.ctrl[:7] - self.data.qpos[:7]).max() < tol):
+            self._frame()
+            err = float(np.abs(self.data.ctrl[:7] - self.data.qpos[:7]).max())
+            if np.abs(self.data.qvel[:7]).max() < 1e-3 and err < tol:
+                steps, reason = i + 1, "converged"
                 break
+            peak = max(peak, err)
+            if (i + 1) % win == 0:
+                if prev_peak is not None and peak > (1.0 - min_gain) * prev_peak:
+                    dp, dr = self._servo_pose_error()
+                    if dp < stall_pos_tol and dr < stall_rot_tol:
+                        steps, reason = i + 1, "stalled"
+                        break
+                prev_peak, peak = peak, 0.0
+        self.last_settle = (steps, reason)
         self._sync()
 
     def goto_pose(self, tool_pose, duration: float = 3.0, use_impedance: bool = True,
@@ -350,6 +504,7 @@ class SimFrankaArm:
                   f"({duration:.1f}s)")
 
         seed = self.get_joints()
+        q_start = seed.copy()
         waypoints = max(int(duration * 20), 2)          # ~20 IK solves per second
         plan = []
         for k in range(1, waypoints + 1):
@@ -361,8 +516,10 @@ class SimFrankaArm:
         plan = np.asarray(plan)
 
         def ctrl(t):
-            idx = min(int(t * waypoints), waypoints - 1)
-            self.data.ctrl[:7] = plan[idx]
+            # Ramp between plan samples rather than holding each one; see
+            # _lerp_plan. No feed-forward here: a straight move starts and
+            # stops abruptly, and a lead term would overshoot the stop.
+            self.data.ctrl[:7] = _lerp_plan(q_start, plan, t)
 
         self._run(duration, ctrl)
         self._settle()
@@ -404,6 +561,7 @@ class SimFrankaArm:
         # One joint plan through every point, solved before any of it runs, so
         # the motion never pauses to think.
         seed = self.get_joints()
+        q_start = seed.copy()
         plan = []
         per_point = max(int(duration * 20 / max(len(pts) - 1, 1)), 2)
         prev_pos, prev_mat = start_pos, start_mat
@@ -416,8 +574,34 @@ class SimFrankaArm:
             prev_pos, prev_mat = pos, mat
         plan = np.asarray(plan)
 
+        # A smooth reference plus velocity feed-forward, so the arm is where the
+        # path says WHEN it says. A path is a shape the skill designed point by
+        # point -- scoop's holds the spoon tip at a set height while the wrist
+        # rolls -- and a servo trailing it by 0.1 s does not just arrive late:
+        # the wrist lags the arm, the tool tilts more than planned, and the
+        # shape breaks. From a checkpoint of the scoop roll the tip went 6.7 mm
+        # through the cup floor at --speed 5 without this, and stayed within
+        # 0.3 mm of plan with it at speeds 2, 3 and 5.
+        ref = _hermite_plan(q_start, plan)
+        span = max(duration / max(self.speed, 1e-6), self.model.opt.timestep)
+
         def ctrl(t):
-            self.data.ctrl[:7] = plan[min(int(t * len(plan)), len(plan) - 1)]
+            if t >= 1.0:
+                self.data.ctrl[:7] = plan[-1]
+                return
+            # Min-jerk timing along the path: it starts and ends with zero
+            # velocity AND acceleration. With uniform timing the path runs at
+            # full speed until its last sample and then stops dead -- the
+            # scoop's wrist was still turning at 1.4 rad/s one sample (28 ms)
+            # before the end -- and the feed-forward turns that stop into a
+            # command step the servos can only answer at their torque limits.
+            # At --speed 2 that braking threw the TCP 26 mm sideways into the
+            # dish rim; smooth timing is also what frankapy's generators do.
+            t = max(t, 0.0)
+            u = t ** 3 * (10.0 - 15.0 * t + 6.0 * t ** 2)
+            du_dt = 30.0 * t ** 2 * (1.0 - t) ** 2
+            q, dq_du = ref(u)
+            self.data.ctrl[:7] = q + self._ff_gain * dq_du * du_dt / span
 
         self._run(duration, ctrl)
         self._settle()
@@ -514,6 +698,7 @@ class SimFrankaArm:
             world[:3, :3] = body_mat
             world[:3, 3] = self.data.xpos[bid]
             self._attached[prop.name] = np.linalg.inv(tcp) @ world
+            self._exclude_from_hand(prop.name)
 
             # A real grasp stalls the fingers on the object; the skills read
             # that width back to confirm they are holding something.
@@ -527,10 +712,31 @@ class SimFrankaArm:
         if self.verbose:
             print("[sim] jaws closed on nothing")
 
+    def _exclude_from_hand(self, name: str):
+        """While held, the prop collides with everything but the hand."""
+        body = self.scene.prop_bodies[name]
+        saved = []
+        for g in range(self.model.ngeom):
+            if self.model.geom_bodyid[g] != body:
+                continue
+            ct, ca = int(self.model.geom_contype[g]), int(self.model.geom_conaffinity[g])
+            if not (ct or ca):
+                continue          # drawn only, never collides
+            saved.append((g, ct, ca))
+            self.model.geom_contype[g] = 4
+            self.model.geom_conaffinity[g] = 1
+        self._held_bits[name] = saved
+
+    def _restore_to_hand(self, name: str):
+        for g, ct, ca in self._held_bits.pop(name, []):
+            self.model.geom_contype[g] = ct
+            self.model.geom_conaffinity[g] = ca
+
     def _release(self):
         for name in list(self._attached):
             if self.verbose:
                 print(f"[sim] released {name!r}")
+            self._restore_to_hand(name)
         self._attached.clear()
         self._held_width = None
 
@@ -543,6 +749,8 @@ class SimFrankaArm:
 
     def reset_scene(self):
         """Put the bench and the arm back to their starting state."""
+        for name in list(self._attached):
+            self._restore_to_hand(name)
         self._attached.clear()
         self._held_width = None
         reset_scene(self.scene)

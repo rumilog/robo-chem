@@ -34,6 +34,11 @@ class Prop:
     fill: int = 0                   # granules to drop in at reset
     fill_rgba: Tuple[float, float, float, float] = (0.95, 0.95, 0.9, 1.0)
     grain_radius: float = 0.0035   # coarse grains cost fewer bodies for a given bed
+    # Height of a powder bed above the container's INSIDE floor, metres. Not
+    # simulated as particles: drawn as a solid-looking fill (no contacts) and
+    # used by robochem.sim.powder to estimate what a scoop collects. Granules
+    # (``fill``) are the physical alternative and only appear with granules=True.
+    powder_level: float = 0.0
     static: bool = False            # True = welded to the table, never moves
 
     # A prop whose real shape matters to perception carries its CAD instead of
@@ -104,20 +109,26 @@ def default_bench() -> List[Prop]:
         Prop(
             name="citric acid cup",
             pos=(0.38, -0.26),
-            radius=0.0345,     # 65mm inner diameter + a 2mm wall
+            # The larger dishes bought for the bench (was 0.0345, a 65mm-inside
+            # dish): measured 3.96 in = 100.6mm across the outside. The inside
+            # is not measured yet -- 96.6mm assumes the 2mm wall below. The
+            # scoop's stroke is sized to the INSIDE radius (radius - wall), so
+            # correct the wall once the inside diameter is known.
+            radius=0.0503,
             height=0.031,      # the lab's reagent cups are shallow dishes
             wall=0.002,
             rgba=(0.97, 0.97, 0.97, 1.0),
             mass=0.01,
             label="citric acid",
-            fill=90,           # a bed to scoop from, not a scatter
+            fill=90,           # granules, only with granules=True
             grain_radius=0.003,
             fill_rgba=(0.98, 0.98, 0.94, 1.0),
+            powder_level=0.018,  # powder 18mm deep: surface 9mm under the rim
         ),
         Prop(
             name="baking soda cup",
             pos=(0.38, 0.26),
-            radius=0.0345,
+            radius=0.0503,     # same 3.96 in dish as the citric acid cup
             height=0.031,
             wall=0.002,
             rgba=(0.97, 0.97, 0.97, 1.0),
@@ -126,6 +137,7 @@ def default_bench() -> List[Prop]:
             fill=90,
             grain_radius=0.003,
             fill_rgba=(1.0, 1.0, 1.0, 1.0),
+            powder_level=0.018,
         ),
         # The lab's printed scoop, straight off spoon.stl: a 30mm flat handle,
         # a crank down, and a 27x20mm open bowl. Every number below is measured

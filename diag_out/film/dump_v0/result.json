@@ -1,0 +1,233 @@
+{
+  "skill": "scoop",
+  "success": true,
+  "powder_estimate": {
+    "collected_ml": 0.08569335937499997,
+    "collected_g": 0.07712402343749998,
+    "fill_fraction": 0.04687500000000001,
+    "peak_ml": 1.8281249999999991,
+    "capacity_ml": 1.8281249999999991,
+    "swept_ml": 2.6894983251391418,
+    "submerged_steps": 2914,
+    "max_tilt_after_exit_deg": 106.54573841733382,
+    "spill_risk": true,
+    "landed_ml": {
+      "white paper cup": 1.5297851562499991
+    },
+    "lost_ml": 0.21264648437499986,
+    "pours": [
+      {
+        "into": "white paper cup",
+        "ml": 1.52978515625,
+        "t0": 62.38800000003028,
+        "t1": 65.44400000002888,
+        "x_range": [
+          0.4839197654487046,
+          0.5349433577281038
+        ],
+        "y_range": [
+          -0.16248389184718323,
+          -0.15471918124514775
+        ],
+        "tilt_deg": [
+          36.93137236631504,
+          84.81712876031443
+        ]
+      },
+      {
+        "into": null,
+        "ml": 0.212646484375,
+        "t0": 65.44800000002887,
+        "t1": 68.40600000002198,
+        "x_range": [
+          0.44705398729921336,
+          0.4837313338494846
+        ],
+        "y_range": [
+          -0.15718035143642364,
+          -0.1413632010579525
+        ],
+        "tilt_deg": [
+          84.89511511430521,
+          106.04902228983522
+        ]
+      }
+    ],
+    "bulk_density_g_per_ml": 0.9
+  },
+  "robot_cup_contacts": 0,
+  "tool_cup_contacts": 0,
+  "granules_in_bowl": null,
+  "cup_moved_mm": 0.0,
+  "params": {
+    "powder_source": "citric acid",
+    "tool_span": 0.03430014577228499,
+    "tool_back_reach": 0.03,
+    "bowl_length": 0.0275,
+    "bowl_depth": 0.0115,
+    "tool_offset": [
+      0.025715418446611286,
+      -7.179043536924974e-05,
+      0.029379237384174393
+    ],
+    "powder_surface_z": 0.021993503382585978,
+    "container_floor_z": 0.004,
+    "container_radius": 0.048299999999999996,
+    "container_center": [
+      0.3800029408159551,
+      -0.26000104679214275
+    ],
+    "bowl_width": 0.0205
+  },
+  "result": {
+    "scooped_from": "citric acid",
+    "depth_mode": "floor",
+    "tip_floor_gap": 0.003,
+    "scoop_depth": 0.014993503382585979,
+    "depth_reference": "tip",
+    "depth_reached": 0.014993503382585979,
+    "tip_depth_max": 0.01499350338258598,
+    "entry_depths_tip_mouth_top": [
+      0.014993503382585979,
+      -0.002664345919450053,
+      -0.014572195221486079
+    ],
+    "end_depths_tip_mouth_top": [
+      0.014993503382585979,
+      0.0034935033825859788,
+      0.0034935033825859788
+    ],
+    "floor_gap_entry": 0.002999999999999999,
+    "floor_gap_end": 0.002999999999999999,
+    "floor_z": 0.004,
+    "floor_source": "container_floor_z",
+    "floor_clearance": 0.001,
+    "rim_lift_max": 0.0,
+    "surface_z": 0.021993503382585978,
+    "surface_given": true,
+    "dig_tilt_deg": 60.0,
+    "dig_tilt_requested": 60.0,
+    "sweep_end_tilt_deg": 0.0,
+    "cup_tilt_deg": 15.0,
+    "exit_tilt_deg": -15.0,
+    "handle_clearance": 0.005,
+    "tool_back_reach": 0.03,
+    "stroke_start": -0.03209970333434104,
+    "stroke_end": 0.02522470333434792,
+    "stroke_travel": 0.05732440666868896,
+    "tip_travel": 0.06419940666856745,
+    "stroke_fits": true,
+    "bowl_length": 0.0275,
+    "bowl_width": 0.0205,
+    "bowl_depth": 0.0115,
+    "roll_late": 1.0,
+    "sweep_advance_requested": null,
+    "sweep_rise": 0.0,
+    "sweep_waypoints": 12,
+    "swept_waypoints": 12,
+    "final_tilt_deg": 0.0,
+    "envelope_reach": 0.04029999999994064,
+    "allowed_reach": 0.040299999999999996,
+    "dish_radius": 0.048299999999999996,
+    "dish_radius_source": "container_radius",
+    "rim_radius": 0.06624127813670899,
+    "tool_span": 0.03430014577228499,
+    "tool_offset": [
+      0.025715418446611286,
+      -7.179043536924974e-05,
+      0.029379237384174393
+    ],
+    "forward_offset": 0.0,
+    "lateral_offset": 0.0,
+    "residual_from_level_deg": -14.996870902582259,
+    "quantity_measured": false
+  },
+  "then": {
+    "skill": "dump",
+    "success": true,
+    "target": "white paper cup",
+    "powder_estimate": {
+      "collected_ml": 0.08569335937499997,
+      "collected_g": 0.07712402343749998,
+      "fill_fraction": 0.04687500000000001,
+      "peak_ml": 1.8281249999999991,
+      "capacity_ml": 1.8281249999999991,
+      "swept_ml": 2.6894983251391418,
+      "submerged_steps": 2914,
+      "max_tilt_after_exit_deg": 106.54573841733382,
+      "spill_risk": true,
+      "landed_ml": {
+        "white paper cup": 1.5297851562499991
+      },
+      "lost_ml": 0.21264648437499986,
+      "pours": [
+        {
+          "into": "white paper cup",
+          "ml": 1.52978515625,
+          "t0": 62.38800000003028,
+          "t1": 65.44400000002888,
+          "x_range": [
+            0.4839197654487046,
+            0.5349433577281038
+          ],
+          "y_range": [
+            -0.16248389184718323,
+            -0.15471918124514775
+          ],
+          "tilt_deg": [
+            36.93137236631504,
+            84.81712876031443
+          ]
+        },
+        {
+          "into": null,
+          "ml": 0.212646484375,
+          "t0": 65.44800000002887,
+          "t1": 68.40600000002198,
+          "x_range": [
+            0.44705398729921336,
+            0.4837313338494846
+          ],
+          "y_range": [
+            -0.15718035143642364,
+            -0.1413632010579525
+          ],
+          "tilt_deg": [
+            84.89511511430521,
+            106.04902228983522
+          ]
+        }
+      ],
+      "bulk_density_g_per_ml": 0.9
+    },
+    "robot_target_contacts": 0,
+    "tool_target_contacts": 0,
+    "target_moved_mm": 0.0,
+    "params": {
+      "target_container": "white paper cup",
+      "tool_offset": [
+        0.025715418446611286,
+        -7.179043536924974e-05,
+        0.029379237384174393
+      ]
+    },
+    "result": {
+      "dumped_into": "white paper cup",
+      "tip_commanded": 120.0,
+      "tip_achieved": 104.40112392109373,
+      "tip_stalled_short": false,
+      "residual_tilt": 0.02502378472218763,
+      "shakes": 2,
+      "rim_radius": 0.04094707988161089,
+      "rim_z": 0.09071552274917954,
+      "tool_offset": [
+        0.025715418446611286,
+        -7.179043536924974e-05,
+        0.029379237384174393
+      ],
+      "forward_offset": 0.0,
+      "lateral_offset": 0.0,
+      "quantity_measured": false
+    }
+  }
+}

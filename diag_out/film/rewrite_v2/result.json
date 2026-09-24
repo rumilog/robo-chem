@@ -1,0 +1,44 @@
+{
+  "skill": "scoop",
+  "success": true,
+  "granules_in_bowl": 0,
+  "params": {
+    "powder_source": "citric acid",
+    "tool_span": 0.03430014577228499,
+    "tool_offset": [
+      0.024601971766289064,
+      -4.6734727785210356e-05,
+      0.02930941141170506
+    ],
+    "powder_surface_z": 0.009577649003049324
+  },
+  "result": {
+    "scooped_from": "citric acid",
+    "scoop_depth": 0.015,
+    "effective_depth": 0.003611504537277309,
+    "bowl_floor_z": 0.005966144465772014,
+    "surface_z": 0.009577649003049324,
+    "surface_given": true,
+    "dig_tilt_deg": 45.0,
+    "cup_tilt_deg": 15.0,
+    "roll_late": 1.6,
+    "sweep_advance": 0.008,
+    "sweep_rise": 0.005,
+    "sweep_waypoints": 12,
+    "swept_waypoints": 12,
+    "final_tilt_deg": -15.0,
+    "envelope_reach": 0.020565698323447734,
+    "allowed_reach": 0.0306869963370383,
+    "rim_radius": 0.0386869963370383,
+    "tool_span": 0.03430014577228499,
+    "tool_offset": [
+      0.024601971766289064,
+      -4.6734727785210356e-05,
+      0.02930941141170506
+    ],
+    "forward_offset": 0.0,
+    "lateral_offset": 0.0,
+    "residual_from_level_deg": -14.999984479337186,
+    "quantity_measured": false
+  }
+}
