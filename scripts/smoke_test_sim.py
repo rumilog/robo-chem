@@ -185,6 +185,97 @@ def test_scoop_and_dump(cell) -> bool:
     return ok
 
 
+def test_scoop_then_stir(cell) -> bool:
+    """Scoop and stir back to back in ONE session, with no reset between them.
+
+    Every other group calls cell.reset() first, which wipes exactly the state
+    that one skill hands the next: what the jaws are holding, where the arm
+    was left, which geoms had their collisions switched off while a prop was
+    carried. The gripper bug this suite caught after the bozhang merge only
+    appeared when a carried prop was let go, so the spoon is used and put down
+    here before the stirrer is picked up -- the handover is the thing under
+    test, not the two skills on their own.
+    """
+    print("\nscoop then stir (no reset between: spoon -> put down -> stirrer)")
+    cell.reset()
+    ok = True
+    tool = {"tool_offset": [0.025, 0.0, 0.029], "bowl_length": 0.0275,
+            "bowl_depth": 0.0115, "bowl_width": 0.0205}
+
+    # ---- his scoop -------------------------------------------------------
+    picked, _ = cell.skills.execute(
+        "pick_up", {"object_name": "larger spoon", "z_offset": 0.0, "grasp_force": 1.0}
+    )
+    ok &= check("spoon picked up", picked and cell.arm.holding == "larger spoon",
+                str(cell.arm.holding))
+    if not picked:
+        return ok
+
+    cup = cell.scene.bench.find("citric acid")
+    cell.vision.clear_cache()
+    scooped, _ = cell.skills.execute(
+        "scoop", {"powder_source": "citric acid", **tool,
+                  "tool_span": 0.0275, "tool_back_reach": 0.030,
+                  "container_radius": cup.radius - cup.wall,
+                  "container_center": list(cell.vision.ground_truth("citric acid")[:2])}
+    )
+    ok &= check("scoop reports success", scooped)
+    if not scooped:
+        return ok
+
+    dumped, _ = cell.skills.execute(
+        "dump", {"target_container": "white paper cup", **tool})
+    ok &= check("dump reports success", dumped)
+
+    # ---- the handover ----------------------------------------------------
+    # Letting the spoon go is the step that used to jam: a carried prop can
+    # overlap the finger pads, and turning its hand collisions back on before
+    # the jaws move stalls the open.
+    ok &= check("spoon released cleanly", cell.arm.open_gripper() is not False)
+    ok &= check("jaws opened past 56mm", cell.arm.get_gripper_width() > 0.056,
+                f"{cell.arm.get_gripper_width() * 1000:.1f}mm")
+    ok &= check("nothing left in the jaws", cell.arm.holding is None,
+                str(cell.arm.holding))
+
+    # ---- your stir -------------------------------------------------------
+    body = cell.scene.prop_bodies["stirrer"]
+    seat = np.array([*cell.scene.bench.find("stirrer holder").pos, 0.100])
+    cell.vision.clear_cache()
+    picked, _ = cell.skills.execute("pick_up", {"object_name": "stirring rod"})
+    ok &= check("stirrer picked up after the scoop",
+                picked and cell.arm.holding == "stirrer", str(cell.arm.holding))
+    if not picked:
+        return ok
+
+    cell.vision.clear_cache()
+    stirred, result = cell.skills.execute("stir", {
+        "target_container": "plastic beaker",
+        "tool_axis": "z",
+        "tool_length": 0.081,
+        "revolutions": 2,
+    })
+    ok &= check("stir reports success", stirred, "" if stirred else str(result)[:70])
+    if stirred:
+        ok &= check("two revolutions completed",
+                    result.get("revolutions_completed") == 2.0,
+                    str(result.get("revolutions_completed")))
+
+    cell.vision.clear_cache()
+    placed, result = cell.skills.execute("place", {
+        "target_location": "stirrer holder",
+        "on_top": True,
+        "release_clearance": 0.015,
+        "stop_force_n": 1.0,
+    })
+    ok &= check("stirrer placed back", placed, "" if placed else str(result)[:70])
+    for _ in range(1500):
+        mujoco.mj_step(cell.scene.model, cell.scene.data)
+    back = cell.scene.data.xpos[body].copy()
+    ok &= check("stirrer back in the holder", np.linalg.norm(back - seat) < 0.008,
+                f"{np.round(back, 4)} vs seat {np.round(seat, 3)}")
+    return ok
+
+
 def test_stirrer_and_stir(cell) -> bool:
     """
     The stirrer's whole cycle: out of its holder, stir, back into its holder.
@@ -308,8 +399,9 @@ def main() -> int:
     parser.add_argument("--granules", action="store_true",
                         help="Loose particles in the reagent cups")
     parser.add_argument("--only", default=None,
-                        help="Run just the groups whose name contains this, "
-                             "e.g. --only scoop")
+                        help="Run just the groups whose name contains this; "
+                             "comma-separated for several, "
+                             "e.g. --only scoop,stir")
     parser.add_argument("--hold", type=float, default=5.0,
                         help="Seconds to keep the viewer open at the end; "
                              "0 waits until you close the window")
@@ -332,10 +424,13 @@ def main() -> int:
         "pick + stir": test_stirrer_and_stir,
         "force guard": test_force_guard_refuses_to_drop_into_nothing,
         "pick + scoop + dump": test_scoop_and_dump,
+        "scoop then stir": test_scoop_then_stir,
         "failure handling": test_empty_gripper_refuses_to_scoop,
     }
     if args.only:
-        wanted = {k: v for k, v in groups.items() if args.only.lower() in k}
+        terms = [t.strip().lower() for t in args.only.split(",") if t.strip()]
+        wanted = {k: v for k, v in groups.items()
+                  if any(t in k for t in terms)}
         if not wanted:
             print(f"--only {args.only!r} matches none of: "
                   + ", ".join(groups))
