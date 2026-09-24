@@ -146,7 +146,7 @@ class PickUpSkill(BaseSkill):
             "lift_height": 0.15,  # Height to lift after grasping
             # Max gripper force (N). With force_limited=True the jaws stop as
             # soon as contact force hits this — keep it low for "any resistance".
-            "grasp_force": 5.0,
+            "grasp_force": 1.5,
             # Only used when grasp_type="side" (pour-style tipped grasps).
             "pitch_deg": 0.0,
             # Close mode: True = squeeze until contact force (good for rigid

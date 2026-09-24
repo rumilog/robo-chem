@@ -113,8 +113,9 @@ CATALOG: Dict[str, SkillSpec] = {
                   "Close this far inside the measured object width, metres. Larger grips "
                   "harder. 0.013 is the validated value for the beaker.", default=0.004),
             Param("grasp_force", "number",
-                  "Gripper force, newtons. Lower for a thin or fragile item; 1.0 is the "
-                  "validated value for the spoon.", default=5.0),
+                  "Gripper force, newtons: the jaws stop closing once the pads read this. "
+                  "Lower for a thin or fragile item; 1.0 is the validated value for the "
+                  "spoon. Raise it for anything heavy enough to slip.", default=1.5),
         ],
     ),
     "place": SkillSpec(
@@ -202,8 +203,9 @@ CATALOG: Dict[str, SkillSpec] = {
         params=[
             Param("target_container", "string", "Where the powder goes.", required=True),
             Param("dump_angle_deg", "number",
-                  "How far past level to tip. Must exceed 90 -- powder sits in the corner "
-                  "of a bowl held at 90.", default=120.0),
+                  "How far past level to tip, nose-down. Vertical empties the bowl and "
+                  "keeps the wrist well inside its travel; the shake at the end clears "
+                  "the powder that stands on the lead wall at exactly 90.", default=90.0),
             Param("tool_offset", "list",
                   "[x, y, z] from the grasp point to the bowl, tool frame, metres. As "
                   "for 'scoop': pass the measurement stated with the gripper contents.",

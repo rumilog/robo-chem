@@ -45,6 +45,11 @@ JOINT_LOW = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8
 JOINT_HIGH = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
 
 MAX_GRIPPER_WIDTH = 0.08
+# Default cap on how hard the jaws squeeze. The gripper tendon is preloaded --
+# it pulls 4N with the jaws wide open and nothing between them -- so actuator
+# force is not squeeze force; this is measured as contact force on the finger
+# pads, which is what a hardware grasp-force limit regulates.
+GRASP_FORCE_N = 1.5
 # actuator8 maps ctrl 0..255 onto a 0..40 mm finger travel (0..80 mm opening).
 CTRL_PER_METRE = 255.0 / MAX_GRIPPER_WIDTH
 
@@ -217,6 +222,11 @@ class SimFrankaArm:
             if mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY,
                                  self.model.geom_bodyid[g])
             in ("hand", "left_finger", "right_finger")]
+        self._finger_geoms = [
+            g for g in self._hand_geoms
+            if mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY,
+                                 self.model.geom_bodyid[g])
+            in ("left_finger", "right_finger")]
         for g in self._hand_geoms:
             self.model.geom_contype[g] = 2
             self.model.geom_conaffinity[g] = 3
@@ -739,8 +749,52 @@ class SimFrankaArm:
             # _release. Restoring them here would jam this very open.
             deferred = self._release(defer_collision=True)
 
-        self.data.ctrl[7] = width * CTRL_PER_METRE
-        self._run(kwargs.get("duration", 1.0), lambda t: None)
+        target_ctrl = width * CTRL_PER_METRE
+        limit = GRASP_FORCE_N if force is None else float(force)
+
+        if opening or limit is None or limit <= 0.0:
+            self.data.ctrl[7] = target_ctrl
+            self._run(kwargs.get("duration", 1.0), lambda t: None)
+        else:
+            # Close until the pads read `limit` newtons, then hold there rather
+            # than driving on to the commanded width. Holding at the width it
+            # stalled at would keep squeezing, because the servo's own preload
+            # is what presses: force = kg*commanded - kb*actual, so the command
+            # that leaves exactly `limit` on the pads is (kb*w - limit)/kg.
+            kg = float(self.model.actuator_gainprm[7, 0]) * CTRL_PER_METRE
+            kb = -float(self.model.actuator_biasprm[7, 1])
+            held = []
+
+            # How long the jaws take to close is a property of the gripper,
+            # not of --speed: the playback multiplier shortens arm moves, and
+            # letting it shorten this one too drove the pads at 480mm/s at
+            # --speed 6, which hit the beaker at 3.6N before the cap could
+            # latch. Multiplying back by self.speed cancels the division in
+            # _run, so the jaws travel at `closing` m/s whatever the playback.
+            closing = float(speed) if speed else 0.05
+            travel = abs(width - previous)
+            span = min(max(travel / max(closing, 1e-3), 0.2), 4.0)
+            duration = span * self.speed
+
+            def ctrl(t):
+                if held:
+                    return
+                if self._finger_contact_force() >= limit:
+                    w = float(self.data.qpos[7] + self.data.qpos[8])
+                    hold = (kb * w - limit) / kg
+                    self.data.ctrl[7] = float(np.clip(
+                        hold * CTRL_PER_METRE, target_ctrl, 255.0))
+                    held.append(True)
+                    return
+                # Ramp the command rather than stepping it to the target. A
+                # step change shuts the jaws within a single solver step, and
+                # the impact peaked at 6.4N on the stirrer -- four times the
+                # cap -- before the next sample could catch it.
+                self.data.ctrl[7] = (
+                    previous + (width - previous) * t) * CTRL_PER_METRE
+
+            self._run(duration, ctrl)
+
         for name in deferred:
             self._restore_to_hand(name)
 
@@ -764,6 +818,22 @@ class SimFrankaArm:
         return True
 
     # -------------------------------------------------------------- grasping
+
+    def _finger_contact_force(self) -> float:
+        """Total normal force the finger pads are pressing something with."""
+        if not self._finger_geoms:
+            return 0.0
+        pads = set(self._finger_geoms)
+        buf = np.zeros(6)
+        total = 0.0
+        for i in range(self.data.ncon):
+            con = self.data.contact[i]
+            g1, g2 = int(con.geom1), int(con.geom2)
+            if (g1 in pads) == (g2 in pads):
+                continue                      # both ours, or neither
+            mujoco.mj_contactForce(self.model, self.data, i, buf)
+            total += abs(float(buf[0]))       # normal component
+        return total
 
     def _try_grasp(self, commanded_width: float):
         """Attach the prop whose grasp point sits between the closing jaws."""

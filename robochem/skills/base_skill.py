@@ -861,7 +861,7 @@ class BaseSkill(ABC):
             print(f"Gripper open failed: {e}")
             return False
     
-    def close_gripper(self, force: float = 5.0, target_width: float = 0.0,
+    def close_gripper(self, force: float = 1.5, target_width: float = 0.0,
                       force_limited: bool = True) -> bool:
         """
         Close the gripper.

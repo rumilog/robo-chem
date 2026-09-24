@@ -192,17 +192,24 @@ def test_scoop_then_stir(cell) -> bool:
     that one skill hands the next: what the jaws are holding, where the arm
     was left, which geoms had their collisions switched off while a prop was
     carried. The gripper bug this suite caught after the bozhang merge only
-    appeared when a carried prop was let go, so the spoon is used and put down
-    here before the stirrer is picked up -- the handover is the thing under
-    test, not the two skills on their own.
+    appeared when a carried prop was let go, so the spoon is used and returned
+    to the slot it came from before the stirrer is picked up -- the handover is
+    the thing under test, not the two skills on their own. Putting the spoon
+    back rather than dropping it also leaves the bench as it was found, so the
+    group can run twice in a row.
     """
-    print("\nscoop then stir (no reset between: spoon -> put down -> stirrer)")
+    print("\nscoop then stir (no reset between: spoon -> back in its slot -> stirrer)")
     cell.reset()
     ok = True
     tool = {"tool_offset": [0.025, 0.0, 0.029], "bowl_length": 0.0275,
             "bowl_depth": 0.0115, "bowl_width": 0.0205}
 
     # ---- his scoop -------------------------------------------------------
+    spoon = cell.scene.prop_bodies["larger spoon"]
+    spoon_start = np.eye(4)
+    spoon_start[:3, :3] = cell.scene.data.xmat[spoon].reshape(3, 3).copy()
+    spoon_start[:3, 3] = cell.scene.data.xpos[spoon].copy()
+
     picked, _ = cell.skills.execute(
         "pick_up", {"object_name": "larger spoon", "z_offset": 0.0, "grasp_force": 1.0}
     )
@@ -227,15 +234,37 @@ def test_scoop_then_stir(cell) -> bool:
         "dump", {"target_container": "white paper cup", **tool})
     ok &= check("dump reports success", dumped)
 
-    # ---- the handover ----------------------------------------------------
+    # ---- the handover: the spoon goes back in its slot --------------------
     # Letting the spoon go is the step that used to jam: a carried prop can
     # overlap the finger pads, and turning its hand collisions back on before
     # the jaws move stalls the open.
+    #
+    # It goes back where it was picked up from rather than being dropped where
+    # the dump left the arm, so the bench is reusable afterwards. place() is
+    # the wrong tool for it: it keeps whatever orientation the arm is already
+    # in, and dump finishes with the wrist turned ~43 deg off the grasp, which
+    # lands the spoon 94mm from its slot. The sim holds a grasp as
+    # prop = TCP @ rel, so inverting that gives the single TCP pose that puts
+    # the spoon back exactly where it started, orientation included.
+    rel = cell.arm._attached["larger spoon"]
+    home = spoon_start @ np.linalg.inv(rel)
+    hover = home.copy()
+    hover[2, 3] += 0.12
+    release = home.copy()
+    release[2, 3] += 0.002          # let it down the last 2mm rather than grind
+    # Where it lands is not asserted: opening the jaws around something already
+    # resting on the bench nudges it 8-18mm, which varies with what ran before.
+    # The point here is that the spoon goes back to its slot and the handover
+    # works, not millimetre placement.
+    cell.arm.goto_pose(hover, duration=3.0)
+    cell.arm.goto_pose(release, duration=2.0)
+
     ok &= check("spoon released cleanly", cell.arm.open_gripper() is not False)
     ok &= check("jaws opened past 56mm", cell.arm.get_gripper_width() > 0.056,
                 f"{cell.arm.get_gripper_width() * 1000:.1f}mm")
     ok &= check("nothing left in the jaws", cell.arm.holding is None,
                 str(cell.arm.holding))
+    cell.arm.goto_pose(hover, duration=2.0)
 
     # ---- your stir -------------------------------------------------------
     body = cell.scene.prop_bodies["stirrer"]
