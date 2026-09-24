@@ -46,7 +46,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--images-dir", required=True)
     parser.add_argument("--label", required=True, help="Reagent label to match")
-    parser.add_argument("--category", default="white paper cup")
+    parser.add_argument("--category", default="white bowl")
     parser.add_argument(
         "--grounding-url",
         default=os.environ.get("GROUNDING_URL", "http://127.0.0.1:5005"),

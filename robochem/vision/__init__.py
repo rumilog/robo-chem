@@ -39,7 +39,7 @@ class VisionSystem:
         max_object_extent: float = 0.35,
         min_object_height: float = -0.02,
         min_object_points: int = 50,
-        labeled_cup_category: str = "white paper cup",
+        labeled_cup_category: str = "white bowl",
     ):
         """
         Initialize the vision system.
@@ -55,7 +55,16 @@ class VisionSystem:
             min_object_height: Lowest plausible centroid height (m); guards
                 against reconstructions that land below the table
             min_object_points: Minimum surviving points for a valid detection
-            labeled_cup_category: SAM prompt used when resolving reagent labels
+            labeled_cup_category: SAM prompt used when resolving reagent labels.
+                The reagents sit in shallow white bowls, so that is the default;
+                a labelled container of any other kind needs the skill's
+                ``container_category`` instead, because the label path only
+                ever considers instances of this one category. Water lives in
+                clear cups, for example, and needs
+                ``container_category="clear plastic cup"``.
+                Chosen by scripts/sweep_prompts.py against
+                scene_captures/bowls_20260924_160459: "white bowl" scored 0.97
+                on 4/4 cameras, where the old "white paper cup" managed 0.60
                 on paper under scoop-target cups
         """
         self.cameras = cameras or {}

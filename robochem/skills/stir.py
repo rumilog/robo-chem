@@ -96,7 +96,7 @@ class StirSkill(BaseSkill):
             # SAM category to search when the target is identified by a
             # written label. The label path only considers instances of this
             # category, so a labelled CLEAR cup is invisible under the default
-            # "white paper cup" and the query quietly finds nothing.
+            # "white bowl" and the query quietly finds nothing.
             "container_category": None,
             # Distance kept between the stirrer and the container wall. The
             # stirrer's own width is unknown to us, so this is deliberately

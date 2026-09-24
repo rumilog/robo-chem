@@ -26,6 +26,12 @@ import numpy as np
 DIRECT_SAM_QUERIES = {
     "white paper cup",
     "paper cup",
+    # The reagents moved into shallow white bowls on 2026-09-24; these are
+    # container categories, not reagent labels, so they prompt SAM directly.
+    "white bowl",
+    "white ceramic bowl",
+    "white glass bowl",
+    "bowl",
     "plastic beaker",
     "beaker",
     "clear cup",

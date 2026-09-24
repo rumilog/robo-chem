@@ -600,6 +600,30 @@ class BaseSkill(ABC):
             )
             self.wait(0.3)
 
+        # Resample to one setpoint per publish tick. The loop below sends one
+        # message per tick and then terminates, so the path's own waypoint
+        # count IS its duration: scoop's 12-point sweep was being published in
+        # 11/50 = 0.22s and cut off there, however long `seconds` said. It read
+        # as a violent flick instead of a 5s stroke. stir never hit this only
+        # because _circle_path already emits seconds*rate_hz points.
+        wanted = max(2, int(round(float(seconds) * float(rate_hz))))
+        if len(poses) < wanted:
+            src = np.linspace(0.0, len(poses) - 1, wanted)
+            dense = []
+            for u in src:
+                i = int(np.floor(u))
+                j = min(i + 1, len(poses) - 1)
+                f = u - i
+                xyz = (1.0 - f) * path[i] + f * path[j]
+                # Small angular steps between waypoints (5 deg or so on a
+                # scoop), so blending the matrices and re-orthonormalising is
+                # an adequate stand-in for a proper slerp.
+                R = _orthonormalize((1.0 - f) * mats[i] + f * mats[j])
+                dense.append(as_pose(xyz, R))
+            print(f"[{tag}] Resampled {len(poses)} waypoints to {wanted} "
+                  f"setpoints so the path actually takes {seconds:.1f}s")
+            poses = dense
+
         dt = 1.0 / float(rate_hz)
         rate = rospy.Rate(float(rate_hz))
         published = 0
@@ -633,6 +657,22 @@ class BaseSkill(ABC):
                 termination_handler_sensor_msg=sensor_proto2ros_msg(
                     term, SensorDataMessageType.SHOULD_TERMINATE),
             ))
+
+            # Wait for the dynamic skill to actually end before returning.
+            # Publishing SHOULD_TERMINATE only asks; the skill stays active for
+            # a moment after, and the next goto_pose then dies with "Cannot
+            # send another command when the previous skill is active!" — which
+            # is what killed the lift at the end of a successful sweep.
+            waiter = getattr(self.robot, "wait_for_skill", None)
+            if callable(waiter):
+                try:
+                    waiter()
+                except Exception as exc:
+                    print(f"[{tag}] wait_for_skill: {exc}")
+                    try:
+                        self.robot.stop_skill()
+                    except Exception:
+                        pass
             self.wait(0.2)
             return True, f"streamed {published + 1} setpoints over {seconds:.1f}s"
         except Exception as exc:
