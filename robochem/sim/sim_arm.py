@@ -733,11 +733,16 @@ class SimFrankaArm:
             print(f"[sim] gripper -> {width * 1000:.1f}mm (grasp={grasp})")
 
         opening = width > previous + 2e-3
+        deferred: List[str] = []
         if opening and self._attached:
-            self._release()
+            # Hand collisions come back only after the jaws are clear; see
+            # _release. Restoring them here would jam this very open.
+            deferred = self._release(defer_collision=True)
 
         self.data.ctrl[7] = width * CTRL_PER_METRE
         self._run(kwargs.get("duration", 1.0), lambda t: None)
+        for name in deferred:
+            self._restore_to_hand(name)
 
         if not opening and self.grasp_mode == "magnet" and not self._attached:
             self._try_grasp(width)
@@ -819,13 +824,33 @@ class SimFrankaArm:
             self.model.geom_contype[g] = ct
             self.model.geom_conaffinity[g] = ca
 
-    def _release(self):
+    def _release(self, defer_collision: bool = False) -> List[str]:
+        """Let go of whatever is in the jaws.
+
+        A held prop is teleported to follow the TCP with its hand collisions
+        switched off, so by the time it is let go its geoms can overlap the
+        finger pads -- 13.5mm deep when the stirrer goes back in its holder.
+        Turning those contacts back on before the jaws move makes MuJoCo
+        resolve that overlap in one step, and the recoil jams the fingers:
+        an 80mm open stalled at 52.6mm and the place skill read it as
+        "failed to open". With ``defer_collision`` the prop is detached but
+        stays uncollidable with the hand, and the caller restores it once the
+        jaws are clear. The prop still keeps conaffinity 1 meanwhile, so it
+        goes on resting on the holder and the table and cannot fall through.
+
+        Returns the names whose hand collisions are still switched off.
+        """
+        deferred = []
         for name in list(self._attached):
             if self.verbose:
                 print(f"[sim] released {name!r}")
-            self._restore_to_hand(name)
+            if defer_collision:
+                deferred.append(name)
+            else:
+                self._restore_to_hand(name)
         self._attached.clear()
         self._held_width = None
+        return deferred
 
     @property
     def holding(self) -> Optional[str]:
