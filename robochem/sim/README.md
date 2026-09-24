@@ -191,6 +191,13 @@ sim_env/bin/python scripts/run_experiment.py --sim \
   --skill scoop --params '{"powder_source":"citric acid","tool_length":0.08}'
 ```
 
+`--skill` can be repeated to run a sequence against one cell; `--params` is
+matched to it in order, and a skill given no `--params` runs on its defaults.
+This is the only way skills that hand a held tool between them (`pick_up` then
+`pour` / `scoop` / `stir`) can work, because a second invocation starts a fresh
+cell with an empty gripper. The run stops at the first step that fails and exits
+non-zero, naming the step.
+
 | Flag | Effect |
 | --- | --- |
 | `--sim-speed N` | Genuinely moves the arm N× faster by compressing commanded durations. Spilling at high N is real, not an artifact — use `1.0` when granule behaviour matters |
@@ -261,32 +268,81 @@ Prop(name="plastic beaker", pos=(0.46, 0.14), radius=0.035, height=0.095,
 The table top is `z = 0`, which is also the Panda's base plane, matching the real
 cell where object centroids land just above zero.
 
-#### Props that carry their CAD
+### The stirrer and its holder
 
-Where the real shape matters to perception, a prop names an STL instead of being
-approximated. The spoon is the lab's printed scoop, straight off `spoon.stl`:
+`stirrer v1.stl` and `stirrer holder.stl` are both on the bench at (0.62, 0.14),
+on the same axis. The two are authored in **one assembly frame**, so they take
+the same orientation and their heights line up directly: the stirrer starts
+seated in the holder, its head resting on the holder's top face and its rod
+hanging in the bore. That is the point of the holder — the tool is always
+presented upright, so the gripper can take it from straight above like anything
+else.
 
-```python
-Prop(name="larger spoon", kind="rod", pos=(0.58, -0.02),
-     mesh="spoon.stl", mesh_scale=0.001,          # the CAD is in mm
-     mesh_pos=(-0.015, 0.0, 0.0035),              # origin -> middle of the handle
-     height=0.030, wall=0.004,                    # handle: 30mm long, 8mm jaws
-     bowl_size=(0.01375, 0.01025, 0.00575),       # open box, half-extents
-     bowl_offset=(0.0408, 0.0, -0.0223))
+| Part | Geometry |
+| --- | --- |
+| Stirrer | 30 mm grasp head on a 10 mm ⌀ rod, 66 mm of rod, 96 mm overall. Head centre to rod tip is **81 mm** — that is `tool_length`. |
+| Holder | 50 mm ⌀ block, 85 mm tall, bored 12 mm with a chamfer over the top 19 mm. Welded to the bench: it is a fixture. |
+
+The holder is a fixture, so it is deliberately **not graspable** — the stirrer's
+head sits directly above it, and without that rule a closing gripper takes the
+holder instead.
+
+The full cycle, in one session:
+
+```bash
+sim_env/bin/python scripts/run_experiment.py --sim \
+  --skill pick_up --params '{"object_name":"stirring rod"}' \
+  --skill stir    --params '{"target_container":"plastic beaker","tool_axis":"z","tool_length":0.081,"revolutions":3}' \
+  --skill place   --params '{"target_location":"stirrer holder","on_top":true,"release_clearance":0.015,"stop_force_n":1.0}'
 ```
 
-The mesh is what the cameras see and what perception reconstructs. It carries no
-contacts: MuJoCo collides a mesh by its **convex hull**, and the hull of an open
-scoop is a solid block that granules could never enter. Contact instead comes
-from the primitives `bowl_size` and `bowl_offset` describe — a floor, four walls
-and a handle box — which sit in group 3, so the renderer does not draw them and
-the segmentation buffer stays mesh-only.
+| Parameter | Why |
+| --- | --- |
+| `tool_axis: "z"` | The default `"x"` is for a spoon gripped across its flat handle, which has to be stood up with a quarter turn. This rod is gripped end-on and is *already* vertical; the `"x"` check reads that correct pose as 90° off and would tip it flat. |
+| `tool_length: 0.081` | Head centre (the TCP) to rod tip. `stir` puts the wrist at `rim_z - stir_depth + tool_length`, so without this the tip never reaches the liquid. |
+| `on_top: true` | `place` defaults to setting things down *beside* the target. Without this the stirrer is laid on the bench next to the holder, where it falls over. |
+| `release_clearance: 0.015` | Half the head. Only a starting guess when `stop_force_n` is set — the probe begins above it and feels its way down. |
+| `stop_force_n: 1.0` | Stop the descent and release the instant the tool pushes back this hard. Contact means the head has landed on the holder's rim, so it is seated. |
 
-Put the body origin where the jaws close (`mesh_pos` shifts the mesh, not the
-body): `sim_arm._try_grasp` tests that point against the jaw box, and
-`Prop.grasp_width` is `2 * wall`.
+The return is a blind insertion: the bore is 2.5 mm wider than the rod, and what
+makes it work is the chamfer, which catches a rod arriving up to ~14 mm off axis
+and walks it down.
 
----
+### Seating by force
+
+`place` cannot know where to let go from geometry alone. How far the stirrer
+hangs below the TCP changes with every grasp — measured at 6–8 mm of variation
+run to run — and the scanned holder height carries a few millimetres of its own
+error. `stop_force_n` sidesteps both: descend in `probe_step` increments and
+release the moment the tool pushes back harder than the threshold.
+
+Measured curve, pressing the stirrer onto its holder:
+
+| Head underside | Upward force |
+| --- | --- |
+| 0.0857 m (just clear) | 0.00 N |
+| **0.0850 m (on the rim)** | **1.84 N** |
+| 0.0843 m | 4.33 N |
+| 0.0832 m | 7.11 N |
+| 0.0809 m | 11.70 N |
+
+So 1 N triggers within a millimetre of flush, which is the intent. Two details
+this depends on:
+
+- `SimFrankaArm.get_ee_force_torque()` matches frankapy's: six floats, base
+  frame, signed as the force the world exerts *on* the robot. A magnet grasp
+  carries the prop kinematically, so nothing it touches reaches the finger
+  joints and a wrist sensor would read zero — the sim sums contacts on
+  everything moving with the wrist instead, held prop included.
+- The seating faces carry a stiffer `solref`/`solimp` than the MuJoCo default,
+  which otherwise squashes for millimetres before pushing back and smears the
+  contact event into a ramp no threshold can find.
+
+If the probe never reaches the threshold it keeps hold and fails, rather than
+opening the gripper at whatever height the scan produced.
+
+The whole cycle is run by the `pick + stir` group of `smoke_test_sim.py`, and the
+refuse-to-drop behaviour by the `force guard` group.
 
 ## Troubleshooting
 

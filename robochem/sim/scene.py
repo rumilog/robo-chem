@@ -195,6 +195,147 @@ def _add_rod(spec, prop: Prop, table_z: float):
     return body
 
 
+def _add_holder(spec, prop: Prop, table_z: float):
+    """
+    A fixture the stirrer stands in, so the tool is always presented upright.
+
+    Welded to the bench: no freejoint, so the rod going in cannot shove it.
+
+    The bore is a ring of panels rather than a subtracted cylinder, which
+    MuJoCo has no primitive for, and the chamfer at the top is that ring
+    repeated at widening radii. That lead-in is the whole reason a blind
+    insertion works: it catches a rod that arrives up to ``funnel_radius`` off
+    axis and walks it down to the bore, so the placement only has to be as
+    accurate as the chamfer is wide, not as accurate as the bore is tight.
+    """
+    bore = prop.bore_radius or 0.0075
+    outer = prop.radius
+    segments = 16
+
+    body = spec.worldbody.add_body(
+        name=prop.body, pos=[prop.pos[0], prop.pos[1], table_z]
+    )
+    # No freejoint: static.
+
+    def ring(z_lo, z_hi, inner, name):
+        """An annulus of boxes between two radii, spanning a height band."""
+        mid = (inner + outer) / 2
+        radial = (outer - inner) / 2
+        tangential = mid * math.tan(math.pi / segments)
+        for i in range(segments):
+            angle = 2 * math.pi * i / segments
+            quat = np.zeros(4)
+            mujoco.mju_axisAngle2Quat(quat, np.array([0.0, 0.0, 1.0]), angle)
+            body.add_geom(
+                type=mujoco.mjtGeom.mjGEOM_BOX,
+                name=f"{prop.body}_{name}{i}",
+                size=[radial, tangential, (z_hi - z_lo) / 2],
+                pos=[mid * math.cos(angle), mid * math.sin(angle),
+                     (z_lo + z_hi) / 2],
+                quat=quat.tolist(),
+                rgba=list(prop.rgba),
+                density=1250, condim=4, friction=[1.0, 0.01, 0.001], group=3,
+                # Printed plastic on plastic is stiff. The default contact
+                # squashes for millimetres before it pushes back, which turns
+                # the seating event into a slow ramp that no force threshold can
+                # separate from the rod brushing the bore on the way down.
+                solref=[0.005, 1.0], solimp=[0.95, 0.99, 0.0005, 0.5, 2.0],
+            )
+
+    # Solid below the bore, so a dropped rod stops where the real one would.
+    body.add_geom(
+        type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+        name=prop.body + "_floor",
+        size=[outer, prop.bore_bottom / 2, 0],
+        pos=[0, 0, prop.bore_bottom / 2],
+        rgba=list(prop.rgba),
+        density=1250, condim=4, friction=[1.0, 0.01, 0.001], group=3,
+    )
+    ring(prop.bore_bottom, prop.funnel_bottom, bore, "bore")
+
+    # The chamfer, as a short stack of ever-wider rings.
+    steps = 4
+    for k in range(steps):
+        z_lo = prop.funnel_bottom + (prop.height - prop.funnel_bottom) * k / steps
+        z_hi = prop.funnel_bottom + (prop.height - prop.funnel_bottom) * (k + 1) / steps
+        inner = bore + (prop.funnel_radius - bore) * (k + 0.5) / steps
+        ring(z_lo, z_hi, inner, f"chamfer{k}_")
+
+    body.add_geom(
+        type=mujoco.mjtGeom.mjGEOM_MESH,
+        meshname=prop.body + "_mesh",
+        pos=list(prop.mesh_pos),
+        quat=list(prop.mesh_quat),
+        rgba=list(prop.rgba),
+        contype=0, conaffinity=0, density=0,
+        group=2,
+    )
+    return body
+
+
+def _add_mesh_stirrer(spec, prop: Prop, table_z: float, bench=None):
+    """
+    A stirrer: a grasp cube on top of a rod, standing cube-up on the bench.
+
+    The body origin is the cube's centre, so ``pick_up`` grasping the cube and
+    ``stir`` measuring immersion from the rod tip are talking about the same
+    point. Like the scoop, the mesh is visual only -- it is what the cameras
+    reconstruct -- and contact comes from two primitives in group 3, which the
+    renderer does not draw.
+
+    The rod's flat tip is what the prop balances on, so it is a cylinder rather
+    than a capsule: a rounded tip is a point contact and the stirrer falls over
+    before the arm has left home.
+    """
+    cube = prop.cube_half or 0.010
+    rest = cube + prop.rod_length          # rod tip on the table
+    if prop.seated_in and bench is not None:
+        holder = bench.find(prop.seated_in)
+        if holder is None:
+            raise ValueError(f"{prop.name!r} is seated_in {prop.seated_in!r}, "
+                             f"which is not on the bench")
+        # Head underside on the holder's top face, rod hanging in the bore.
+        rest = holder.height + cube
+
+    body = spec.worldbody.add_body(
+        name=prop.body, pos=[prop.pos[0], prop.pos[1], table_z + rest]
+    )
+    body.add_freejoint()
+
+    body.add_geom(
+        type=mujoco.mjtGeom.mjGEOM_MESH,
+        meshname=prop.body + "_mesh",
+        pos=list(prop.mesh_pos),
+        quat=list(prop.mesh_quat),
+        rgba=list(prop.rgba),
+        contype=0, conaffinity=0, density=0,
+        group=2,
+    )
+
+    # Named for the same reason the scoop's panels are: when the stirrer clips
+    # the cup, "the rod" and "the cube" call for different fixes.
+    body.add_geom(
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        name=prop.body + "_cube",
+        size=[cube, cube, cube],
+        pos=[0, 0, 0],
+        rgba=list(prop.rgba),
+        density=1250,                      # printed PLA
+        condim=4, friction=[1.2, 0.01, 0.001], group=3,
+        solref=[0.005, 1.0], solimp=[0.95, 0.99, 0.0005, 0.5, 2.0],
+    )
+    body.add_geom(
+        type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+        name=prop.body + "_rod",
+        size=[prop.rod_radius, prop.rod_length / 2, 0],
+        pos=[0, 0, -(cube + prop.rod_length / 2)],
+        rgba=list(prop.rgba),
+        density=1250,
+        condim=4, friction=[1.2, 0.01, 0.001], group=3,
+    )
+    return body
+
+
 def _add_mesh_scoop(spec, prop: Prop, table_z: float):
     """
     A prop whose visible shape is its CAD file.
@@ -221,6 +362,7 @@ def _add_mesh_scoop(spec, prop: Prop, table_z: float):
         type=mujoco.mjtGeom.mjGEOM_MESH,
         meshname=prop.body + "_mesh",
         pos=list(prop.mesh_pos),
+        quat=list(prop.mesh_quat),
         rgba=list(prop.rgba),
         contype=0, conaffinity=0, density=0,   # seen, never touched
         group=2,
@@ -435,7 +577,11 @@ def build_scene(
     for prop in bench.props:
         if prop.label:
             _add_label(spec, prop, bench.table_z)
-        if prop.mesh:
+        if prop.kind == "holder":
+            _add_holder(spec, prop, bench.table_z)
+        elif prop.mesh and prop.kind == "stirrer":
+            _add_mesh_stirrer(spec, prop, bench.table_z, bench)
+        elif prop.mesh:
             _add_mesh_scoop(spec, prop, bench.table_z)
         elif prop.kind == "rod":
             _add_rod(spec, prop, bench.table_z)
@@ -451,9 +597,11 @@ def build_scene(
         return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
 
     prop_bodies = {p.name: bid(p.body) for p in bench.props}
+    # Static props are welded to the world and have no freejoint to address.
     prop_qpos = {
         p.name: int(model.jnt_qposadr[model.body_jntadr[prop_bodies[p.name]]])
         for p in bench.props
+        if model.body_jntadr[prop_bodies[p.name]] >= 0
     }
     grain_bodies = {k: [bid(n) for n in v] for k, v in grain_names.items()}
 

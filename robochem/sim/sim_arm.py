@@ -25,6 +25,7 @@ from __future__ import annotations
 import gc
 import math
 import time
+from collections import deque
 from typing import Dict, List, Optional, Tuple
 
 import mujoco
@@ -50,6 +51,11 @@ CTRL_PER_METRE = 255.0 / MAX_GRIPPER_WIDTH
 # The box, in the TCP frame, a prop's grasp point must fall inside for a
 # closing gripper to pick it up. z is negative back towards the fingers.
 JAW_BOX = np.array([0.035, 0.05, 0.065])
+
+# Wrench filtering: one sample every 10 physics steps (20ms), 5 kept -> a 100ms
+# window, which is the order a real F/T reading is filtered over.
+WRENCH_EVERY = 10
+WRENCH_SAMPLES = 5
 
 
 def _slerp(r_a: np.ndarray, r_b: np.ndarray, t: float) -> np.ndarray:
@@ -121,6 +127,10 @@ class SimFrankaArm:
 
         self._attached: Dict[str, np.ndarray] = {}   # prop name -> TCP^-1 * prop pose
         self._held_width: Optional[float] = None
+        # ~100ms of wrench history, sampled every WRENCH_EVERY steps. Summing
+        # contacts on every step would dominate the step cost for no gain.
+        self._wrench_hist: deque = deque(maxlen=WRENCH_SAMPLES)
+        self._wrench_tick = 0
         self._viewer = None
         if viewer:
             self._open_viewer()
@@ -192,6 +202,74 @@ class SimFrankaArm:
     def get_joints(self) -> np.ndarray:
         return self.data.qpos[:7].copy()
 
+    def _tool_bodies(self) -> set:
+        """Everything rigidly moving with the wrist: hand, fingers, held prop."""
+        ids = set()
+        for name in ("hand", "left_finger", "right_finger", "mounted_tool"):
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+            if bid >= 0:
+                ids.add(bid)
+        for name in self._attached:
+            ids.add(self.scene.prop_bodies[name])
+        return ids
+
+    def get_ee_force_torque(self) -> np.ndarray:
+        """
+        Filtered external wrench on the end effector, base frame.
+
+        The hardware reading is already filtered, and a single MuJoCo step is
+        not: contact impulses chatter as the solver redistributes them, so an
+        instantaneous sample swings by several newtons while the tool sits
+        still. This returns the mean of the recent history that ``_step``
+        collects, which is the comparable quantity.
+        """
+        if self._wrench_hist:
+            return np.mean(self._wrench_hist, axis=0)
+        return self._compute_ee_wrench()
+
+    def _compute_ee_wrench(self) -> np.ndarray:
+        """
+        One instantaneous sample of the external wrench, base frame.
+
+        Matches ``frankapy.FrankaArm.get_ee_force_torque()``: six floats, force
+        then torque, in world coordinates, and signed as the force the world
+        exerts ON the robot -- so pressing the tool down onto something reads a
+        positive Z.
+
+        A magnet grasp carries the held prop kinematically, so nothing it
+        touches is transmitted through the finger joints and a wrist sensor
+        would read zero. Instead this sums the contacts on everything moving
+        with the wrist, the held prop included, which is what a rigid grasp
+        would pass up the arm.
+        """
+        tool = self._tool_bodies()
+        tcp, _ = self._tcp()
+        wrench = np.zeros(6)
+        buf = np.zeros(6)
+
+        for i in range(self.data.ncon):
+            con = self.data.contact[i]
+            b1 = self.model.geom_bodyid[con.geom1]
+            b2 = self.model.geom_bodyid[con.geom2]
+            on1, on2 = b1 in tool, b2 in tool
+            if on1 == on2:                 # both ours, or neither: not external
+                continue
+
+            mujoco.mj_contactForce(self.model, self.data, i, buf)
+            # contact.frame holds the frame axes as rows, so its transpose maps
+            # a contact-frame vector into world.
+            force = con.frame.reshape(3, 3).T @ buf[:3]
+            # mj_contactForce reports the contact force on geom2's body, so it
+            # is already the force on us when the tool is geom2; flip it when
+            # the tool is geom1. Verified by pressing the stirrer down onto the
+            # holder and requiring a positive Z.
+            if on1:
+                force = -force
+            wrench[:3] += force
+            wrench[3:] += np.cross(np.asarray(con.pos) - tcp, force)
+
+        return wrench
+
     def _solve_ik(self, target_pos, target_mat, q_seed,
                   iters: int = 40, tol: float = 5e-4) -> np.ndarray:
         """
@@ -245,6 +323,9 @@ class SimFrankaArm:
         for _ in range(n):
             mujoco.mj_step(self.model, self.data)
             self._follow_attached()
+            self._wrench_tick += 1
+            if self._wrench_tick % WRENCH_EVERY == 0:
+                self._wrench_hist.append(self._compute_ee_wrench())
 
     def _follow_attached(self):
         """
@@ -499,6 +580,12 @@ class SimFrankaArm:
         """Attach the prop whose grasp point sits between the closing jaws."""
         pos, mat = self._tcp()
         for prop in self.scene.bench.props:
+            # A fixture is bolted down: there is no freejoint to drive it by,
+            # and closing on one should read as "the jaws shut on nothing", not
+            # as picking the bench up. The stirrer's head sits directly above
+            # its holder, so without this the holder wins the jaw-box test.
+            if prop.name not in self.scene.prop_qpos:
+                continue
             bid = self.scene.prop_bodies[prop.name]
             body_mat = self.data.xmat[bid].reshape(3, 3)
             point = self.data.xpos[bid] + body_mat @ np.asarray(prop.grasp_offset)

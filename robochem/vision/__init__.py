@@ -23,7 +23,12 @@ class VisionSystem:
     """
     Unified vision system that combines all visual perception capabilities.
     """
-    
+
+    #: Channel order of the frames :meth:`capture_scene` returns. The RealSense
+    #: cage streams bgr8; the simulated cage renders RGB and says so. Anything
+    #: that hands a frame to a VLM or writes it to disk has to know which.
+    frame_color_order = "bgr"
+
     def __init__(
         self,
         cameras: dict = None,
@@ -98,6 +103,20 @@ class VisionSystem:
         """Capture images from all cameras."""
         if self.object_localizer:
             return self.object_localizer.capture_images()
+        return []
+
+    def known_object_names(self):
+        """
+        Names this perception stack is known to resolve, or ``[]`` if open ended.
+
+        Grounding here is open-vocabulary -- SAM 3 is asked for whatever noun
+        phrase a skill passes -- so the real cell has no such inventory and
+        returns empty. The simulated cell does know exactly what is on its
+        bench, and overrides this, which is what lets the planner be told that
+        "measuring scoop" is not a thing it can ask for there but "larger
+        spoon" is. Callers must treat an empty list as "no constraint", never
+        as "nothing is present".
+        """
         return []
     
     def segment_object(self, images, object_query):

@@ -57,6 +57,23 @@ class PlaceSkill(BaseSkill):
             # default drops the object next to it on the bench.
             "on_top": False,
             "beside_offset": 0.10,
+            # Feel for the seat instead of trusting the computed release height.
+            #
+            # Set this (newtons) to descend in small steps and stop the moment
+            # the tool pushes back that hard, then release there. It removes the
+            # two things release_clearance cannot know: how far the held object
+            # sticks out below the TCP, which changes with every grasp, and the
+            # few millimetres of error in the scanned surface height. Dropping a
+            # stirrer into its holder is the case it was written for -- contact
+            # means the head has landed on the holder's rim and it is seated.
+            #
+            # None (the default) keeps the plain position-controlled descent,
+            # which is right for setting a beaker down on open bench.
+            "stop_force_n": None,
+            "probe_above": 0.015,      # start probing this far above the target
+            "probe_below": 0.020,      # give up this far below it
+            "probe_step": 0.002,
+            "probe_seconds": 1.0,      # per step; also what the reading settles over
         }
 
     def check_preconditions(self, params: Dict[str, Any]) -> Tuple[bool, str]:
@@ -123,12 +140,65 @@ class PlaceSkill(BaseSkill):
 
         # Step 2: descend. If this fails we go back up and keep hold of the
         # object rather than releasing it into thin air.
-        print(f"[Place] Descending to release height...")
-        if not self.goto_pose_rigid(target_pos, hold_rotation, duration=4.0):
+        stop_force = params.get("stop_force_n")
+        seated_by_force, contact_force, contact_z = False, None, None
+
+        if stop_force is not None:
+            if self.ee_wrench() is None:
+                return False, {
+                    "error": ("stop_force_n was given but this arm reports no "
+                              "force; refusing to probe blind"),
+                    "still_holding": True,
+                }
+            stop_force = float(stop_force)
+            step = float(params["probe_step"])
+            z_from = release_z + float(params["probe_above"])
+            z_to = release_z - float(params["probe_below"])
+            print(f"[Place] Feeling for the seat: stepping {step * 1000:.0f}mm "
+                  f"from z={z_from:.4f} down to z={z_to:.4f}, stopping above "
+                  f"{stop_force:.1f}N")
+
+            probe = target_pos.copy()
+            z = z_from
+            while z >= z_to - 1e-9:
+                probe[2] = z
+                if not self.goto_pose_rigid(probe, hold_rotation,
+                                            duration=float(params["probe_seconds"])):
+                    self.goto_pose_rigid(hover, hold_rotation, duration=3.0)
+                    return False, {"error": "Failed to command a probe step",
+                                   "still_holding": True}
+                push = self.ee_push_up_n()
+                print(f"[Place]   z={z:.4f}  push={push:+.2f}N")
+                if push is not None and push > stop_force:
+                    seated_by_force, contact_force, contact_z = True, push, z
+                    print(f"[Place] Contact at z={z:.4f} ({push:.2f}N > "
+                          f"{stop_force:.1f}N) — seated, releasing here")
+                    break
+                z -= step
+
+            if not seated_by_force:
+                # Never felt anything. Releasing anyway would drop the object
+                # from however high the scan happened to put us.
+                self.goto_pose_rigid(hover, hold_rotation, duration=3.0)
+                return False, {
+                    "error": (f"Probed from z={z_from:.4f} to z={z_to:.4f} and "
+                              f"never reached {stop_force:.1f}N. Nothing was "
+                              f"there to seat against, so the object is still "
+                              f"held rather than dropped."),
+                    "still_holding": True,
+                    "probe_from": z_from,
+                    "probe_to": z_to,
+                }
+            target_pos = probe.copy()
+
+        elif not self.goto_pose_rigid(target_pos, hold_rotation, duration=4.0):
             self.goto_pose_rigid(hover, hold_rotation, duration=3.0)
             return False, {"error": "Failed to command release pose",
                            "still_holding": True}
-        arrived, err = self.reached(target_pos, descend_tol)
+        # The probe already stopped exactly where it meant to; only the
+        # position-controlled descent needs its arrival checked.
+        arrived, err = (True, 0.0) if seated_by_force else self.reached(
+            target_pos, descend_tol)
         if not arrived:
             print(f"[Place] Descent stopped {err * 1000:.0f}mm short "
                   f"(tol {descend_tol * 1000:.0f}mm) — NOT releasing")
@@ -179,6 +249,9 @@ class PlaceSkill(BaseSkill):
             "release_width": released_width,
             "held_width_at_start": start_width,
             "located_target": located is not None,
+            "seated_by_force": seated_by_force,
+            "contact_force_n": contact_force,
+            "contact_z": contact_z,
         }
 
     def _resolve_target(

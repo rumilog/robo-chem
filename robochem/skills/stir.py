@@ -107,6 +107,15 @@ class StirSkill(BaseSkill):
             # tip, so an unmeasured tool either dredges the bottom or never
             # touches the liquid.
             "tool_length": 0.0,
+            # Which axis of the tool frame the working length runs along.
+            #   "x"  a spoon gripped across its flat handle, so the handle
+            #        sticks out sideways and has to be stood up (the default,
+            #        and what verticalize was written for)
+            #   "z"  a rod gripped end-on -- the printed stirrer, taken by its
+            #        cube from straight above. It comes out of pick_up already
+            #        pointing down, and the "x" check would read that correct
+            #        pose as 90 deg off and tip it flat.
+            "tool_axis": "x",
             "hover_tol": 0.05,
             "descend_tol": 0.03,
             # Circle waypoints are allowed to run loose: the stirrer is in
@@ -142,6 +151,9 @@ class StirSkill(BaseSkill):
         wall_clearance = float(params["wall_clearance"])
         in_air = bool(params["in_air"])
         verticalize = bool(params["verticalize"])
+        tool_axis = str(params["tool_axis"]).lower()
+        if tool_axis not in ("x", "z"):
+            return False, {"error": f"tool_axis must be 'x' or 'z', got {tool_axis!r}"}
         verticalize_deg = float(params["verticalize_deg"])
         orient_tol = float(params["orient_tol_deg"])
         orient_retries = max(1, int(params["orient_retries"]))
@@ -164,12 +176,30 @@ class StirSkill(BaseSkill):
             if not ok:
                 return False, {"error": f"Lost the stirrer while homing: {msg}"}
 
-        # 1. Stand the spoon up before anything else.
+        # 1. Stand the tool up before anything else.
         #
+        # A rod gripped end-on is already vertical -- a top grasp on the cube
+        # leaves the shaft pointing straight down the tool Z. There is nothing
+        # to stand up, and the spoon's correction (a quarter turn about tool Y)
+        # would lay it flat. So check it and move on; if it is NOT vertical the
+        # grasp itself went wrong, and rotating about Y is not the repair.
+        if tool_axis == "z":
+            tip = self.tool_tip_deg()
+            if tip > orient_tol:
+                return False, {
+                    "error": (f"The tool is {tip:.1f}° from straight down, but "
+                              f"tool_axis='z' means it should have come out of "
+                              f"the grasp vertical (tol {orient_tol:.0f}°). "
+                              f"Re-grip it from above rather than tilting here."),
+                    "tool_tip_deg": tip,
+                }
+            print(f"[Stir] Rod already vertical ({tip:.1f}° from down); "
+                  f"nothing to stand up")
+
         # pick_up takes a spoon lying flat with a top grasp, which leaves the
         # handle horizontal along +X, pointing away from the base, with tool Z
         # down. A horizontal spoon cannot go into a cup.
-        if verticalize:
+        elif verticalize:
             # Tilt toward the base about the tool's own closing axis. From the
             # flat grasp (handle out along +X) a quarter turn drops the handle
             # to straight down. Negative for the same reason scoop's bite tilt
@@ -429,8 +459,17 @@ class StirSkill(BaseSkill):
             "stirred_container": target,
             "in_air": in_air,
             "center": [float(center[0]), float(center[1])],
-            "verticalized": verticalize,
+            "tool_axis": tool_axis,
+            "verticalized": verticalize and tool_axis == "x",
+            # The handle measure, kept under its original name for callers that
+            # already read it.
             "long_axis_deg": self.tool_long_axis_deg(),
+            # ...and the angle that was actually checked. On the rod path the
+            # handle measure reads ~90 deg for a perfectly vertical tool, which
+            # looks like a failure in the log when it is the correct pose.
+            "tool_angle_from_down_deg": (
+                self.tool_long_axis_deg() if tool_axis == "x" else self.tool_tip_deg()
+            ),
             "revolutions": revolutions,
             "revolutions_completed": revolutions_done,
             "stir_radius": radius,

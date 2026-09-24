@@ -68,6 +68,11 @@ class _Intrinsics:
 class SimVision(VisionSystem):
     """VisionSystem backed by rendered MuJoCo cameras."""
 
+    #: MuJoCo renders RGB; the cage streams BGR. Declared so that anything
+    #: handing a frame to a VLM converts rather than sending it a picture with
+    #: its reds and blues swapped.
+    frame_color_order = "rgb"
+
     def __init__(
         self,
         scene: SimScene,
@@ -186,6 +191,24 @@ class SimVision(VisionSystem):
     def capture_scene(self):
         """RGB from every cage camera, in camera-id order."""
         return [self.render_rgb(cam_id) for cam_id in self.camera_ids]
+
+    def known_object_names(self):
+        """
+        Every name this bench resolves: each prop's name and its reagent label.
+
+        The real cell cannot answer this -- grounding there is open-vocabulary --
+        but the simulated one knows exactly what it was built with, and
+        :meth:`Bench.find` will return nothing for a plausible name that is not
+        on the list ("measuring scoop" does not reach "larger spoon"). A planner
+        told the inventory asks for things that exist; one that is not spends
+        its attempts discovering the list one failed skill at a time.
+        """
+        names = []
+        for prop in self.scene.bench.props:
+            names.append(prop.name)
+            if prop.label:
+                names.append(prop.label)
+        return sorted(set(names))
 
     def _masks_for(self, prop: Prop):
         """Per-camera (mask, depth_mm) for one prop, as SAM would have returned."""

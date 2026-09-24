@@ -30,6 +30,17 @@ Two things about that swap are load-bearing and are NOT hidden:
     a weaker autonomy claim — and it must be restated in the paper rather than
     quietly inherited. ``executor_provenance()`` returns the wording to log.
 
+Which of the two merges to use. This module keeps robomail_Aliyah's orchestrator
+as the driver and replaces only its executor, so its trial-log schema and its
+six-action vocabulary survive. :mod:`robochem.agents` is the other direction: the
+agent pipeline moved into this repo and re-pointed at ``SKILL_REGISTRY`` itself,
+so the model plans in the real skill names and chooses their parameters, and
+``dump``, ``arc_scoop``, ``wait`` and the perception skills -- none of which the
+six-action vocabulary can express -- are available to it. Use this bridge to run
+robomail_Aliyah's own entry points against the real cell; use
+:class:`~robochem.orchestrator.agent_orchestrator.AgentOrchestrator` for new work
+here. Both carry the same provenance caveat, for the same reason.
+
 Import safety: nothing from robomail_Aliyah is imported at module load. Steps
 are consumed structurally (``.action``, ``.target_object``, ``.tool``,
 ``.location``, ``.primitives``), so this module is importable and testable on a

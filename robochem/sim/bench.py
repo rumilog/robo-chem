@@ -31,6 +31,7 @@ class Prop:
     rgba: Tuple[float, float, float, float] = (0.9, 0.9, 0.9, 1.0)
     mass: float = 0.02
     label: Optional[str] = None     # reagent written on the paper under a cup
+    aliases: Tuple[str, ...] = ()   # other names a skill might ask for it by
     fill: int = 0                   # granules to drop in at reset
     fill_rgba: Tuple[float, float, float, float] = (0.95, 0.95, 0.9, 1.0)
     grain_radius: float = 0.0035   # coarse grains cost fewer bodies for a given bed
@@ -43,11 +44,34 @@ class Prop:
     mesh: Optional[str] = None      # STL path, relative to the repo root
     mesh_scale: float = 1.0         # 0.001 for a CAD file authored in mm
     mesh_pos: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    # wxyz. MuJoCo re-frames an imported mesh onto its principal axes of
+    # inertia, which is not the pose the part is used in, so this puts it back.
+    mesh_quat: Tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
 
     # An open box the granules can actually sit in, built from five thin
     # panels. Half-extents and centre, in the body frame.
     bowl_size: Optional[Tuple[float, float, float]] = None
     bowl_offset: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+    # A stirrer: a cube to grasp, on a rod that goes into the liquid. The body
+    # origin is the cube's centre, so the rod hangs from -cube_half down to
+    # -(cube_half + rod_length) and the tool reaches that far past the TCP.
+    cube_half: Optional[float] = None
+    rod_radius: float = 0.005
+    rod_length: float = 0.035
+
+    # A stirrer holder: a block with a bore the stirrer's rod drops into, so
+    # the tool is always presented upright. Heights are above the body origin,
+    # which sits on the table.
+    # Name of the holder this prop starts seated in. Its rest height then
+    # comes from the holder's top face rather than the table, so the two stay
+    # in agreement if either part is re-measured.
+    seated_in: Optional[str] = None
+
+    bore_radius: Optional[float] = None
+    bore_bottom: float = 0.010      # the rod cannot fall past this
+    funnel_bottom: float = 0.066    # where the lead-in chamfer starts
+    funnel_radius: float = 0.0145   # bore radius at the very top
 
     @property
     def body(self) -> str:
@@ -62,16 +86,33 @@ class Prop:
         Containers are grasped near the rim, a rod (spoon) across its handle.
         Used only to decide whether a closing gripper has caught this prop.
         """
-        if self.kind == "rod":
+        if self.kind in ("rod", "stirrer"):
+            # Both put their body origin where the jaws close: the middle of
+            # the spoon's handle, the centre of the stirrer's cube.
             return (0.0, 0.0, 0.0)
         return (0.0, 0.0, self.height * 0.75)
 
     @property
     def grasp_width(self) -> float:
         """Jaw opening that corresponds to holding this prop."""
+        if self.kind == "stirrer":
+            return 2 * (self.cube_half or 0.01)
         if self.kind == "rod":
             return 2 * self.wall
         return 2 * self.radius
+
+    @property
+    def tool_length(self) -> float:
+        """
+        How far the working tip reaches past the grasp point.
+
+        For a stirrer this is what ``stir`` needs as ``tool_length``: the TCP
+        sits at the cube's centre, the rod tip is this far below it, and the
+        immersion depth is measured from the tip, not the wrist.
+        """
+        if self.kind == "stirrer":
+            return (self.cube_half or 0.01) + self.rod_length
+        return 0.0
 
 
 def default_bench() -> List[Prop]:
@@ -146,6 +187,53 @@ def default_bench() -> List[Prop]:
             rgba=(0.88, 0.88, 0.90, 1.0),
             mass=0.01,
         ),
+        # The holder the stirrer lives in: a 50mm block, 85mm tall, bored
+        # 12mm for the rod with a chamfer at the top to catch it on the way in.
+        # Welded to the bench -- it is a fixture, and a holder that skitters
+        # when the rod goes in is not presenting anything upright.
+        Prop(
+            name="stirrer holder",
+            kind="holder",
+            pos=(0.62, 0.14),
+            mesh="stirrer holder.stl",
+            mesh_scale=0.001,
+            mesh_quat=(0.70710678, 0.70710678, 0.0, 0.0),
+            mesh_pos=(0.0, 0.0, 0.105),
+            radius=0.025,           # outer half-width
+            height=0.085,
+            bore_radius=0.0075,     # 7.5mm against a 5mm rod: 2.5mm of slack
+            bore_bottom=0.010,
+            funnel_bottom=0.066,
+            funnel_radius=0.0145,
+            aliases=("holder", "stirrer stand", "stir holder", "tool holder"),
+            rgba=(0.55, 0.57, 0.62, 1.0),
+            static=True,
+        ),
+        # The printed stirrer, straight off "stirrer v1.stl": a 10mm rod 66mm
+        # long under a 30mm grasp head, 96mm overall. It starts seated in the
+        # holder -- head resting on the holder's top face, rod hanging in the
+        # bore -- which is the pose the gripper takes it from.
+        #
+        # The two STLs are authored in one assembly frame, so both take the
+        # same +90deg-about-X and their z coordinates line up directly: the
+        # head's underside lands exactly on the holder's top face.
+        Prop(
+            name="stirrer",
+            kind="stirrer",
+            pos=(0.62, 0.14),       # same axis as the holder: it sits in it
+            mesh="stirrer v1.stl",
+            mesh_scale=0.001,
+            mesh_quat=(0.70710678, 0.70710678, 0.0, 0.0),
+            mesh_pos=(0.0, 0.0, 0.005),     # CoM -> head centre
+            seated_in="stirrer holder",
+            cube_half=0.015,
+            rod_radius=0.005,
+            rod_length=0.066,       # head underside to rod tip
+            aliases=("stirring rod", "stir rod", "stirring stick",
+                     "stir stick", "stirrer rod"),
+            rgba=(0.30, 0.55, 0.85, 1.0),
+            mass=0.015,
+        ),
     ]
 
 
@@ -170,18 +258,20 @@ class Bench:
             return None
 
         for prop in self.props:
-            if prop.name.lower() == q or (prop.label or "").lower() == q:
+            if (prop.name.lower() == q or (prop.label or "").lower() == q
+                    or q in {a.lower() for a in prop.aliases}):
                 return prop
 
         for prop in self.props:
-            hay = f"{prop.name} {prop.label or ''}".lower()
+            hay = f"{prop.name} {prop.label or ''} {' '.join(prop.aliases)}".lower()
             if q in hay or prop.name.lower() in q:
                 return prop
 
         tokens = set(q.split())
         best, best_score = None, 0
         for prop in self.props:
-            hay = set(f"{prop.name} {prop.label or ''}".lower().split())
+            hay = set(f"{prop.name} {prop.label or ''} "
+                      f"{' '.join(prop.aliases)}".lower().split())
             score = len(tokens & hay)
             if score > best_score:
                 best, best_score = prop, score

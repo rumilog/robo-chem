@@ -63,3 +63,6 @@ logs/
 # Local Python environments (built by scripts/setup_sim.sh; never committed)
 perception_env/
 sim_env/
+# ...and sim_env as a symlink to one of them (no trailing slash: git does not
+# treat a symlink as a directory, so the pattern above would not catch it)
+sim_env

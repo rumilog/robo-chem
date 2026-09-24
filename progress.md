@@ -1,6 +1,6 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-09-09
+Last updated: 2026-09-24
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
@@ -122,6 +122,83 @@ python scripts/run_experiment.py --skill pour \
 
 ---
 
+## LLM agent pipeline (added 2026-09-24)
+
+robomail_Aliyah's multi-agent planner now drives the real skills, in
+[`robochem/agents/`](robochem/agents/) with the loop in
+[`robochem/orchestrator/agent_orchestrator.py`](robochem/orchestrator/agent_orchestrator.py).
+What was merged and what was dropped:
+
+| From robomail_Aliyah | Fate |
+| --- | --- |
+| `agents/llm_client.py` | Kept. The ChatGPT call, structured output, key policy. Gained numpy-frame image blocks that respect BGR vs RGB |
+| `agents/scene_understanding.py` | Kept, re-pointed at live cage frames and at names perception can resolve |
+| `agents/high_level_planner.py` | Kept. `verification_modality` dropped — `ChemistryVerifier` routes itself off the wording |
+| `config/robot_profile.py` | Kept. PLATO's taught `workspace_positions` dropped; this stack locates by name |
+| `agents/action_vocabulary.py` | **Replaced** by `agents/skill_catalog.py`, generated from `SKILL_REGISTRY` |
+| `agents/affordance.py` + `agents/step_planner.py` | **Replaced** by `agents/skill_planner.py`: sub-task → one skill call with parameters, no GOTO/GRASP/TILT |
+| `skills/executor.py` (fake) | **Replaced** by `SkillsExecutor`. The arm moves |
+
+Decisions worth keeping:
+
+- **The model chooses the skill and its arguments, not the trajectory.** Motion
+  inside each skill stays hand-written and SAM 3 grounded. This breaks
+  robomail_Aliyah's "no hand-scripted motion" criterion; every trial record says
+  so under `provenance`, and so does `plato_bridge.executor_provenance()`.
+- **Names are grounded, not captions.** `VisionSystem.known_object_names()`
+  returns `[]` on hardware (open-vocabulary SAM 3) and the bench inventory in
+  sim. Where there is an inventory the scene agent must name from it — without
+  that the model plans against a "measuring scoop" and the sim bench's spoon is
+  called "larger spoon", which resolves to nothing.
+- **`tool_offset` comes from `pick_up`, not from the model.** `pick_up` already
+  reported `suggested_tool_offset`; the orchestrator now carries it to the next
+  step's prompt. Its z is a lower bound (the cage looks down, the bowl underside
+  is occluded) and the prompt says so.
+- **A failed skill replans; it is never retried unchanged.** The old
+  `VLMOrchestrator` re-ran a failed step up to three times identically.
+- Verification is off by default in `--sim`: MuJoCo has no chemistry, so a
+  colour check there fails for reasons unrelated to the plan and burns replans.
+
+Two overlapping merge paths now exist, deliberately:
+`plato_bridge.RoboChemExecutor` keeps robomail_Aliyah as the driver and swaps
+only the executor (so its six-action vocabulary and log schema survive);
+`AgentOrchestrator` moves the pipeline here and plans in the real skill names,
+which is what makes `dump`, `arc_scoop`, `wait` and the perception skills
+reachable at all.
+
+### First end-to-end result (sim, 2026-09-24)
+
+`"Scoop citric acid into the white paper cup"`, granules on, four sub-tasks, no
+replan needed: pick_up spoon → scoop → dump → place beside the citric acid cup.
+All four executed. **2 of 90 grains reached the paper cup.**
+
+The thin yield is the known `measure_tool_offset` limitation, not the planner.
+`pick_up` measured the bowl at **z = 3.9 mm** below the grasp; CAD says
+**28.0 mm** (`bowl_offset.z − bowl_size.z` in `sim/bench.py`). The cage looks
+down, the bowl's underside is occluded, and the cloud stops at its rim — which
+`measure_tool_offset`'s own docstring calls a lower bound. `scoop` therefore
+aimed the bowl at z=0.008 with the cup floor at z=0.003, and the real bowl sat
+~24 mm lower than that, i.e. into the base rather than through the bed.
+
+`scripts/film_sim_skill.py` already works around this by feeding CAD ground
+truth. The durable fix belongs in perception or in a per-tool CAD table the
+orchestrator can quote alongside the measurement — **not** in the prompt: the
+model must not be asked to guess a depth no camera measured. Until then the
+agent run surfaces the measured value with its lower-bound caveat, which is why
+the model passed 3.9 mm rather than inventing something.
+
+```bash
+# no key, no robot: vocabulary, parameter checks, gripper bookkeeping, replanning
+perception_env/bin/python scripts/test_agents_offline.py
+
+# real GPT calls, real perception, nothing moves
+perception_env/bin/python scripts/run_experiment.py --sim --no-viewer --dry-run \
+  --workspace-min 0.25 -0.40 -0.13 \
+  --task "Scoop citric acid into the white paper cup"
+```
+
+---
+
 ## Skills inventory (registered)
 
 Manipulation: `pick_up`, `place`, `pour`, `scoop`, `dispense`, `stir`,
@@ -181,8 +258,11 @@ perception_env/bin/python scripts/test_skills_offline.py   # no robot needed
 | `robochem/skills/pick_up.py` | Pick skill |
 | `robochem/skills/pour.py` | Pour skill |
 | `robochem/skills/{place,scoop,stir,dispense}.py` | Rewritten 2026-09-08, not yet bench-tested |
-| `robochem/integration/plato_bridge.py` | Runs `robomail_Aliyah` plans on the real cell |
+| `robochem/agents/` | LLM planner: scene, plan, skill call, vocabulary |
+| `robochem/orchestrator/agent_orchestrator.py` | The closed loop over agents + skills |
+| `robochem/integration/plato_bridge.py` | The other merge: runs `robomail_Aliyah` plans on the real cell |
 | `scripts/test_skills_offline.py` | Offline skill + bridge checks |
+| `scripts/test_agents_offline.py` | Offline agent-loop checks (no API key) |
 | `SKILLS_ROADMAP.md` | Skill gap, hardening playbook, integration plan |
 | `robochem/vision/` | Localizer, SAM client, grasp analyzer |
 | `perception_service/grounding_service.py` | SAM 3 / GDINO HTTP service |

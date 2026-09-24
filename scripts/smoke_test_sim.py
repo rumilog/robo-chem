@@ -18,6 +18,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import mujoco
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -120,6 +121,111 @@ def test_spoon_and_scoop(cell) -> bool:
     return ok
 
 
+def test_stirrer_and_stir(cell) -> bool:
+    """
+    The stirrer's whole cycle: out of its holder, stir, back into its holder.
+
+    The return is the interesting half. The rod is 66mm long and the bore is
+    only 2.5mm wider than it, so the insertion is blind and depends on the
+    holder's chamfer catching a rod that arrives off axis -- which is exactly
+    what would bite on hardware.
+    """
+    print("\npick_up + stir + place (stirrer <-> its holder)")
+    cell.reset()
+    ok = True
+    body = cell.scene.prop_bodies["stirrer"]
+    seat = np.array([*cell.scene.bench.find("stirrer holder").pos, 0.100])
+
+    def pose():
+        R = cell.scene.data.xmat[body].reshape(3, 3)
+        return (cell.scene.data.xpos[body].copy(),
+                float(np.degrees(np.arccos(np.clip(R[2, 2], -1, 1)))))
+
+    start, tilt = pose()
+    ok &= check("starts seated in the holder, upright",
+                np.linalg.norm(start - seat) < 0.006 and tilt < 2.0,
+                f"{np.round(start, 4)}, {tilt:.2f} deg")
+
+    picked, _ = cell.skills.execute("pick_up", {"object_name": "stirring rod"})
+    ok &= check("lifted out by its head",
+                picked and cell.arm.holding == "stirrer", str(cell.arm.holding))
+    ok &= check("gripper closed on the 30mm head",
+                abs(cell.arm.get_gripper_width() - 0.030) < 0.002,
+                f"{cell.arm.get_gripper_width() * 1000:.1f}mm")
+    _, tilt = pose()
+    ok &= check("rod hangs vertical after the grasp", tilt < 5.0, f"{tilt:.2f} deg")
+
+    cell.vision.clear_cache()
+    stirred, result = cell.skills.execute("stir", {
+        "target_container": "plastic beaker",
+        "tool_axis": "z",          # gripped end-on, already vertical
+        "tool_length": 0.081,      # head centre -> rod tip
+        "revolutions": 2,
+    })
+    ok &= check("stir reports success", stirred, "" if stirred else str(result)[:70])
+    if stirred:
+        ok &= check("two revolutions completed",
+                    result.get("revolutions_completed") == 2.0,
+                    str(result.get("revolutions_completed")))
+        ok &= check("circle fits the measured rim",
+                    result["stir_radius"] <= result["rim_radius"] - 0.010,
+                    f"r={result['stir_radius']*1000:.0f}mm in a "
+                    f"{result['rim_radius']*1000:.0f}mm opening")
+
+    cell.vision.clear_cache()
+    placed, result = cell.skills.execute("place", {
+        "target_location": "stirrer holder",
+        "on_top": True,            # into the bore, not down beside it
+        "release_clearance": 0.015,
+        "stop_force_n": 1.0,       # feel for the rim rather than trusting the scan
+    })
+    ok &= check("place reports success", placed, "" if placed else str(result)[:70])
+    if placed:
+        ok &= check("stopped on contact, not on the computed height",
+                    result.get("seated_by_force") is True,
+                    f"{result.get('contact_force_n')} N at z={result.get('contact_z')}")
+
+    for _ in range(1500):          # let it drop the last millimetre and settle
+        mujoco.mj_step(cell.scene.model, cell.scene.data)
+    back, tilt = pose()
+    ok &= check("back in the holder", np.linalg.norm(back - seat) < 0.008,
+                f"{np.round(back, 4)} vs seat {np.round(seat, 3)}")
+    ok &= check("standing upright again, not dropped on the bench",
+                tilt < 5.0, f"{tilt:.2f} deg")
+    ok &= check("gripper is empty", cell.arm.holding is None, str(cell.arm.holding))
+    return ok
+
+
+def test_force_guard_refuses_to_drop_into_nothing(cell) -> bool:
+    """
+    A force-guarded place must keep hold when it never feels anything.
+
+    Probing over open bench and releasing anyway would drop the tool from
+    whatever height the scan happened to produce, which is the failure the
+    guard exists to prevent.
+    """
+    print("\nforce guard")
+    cell.reset()
+    picked, _ = cell.skills.execute("pick_up", {"object_name": "stirring rod"})
+    if not picked:
+        return check("could pick the stirrer up to test the guard", False)
+
+    # Probe in clear air over the bench. A 3-element target names the surface
+    # to release above, and 0.30 is high enough that the stirrer's 81mm of rod
+    # never reaches the table -- so the probe genuinely feels nothing.
+    cell.vision.clear_cache()
+    placed, result = cell.skills.execute("place", {
+        "target_location": [0.48, -0.20, 0.30],
+        "stop_force_n": 1.0,
+        "probe_below": 0.010,
+    })
+    ok = check("refuses to release having felt nothing", not placed,
+               str(result.get("error", ""))[:60])
+    ok &= check("still holding the stirrer", cell.arm.holding == "stirrer",
+                str(cell.arm.holding))
+    return ok
+
+
 def test_empty_gripper_refuses_to_scoop(cell) -> bool:
     """Scooping with nothing in the jaws must fail, not mime the motion."""
     print("\nfailure handling")
@@ -159,6 +265,8 @@ def main() -> int:
         "motion": test_reach,
         "pick + pour": test_pick_and_pour,
         "pick + scoop": test_spoon_and_scoop,
+        "pick + stir": test_stirrer_and_stir,
+        "force guard": test_force_guard_refuses_to_drop_into_nothing,
         "failure handling": test_empty_gripper_refuses_to_scoop,
     }
     if args.only:

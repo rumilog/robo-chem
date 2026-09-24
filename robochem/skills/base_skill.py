@@ -972,3 +972,27 @@ class BaseSkill(ABC):
     def wait(self, seconds: float):
         """Wait for specified duration."""
         time.sleep(seconds)
+
+    def ee_wrench(self) -> Optional[np.ndarray]:
+        """
+        External wrench on the end effector, base frame, or None.
+
+        frankapy reports this as the force the environment exerts ON the robot,
+        so pressing a held tool down onto something gives a positive Z. None
+        means this arm has no force reading at all, which callers must treat as
+        "cannot tell", never as "no contact".
+        """
+        getter = getattr(self.robot, "get_ee_force_torque", None)
+        if getter is None:
+            return None
+        try:
+            wrench = np.asarray(getter(), dtype=float)
+        except Exception as exc:
+            print(f"[Force] Could not read the wrench: {exc}")
+            return None
+        return wrench if wrench.shape == (6,) else None
+
+    def ee_push_up_n(self) -> Optional[float]:
+        """Upward force the world is pushing back with, in newtons, or None."""
+        wrench = self.ee_wrench()
+        return None if wrench is None else float(wrench[2])

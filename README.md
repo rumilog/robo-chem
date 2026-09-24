@@ -107,8 +107,9 @@ python scripts/check_labeled_cups.py \
 robo-chem/
 ├── robochem/                 # Python package
 │   ├── skills/               # pick_up, pour, scoop, place, …
+│   ├── agents/               # LLM planner: scene → plan → skill call
 │   ├── vision/               # multi-cam localizer, grasp analyzer, grounding client
-│   ├── orchestrator/         # VLM task planning
+│   ├── orchestrator/         # the closed loop over the agents and the skills
 │   └── verification/         # chemistry outcome checks
 ├── perception_service/       # Flask SAM 3 / GroundingDINO service
 ├── scripts/
@@ -146,11 +147,101 @@ Run any skill:
 python scripts/run_experiment.py --skill <name> --params '<json>'
 ```
 
-Natural-language tasks (needs API key):
+---
+
+## Natural-language tasks (the LLM agents)
+
+`--task` runs the agent pipeline in [`robochem/agents/`](robochem/agents/): it
+looks at the bench through the cage, plans sub-tasks, chooses a skill and its
+parameters for each one, executes them, and replans when one fails. It is
+robomail_Aliyah's multi-agent planner — structured output, a robot capability
+profile, closed-loop correction — with its fake executor replaced by the real
+`SkillsExecutor`.
 
 ```bash
-python scripts/run_experiment.py --task "Pour the water into the beaker"
+source scripts/env.sh
+python scripts/run_experiment.py --task "Scoop citric acid into the white paper cup"
 ```
+
+**See the plan without moving the arm.** `--dry-run` runs every LLM stage and
+prints the skill call it would make for each sub-task, then stops. This is the
+cheap way to check a task before committing the bench to it:
+
+```bash
+perception_env/bin/python scripts/run_experiment.py --sim --no-viewer --dry-run \
+    --workspace-min 0.25 -0.40 -0.13 \
+    --task "Scoop citric acid into the white paper cup"
+```
+
+```
+[scene] 4 objects: citric acid cup, larger spoon, plastic beaker, white paper cup
+[plan] 4 sub-tasks
+   1. Pick up the larger spoon
+   2. Scoop citric acid from the citric acid cup with the held larger spoon
+   3. Dump the loaded larger spoon into the white paper cup
+   4. Place the larger spoon beside the citric acid cup
+```
+
+Drop `--dry-run` and the same run executes. Step 2 then comes out as:
+
+```
+[step 2] Scoop citric acid from the citric acid cup with the held larger spoon
+   -> --skill scoop --params '{"powder_source": "citric acid cup",
+                               "tool_offset": [-0.0306, -0.0015, 0.0039]}'
+```
+
+That `tool_offset` is not a number the model invented, and it is not in the dry
+run either: `pick_up` measured it off the point cloud at the moment it grasped
+the spoon, and the orchestrator put it in the prompt for the next step. A dry run
+grasps nothing, so there is nothing to measure and the parameter is absent.
+
+| Flag | Effect |
+| --- | --- |
+| `--dry-run` | Plan in full, execute nothing |
+| `--max-retries N` | Corrective replanning attempts (default 3) |
+| `--no-verify` / `--verify` | Chemistry check at the end. On by default on hardware, off in `--sim`, which has no chemistry to check |
+| `--legacy-planner` | The older single-prompt `VLMOrchestrator` |
+
+Every run writes a JSON record to `--log-dir` (default `experiments/`) holding the
+scene, every plan and correction, every skill call with its parameters, and what
+each one returned.
+
+### How the pieces fit
+
+| Stage | Module | Does |
+| --- | --- | --- |
+| Scene | `agents/scene.py` | Names what is on the bench, using names perception can actually resolve |
+| Plan | `agents/planner.py` | Goal → ordered sub-tasks; also the corrective replan |
+| Skill call | `agents/skill_planner.py` | One sub-task → one `SkillsExecutor` call, with parameters |
+| Vocabulary | `agents/skill_catalog.py` | The closed skill list, generated from `SKILL_REGISTRY` |
+| Loop | `orchestrator/agent_orchestrator.py` | Executes, tracks the gripper, replans on failure |
+
+Three things are deliberate and worth knowing:
+
+- **The model does not author trajectories.** It picks the skill and its
+  arguments; the motion inside each skill is hand-written and grounded by SAM 3.
+  This is a weaker autonomy claim than robomail_Aliyah's "all motion comes from
+  the LLM Step Planner", and every trial record says so under `provenance`.
+- **Object names are grounded, not captions.** A name goes straight to
+  `VisionSystem.locate`. Where the cell can enumerate its bench — the simulator
+  can — the scene agent must name objects from that inventory, so it cannot plan
+  against a "measuring scoop" the bench calls a "larger spoon".
+- **Tool offsets come from perception.** `pick_up` measures where a grasped
+  tool's working end sits and reports it; the orchestrator hands that
+  measurement to the agent planning the next step rather than letting the model
+  guess a number it cannot see.
+
+Instead of a typed task, `--instruction-image` reads the goal off a photographed
+protocol page.
+
+**Status.** Exercised end to end in `--sim`: plan, execute, an autonomous replan
+after a failed `place`, success. With granules on, 2 of 90 citric acid grains
+reached the paper cup — the scoop's yield is limited by `measure_tool_offset`
+reading the bowl 24 mm shallower than CAD, which is a perception limitation that
+predates this pipeline (see `progress.md`). **Not yet run on the arm.** The hardware path
+differs in two ways worth watching the first time: object names are open
+vocabulary rather than a bench inventory, so a name the scene agent invents can
+fail to ground; and verification is on by default.
 
 ---
 
@@ -260,6 +351,10 @@ No hardware needed (run these from `perception_env`, without `scripts/env.sh`):
 ```bash
 # Skill geometry and failure logic against a fake arm
 perception_env/bin/python scripts/test_skills_offline.py
+
+# The agent loop against a fake model: vocabulary, parameter checking,
+# gripper bookkeeping, replanning. Needs no API key.
+perception_env/bin/python scripts/test_agents_offline.py
 
 # Perception + motion + pick/pour/scoop against the simulated cell
 perception_env/bin/python scripts/smoke_test_sim.py
