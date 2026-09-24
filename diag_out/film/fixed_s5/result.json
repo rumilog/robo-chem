@@ -1,0 +1,81 @@
+{
+  "skill": "scoop",
+  "success": true,
+  "granules_in_bowl": 0,
+  "cup_moved_mm": 1.68,
+  "params": {
+    "powder_source": "citric acid",
+    "tool_span": 0.03430014577228499,
+    "tool_back_reach": 0.03,
+    "bowl_length": 0.0275,
+    "bowl_depth": 0.0115,
+    "tool_offset": [
+      0.024622390722661643,
+      -7.130581849201486e-05,
+      0.029312825264587436
+    ],
+    "powder_surface_z": 0.02291015279848339,
+    "container_floor_z": 0.004,
+    "forward_offset": -0.004
+  },
+  "result": {
+    "scooped_from": "citric acid",
+    "depth_mode": "floor",
+    "tip_floor_gap": 0.003,
+    "scoop_depth": 0.01591015279848339,
+    "depth_reference": "tip",
+    "depth_reached": 0.014223175398910142,
+    "tip_depth_max": 0.015910152798483394,
+    "entry_depths_tip_mouth_top": [
+      0.015910152798483387,
+      -0.0019442934264769403,
+      -0.011667011667791969
+    ],
+    "end_depths_tip_mouth_top": [
+      0.014223175398910142,
+      0.0027231753989101423,
+      0.0027231753989101423
+    ],
+    "floor_gap_entry": 0.003000000000000001,
+    "floor_gap_end": 0.004686977399573248,
+    "floor_z": 0.004,
+    "floor_source": "container_floor_z",
+    "floor_clearance": 0.001,
+    "rim_lift_max": 0.0016869773995732487,
+    "surface_z": 0.02291015279848339,
+    "surface_given": true,
+    "dig_tilt_deg": 45.0,
+    "dig_tilt_requested": 45.0,
+    "sweep_end_tilt_deg": 0.0,
+    "cup_tilt_deg": 15.0,
+    "exit_tilt_deg": -15.0,
+    "handle_clearance": 0.005,
+    "tool_back_reach": 0.03,
+    "footprint_shift": -0.0023698482803927723,
+    "footprint_about_site": [
+      -0.016092566521688112,
+      0.016092566521688167
+    ],
+    "bowl_length": 0.0275,
+    "bowl_depth": 0.0115,
+    "roll_late": 1.6,
+    "sweep_advance": 0.008,
+    "sweep_rise": 0.0,
+    "sweep_waypoints": 12,
+    "swept_waypoints": 12,
+    "final_tilt_deg": 0.0,
+    "envelope_reach": 0.022496781116003117,
+    "allowed_reach": 0.030678333597896415,
+    "rim_radius": 0.038678333597896415,
+    "tool_span": 0.03430014577228499,
+    "tool_offset": [
+      0.024622390722661643,
+      -7.130581849201486e-05,
+      0.029312825264587436
+    ],
+    "forward_offset": -0.004,
+    "lateral_offset": 0.0,
+    "residual_from_level_deg": -14.996906152225222,
+    "quantity_measured": false
+  }
+}

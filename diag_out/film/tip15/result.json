@@ -1,0 +1,79 @@
+{
+  "skill": "scoop",
+  "success": true,
+  "granules_in_bowl": 0,
+  "cup_moved_mm": 7.82,
+  "params": {
+    "powder_source": "citric acid",
+    "tool_span": 0.03430014577228499,
+    "tool_back_reach": 0.03,
+    "bowl_length": 0.0275,
+    "bowl_depth": 0.0115,
+    "tool_offset": [
+      0.024622389885961014,
+      -7.130582766616124e-05,
+      0.02931282325333981
+    ],
+    "powder_surface_z": 0.022791547934253968,
+    "container_floor_z": 0.004,
+    "forward_offset": -0.008
+  },
+  "result": {
+    "scooped_from": "citric acid",
+    "scoop_depth": 0.015,
+    "depth_reference": "tip",
+    "depth_reached": 0.014104794736596891,
+    "tip_depth_max": 0.015000000000000001,
+    "entry_depths_tip_mouth_top": [
+      0.015000000000000001,
+      -0.002854446224960318,
+      -0.012577164466275347
+    ],
+    "end_depths_tip_mouth_top": [
+      0.014104794736596891,
+      0.0026047947365968917,
+      0.0026047947365968917
+    ],
+    "floor_gap_entry": 0.003791547934253967,
+    "floor_gap_end": 0.004686753197657077,
+    "floor_z": 0.004,
+    "floor_source": "container_floor_z",
+    "floor_clearance": 0.001,
+    "rim_lift_max": 0.000895205263403108,
+    "surface_z": 0.022791547934253968,
+    "surface_given": true,
+    "dig_tilt_deg": 45.0,
+    "dig_tilt_requested": 45.0,
+    "sweep_end_tilt_deg": 0.0,
+    "cup_tilt_deg": 15.0,
+    "exit_tilt_deg": -15.0,
+    "handle_clearance": 0.005,
+    "tool_back_reach": 0.03,
+    "footprint_shift": -0.0023698482803927723,
+    "footprint_about_site": [
+      -0.016092566521688112,
+      0.016092566521688167
+    ],
+    "bowl_length": 0.0275,
+    "bowl_depth": 0.0115,
+    "roll_late": 1.6,
+    "sweep_advance": 0.008,
+    "sweep_rise": 0.0,
+    "sweep_waypoints": 12,
+    "swept_waypoints": 12,
+    "final_tilt_deg": 0.0,
+    "envelope_reach": 0.02649678111600312,
+    "allowed_reach": 0.030679967627924146,
+    "rim_radius": 0.038679967627924146,
+    "tool_span": 0.03430014577228499,
+    "tool_offset": [
+      0.024622389885961014,
+      -7.130582766616124e-05,
+      0.02931282325333981
+    ],
+    "forward_offset": -0.008,
+    "lateral_offset": 0.0,
+    "residual_from_level_deg": -14.996983922938867,
+    "quantity_measured": false
+  }
+}

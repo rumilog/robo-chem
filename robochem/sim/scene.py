@@ -391,7 +391,68 @@ def _add_mesh_scoop(spec, prop: Prop, table_z: float):
         size = [wall, bowl[1], bowl[2]] if sx else [bowl[0], wall, bowl[2]]
         panel(size, centre + [sx * (bowl[0] - wall), sy * (bowl[1] - wall), 0],
               name)
+    # The powder the bowl is carrying, drawn only: invisible (alpha 0) and
+    # paper-thin until robochem.sim.powder fills it in. Resting on the inside
+    # of the bowl floor, spanning the cavity between the four walls.
+    body.add_geom(
+        type=mujoco.mjtGeom.mjGEOM_BOX,
+        name=f"{prop.body}_load",
+        size=[bowl[0] - 2 * wall, bowl[1] - 2 * wall, 1e-4],
+        pos=list(centre + [0, 0, -bowl[2] + 2 * wall + 1e-4]),
+        rgba=[0.97, 0.96, 0.90, 0.0],
+        contype=0, conaffinity=0, density=0,
+        group=2,
+    )
     return body
+
+
+def _add_powder_bed(cup_body, prop: Prop):
+    """
+    A drawn powder bed: a solid-looking fill from the inside floor up to
+    ``prop.powder_level``, with no contacts and no mass.
+
+    It exists to be SEEN -- by the viewer, and by the cameras, whose depth then
+    stops at the powder surface the way it did at the top of a granule bed --
+    while the physics stays that of an empty cup. It sits on its own child body
+    so the segmentation mask of the cup, which SimVision builds per body, is
+    the cup alone: perception of the container is unchanged by the fill.
+    What a scoop collects from it is estimated geometrically, in
+    robochem.sim.powder.
+    """
+    half_h = prop.height / 2
+    inner = prop.radius - prop.wall
+    level = min(prop.powder_level, prop.height - 2 * prop.wall)
+    bed = cup_body.add_body(name=prop.body + "_powder",
+                            pos=[0, 0, -half_h + 2 * prop.wall + level / 2])
+    bed.add_geom(
+        type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+        name=prop.body + "_powder_bed",
+        size=[inner - 0.0005, level / 2, 0],
+        rgba=list(prop.fill_rgba),
+        contype=0, conaffinity=0, density=0,
+        group=2,
+    )
+    return bed
+
+
+def _add_heap(cup_body, prop: Prop):
+    """
+    Where powder poured INTO a container is drawn: a flat pile on the inside
+    floor, invisible (alpha 0) until robochem.sim.powder lands something here.
+    On its own child body, like the bed, so the cup's segmentation stays the
+    cup alone.
+    """
+    heap = cup_body.add_body(name=prop.body + "_received",
+                             pos=[0, 0, -prop.height / 2 + 2 * prop.wall])
+    heap.add_geom(
+        type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+        name=prop.body + "_received",
+        size=[0.001, 1e-4, 0],
+        rgba=[0.97, 0.96, 0.90, 0.0],
+        contype=0, conaffinity=0, density=0,
+        group=2,
+    )
+    return heap
 
 
 def _add_label(spec, prop: Prop, table_z: float):
@@ -521,6 +582,7 @@ def build_scene(
     tool_length: float = 0.0,
     granules: bool = False,
     timestep: float = 0.002,
+    solver: str = "cg",
 ) -> SimScene:
     """
     Compile the full scene and the IK-only arm model.
@@ -531,8 +593,15 @@ def build_scene(
         camera_ids: Which cage cameras to place
         fovy: Vertical field of view, degrees
         tool_length: Length of a fixed tool bolted to the hand, metres
-        granules: Put loose particles in reagent cups so pours/scoops show flow
+        granules: Put loose particles in reagent cups so pours/scoops show flow.
+            Off, a cup with a ``powder_level`` gets a drawn powder bed instead
+            (no contacts); robochem.sim.powder estimates what a scoop takes.
         timestep: Physics timestep
+        solver: "cg" (default) or "newton". Measured on this scene, CG is 4-6x
+            cheaper per step with the spoon in a granule bed and 6x with the
+            bed alone (Newton's Hessian over a packed pile is ~55% dense), for
+            granule positions within ~0.1 mm of Newton's. With a finer bed
+            (700 x 4 mm grains) Newton took 3966 ms/step against CG's 17.
 
     Returns:
         A compiled :class:`SimScene`.
@@ -549,6 +618,12 @@ def build_scene(
     spec = _base_spec(tool_length)
     spec.option.timestep = timestep
     spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
+    if solver not in ("cg", "newton"):
+        raise ValueError(f"solver must be 'cg' or 'newton', got {solver!r}")
+    # CG keeps the default 100 iterations: capped at 50 it visibly changed a
+    # granule bed (97 grains moved over 1 mm), at 100 it matched Newton.
+    spec.option.solver = (mujoco.mjtSolver.mjSOL_CG if solver == "cg"
+                          else mujoco.mjtSolver.mjSOL_NEWTON)
 
     spec.worldbody.add_geom(
         name="table",
@@ -586,7 +661,10 @@ def build_scene(
         elif prop.kind == "rod":
             _add_rod(spec, prop, bench.table_z)
         else:
-            _add_container(spec, prop, bench.table_z)
+            cup = _add_container(spec, prop, bench.table_z)
+            if not granules and prop.powder_level > 0:
+                _add_powder_bed(cup, prop)
+            _add_heap(cup, prop)
         if granules and prop.fill:
             grain_names[prop.name] = _add_grains(spec, prop, bench.table_z)
 

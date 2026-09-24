@@ -110,14 +110,78 @@ def test_spoon_and_scoop(cell) -> bool:
     ok &= check("spoon picked up", picked and cell.arm.holding == "larger spoon",
                 str(cell.arm.holding))
 
+    cup = cell.scene.bench.find("citric acid")
     cell.vision.clear_cache()
+    # The printed scoop is CRANKED: the bowl sits forward of and below the
+    # jaws, so a bare tool_length aims the arm at the wrong place entirely --
+    # with tool_length=0.08 this test collected 0 granules out of 90 and still
+    # passed. tool_span and tool_back_reach are what the stroke checks its
+    # clearances against; without them it only protects a point.
     scooped, result = cell.skills.execute(
-        "scoop", {"powder_source": "citric acid", "tool_length": 0.08}
+        "scoop", {"powder_source": "citric acid",
+                  "tool_offset": [0.025, 0.0, 0.029],
+                  "tool_span": 0.0275,
+                  "tool_back_reach": 0.030,
+                  "bowl_length": 0.0275,
+                  "bowl_depth": 0.0115,
+                  "bowl_width": 0.0205,
+                  # The stroke is sized to the dish, so give it the real inside
+                  # radius: perception's "opening radius" reads the outside of
+                  # the rim plus its centre error.
+                  "container_radius": cup.radius - cup.wall,
+                  # ...and its real centre: perception's leans ~16 mm toward the
+                  # cameras on the 90 mm dish, which puts the bowl in the wall.
+                  "container_center": list(cell.vision.ground_truth("citric acid")[:2])}
     )
     ok &= check("scoop reports success", scooped)
     if scooped:
-        residual = float(result.get("residual_tilt", 99))
-        ok &= check("spoon came back level", residual < 5.0, f"{residual:.2f} deg")
+        # The stroke deliberately finishes NOSE-UP, cupping the load. Coming
+        # back level while still over the cup is what tips the powder straight
+        # back in, so "did it level" is the wrong question -- negative here
+        # means tipped up, which is what carries the scoop out loaded.
+        cupped = float(result.get("residual_from_level_deg", 0.0))
+        ok &= check("spoon finished cupped (nose-up)", cupped < -5.0,
+                    f"{cupped:+.1f} deg from level")
+    return ok
+
+
+def test_scoop_and_dump(cell) -> bool:
+    """Scoop, then empty it into the paper cup from just above the rim."""
+    print("\npick_up + scoop + dump (larger spoon, citric acid -> white paper cup)")
+    cell.reset()
+    ok = True
+
+    picked, _ = cell.skills.execute(
+        "pick_up", {"object_name": "larger spoon", "z_offset": 0.0, "grasp_force": 1.0}
+    )
+    ok &= check("spoon picked up", picked and cell.arm.holding == "larger spoon",
+                str(cell.arm.holding))
+    cup = cell.scene.bench.find("citric acid")
+    tool = {"tool_offset": [0.025, 0.0, 0.029], "bowl_length": 0.0275,
+            "bowl_depth": 0.0115, "bowl_width": 0.0205}
+    cell.vision.clear_cache()
+    scooped, _ = cell.skills.execute(
+        "scoop", {"powder_source": "citric acid", **tool,
+                  "tool_span": 0.0275, "tool_back_reach": 0.030,
+                  "container_radius": cup.radius - cup.wall,
+                  "container_center": list(cell.vision.ground_truth("citric acid")[:2])}
+    )
+    ok &= check("scoop reports success", scooped)
+    if not scooped:
+        return ok
+
+    dumped, result = cell.skills.execute(
+        "dump", {"target_container": "white paper cup", **tool})
+    ok &= check("dump reports success", dumped, str(result.get("error", ""))[:70])
+    if dumped:
+        tip = float(result.get("tip_achieved", 0.0))
+        ok &= check("tipped to about vertical", tip > 85.0, f"{tip:.1f} deg")
+        # The whole point of the rewrite: the bowl stays over the target
+        # while it tips, instead of wandering 80 mm toward the base.
+        drift = max(result.get("bowl_drift_mm", {}).values(), default=1e9)
+        ok &= check("bowl stayed over the cup", drift < 5.0, f"{drift:.1f} mm at worst")
+        residual = abs(float(result.get("residual_tilt", 90.0)))
+        ok &= check("came back level", residual < 5.0, f"{residual:.1f} deg")
     return ok
 
 
@@ -267,6 +331,7 @@ def main() -> int:
         "pick + scoop": test_spoon_and_scoop,
         "pick + stir": test_stirrer_and_stir,
         "force guard": test_force_guard_refuses_to_drop_into_nothing,
+        "pick + scoop + dump": test_scoop_and_dump,
         "failure handling": test_empty_gripper_refuses_to_scoop,
     }
     if args.only:
