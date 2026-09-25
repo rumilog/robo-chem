@@ -22,6 +22,17 @@ Two backends, same HTTP contract:
          a fallback. Scores only ~0.3-0.6 here and tends to expand its box to
          surrounding structure, so prefer sam3 unless the weights are missing.
 
+Both are text backends, and text runs out on the printed tools: they have no
+name SAM 3 knows, and scripts/sweep_prompts.py could not find one (see
+diag_out/stirrer_prompts). So a third path sits in front of them:
+
+  exemplar  Segment everything, embed each candidate, keep the one matching a
+            reference crop you boxed by hand once
+            (perception_service/exemplar_matcher.py). It handles ONLY the names
+            registered in exemplars/*.npz; every other prompt still goes to the
+            text backend, so nothing else changes. Register with
+            scripts/register_object.py.
+
 Usage:
     perception_env/bin/python perception_service/grounding_service.py \
         --backend sam3 --model weights/sam3.pt
@@ -31,18 +42,25 @@ Usage:
 import argparse
 import base64
 import logging
+import os
 import time
 
 import cv2
 import numpy as np
 from flask import Flask, jsonify, request
 
+from exemplar_matcher import (
+    DEFAULT_EXEMPLAR_DIR,
+    ExemplarBackend,
+    ExemplarLibrary,
+)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("grounding")
 
 app = Flask(__name__)
 
-STATE = {"backend": None, "name": None, "conf": 0.25}
+STATE = {"backend": None, "name": None, "conf": 0.25, "exemplars": None}
 
 
 # ---------------------------------------------------------------- backends
@@ -286,13 +304,37 @@ def encode_mask(mask: np.ndarray) -> str:
 
 @app.get("/health")
 def health():
+    ex = STATE["exemplars"]
     return jsonify(
         {
             "ok": STATE["backend"] is not None,
             "backend": STATE["name"],
             "conf": STATE["conf"],
+            "exemplars": ex.library.names if ex else [],
         }
     )
+
+
+@app.get("/exemplars")
+def exemplars():
+    """Which names are answered by appearance rather than by text."""
+    ex = STATE["exemplars"]
+    if ex is None:
+        return jsonify({"loaded": False, "objects": []})
+    return jsonify({
+        "loaded": True,
+        "threshold": ex.threshold,
+        "objects": [
+            {
+                "name": e.name,
+                "aliases": e.aliases,
+                "views": int(len(e.embeddings)),
+                "created": e.created,
+                "path": e.path,
+            }
+            for e in ex.library.entries
+        ],
+    })
 
 
 @app.post("/segment")
@@ -323,9 +365,18 @@ def segment():
     if not images:
         return jsonify({"error": "missing 'images'"}), 400
 
+    conf = payload.get("conf")
+
     backend = STATE["backend"]
     if backend is None:
         return jsonify({"error": "backend not loaded"}), 503
+
+    # A registered object is matched by appearance; everything else by text.
+    # Dispatch happens on the name, so callers -- and every skill above them --
+    # never learn which path answered.
+    exemplar = STATE["exemplars"]
+    if exemplar is not None and exemplar.knows(prompt):
+        backend = exemplar
 
     results = {}
     for cam_id, b64 in images.items():
@@ -337,7 +388,8 @@ def segment():
             continue
 
         try:
-            entry = backend.infer(image, prompt, return_all=return_all)
+            extra = {"conf": conf} if backend is STATE["exemplars"] else {}
+            entry = backend.infer(image, prompt, return_all=return_all, **extra)
         except Exception as e:
             log.exception(f"inference failed on cam {cam_id}")
             results[cam_id] = {"found": False, "error": f"inference failed: {e}"}
@@ -374,7 +426,7 @@ def segment():
 
     return jsonify({
         "prompt": prompt,
-        "backend": STATE["name"],
+        "backend": backend.name,
         "return_all": return_all,
         "results": results,
     })
@@ -389,6 +441,23 @@ def main():
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--box-threshold", type=float, default=0.3, help="gdino only")
     parser.add_argument("--text-threshold", type=float, default=0.25, help="gdino only")
+    parser.add_argument(
+        "--exemplars",
+        default=None,
+        help="directory of registered objects (default: exemplars/ if it has "
+             "any .npz). These names bypass the text backend entirely.",
+    )
+    parser.add_argument("--no-exemplars", action="store_true",
+                        help="ignore exemplars/ and answer everything with text")
+    parser.add_argument("--exemplar-thresh", type=float, default=0.60,
+                        help="minimum cosine similarity to a reference view "
+                             "(scripts/register_object.py suggests one)")
+    parser.add_argument("--exemplar-points", type=int, default=32,
+                        help="mask-generator point grid (NxN). Denser finds "
+                             "smaller objects and costs proportionally more")
+    parser.add_argument("--exemplar-retry-points", type=int, default=48,
+                        help="denser grid retried only on a miss; set equal to "
+                             "--exemplar-points to disable the retry")
     args = parser.parse_args()
 
     if args.backend == "sam3":
@@ -401,6 +470,29 @@ def main():
 
     STATE["name"] = STATE["backend"].name
     STATE["conf"] = args.conf
+
+    if not args.no_exemplars:
+        ex_dir = args.exemplars or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            DEFAULT_EXEMPLAR_DIR,
+        )
+        library = (
+            ExemplarLibrary.load(ex_dir) if os.path.isdir(ex_dir)
+            else ExemplarLibrary([])
+        )
+        if len(library):
+            # Only pay for the extra two models when something is registered.
+            STATE["exemplars"] = ExemplarBackend(
+                library,
+                threshold=args.exemplar_thresh,
+                points=args.exemplar_points,
+                retry_points=args.exemplar_retry_points,
+            )
+            log.info(f"exemplar matching for {library.names} (thresh "
+                     f"{args.exemplar_thresh}); all other prompts go to "
+                     f"{STATE['name']}")
+        elif args.exemplars:
+            log.warning(f"no exemplars found in {ex_dir}")
 
     log.info(f"serving {STATE['name']} on http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, threaded=False)

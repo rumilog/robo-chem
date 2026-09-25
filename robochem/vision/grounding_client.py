@@ -11,6 +11,7 @@ started; nothing here needs to know which is running.
 """
 
 import base64
+import os
 import json
 from typing import Dict, List, Optional, Tuple
 
@@ -33,9 +34,14 @@ class GroundingClient:
     Thin HTTP client for the grounding service.
     """
 
-    def __init__(self, url: str = "http://127.0.0.1:5005", timeout: float = 180.0):
+    def __init__(self, url: str = "http://127.0.0.1:5005", timeout: float = 180.0,
+                 batch_size: int = 2):
         self.url = url.rstrip("/")
         self.timeout = timeout
+        #: Cameras per /segment request. Lower means a lower peak in the
+        #: service; GROUNDING_BATCH overrides it.
+        self.batch_size = int(os.environ.get("GROUNDING_BATCH", batch_size))
+
 
     def health(self) -> dict:
         try:
@@ -71,28 +77,57 @@ class GroundingClient:
         conf: float = None,
         return_all: bool = False,
     ) -> dict:
-        encoded = {}
-        for cam_id, img in images.items():
-            ok, buf = cv2.imencode(".jpg", img)
-            if not ok:
+        """
+        Segment a prompt across cameras, in batches of ``self.batch_size``.
+
+        Sending all four cameras in one request makes the service hold four
+        sets of segmentation intermediates at once. Measured 2026-09-25: it
+        sits at 5.85GB resident and peaks at 8.90GB for a four-frame
+        ``segment_instances`` -- a 3GB spike. On a 15GB host with the service
+        already resident that exhausts RAM, and the machine goes into swap
+        thrash rather than OOM-killing anything, which freezes the desktop
+        mid-run. Batching trades a little latency for a lower peak.
+        """
+        cam_ids = list(images.keys())
+        batch = max(1, int(self.batch_size))
+        merged: dict = {"results": {}}
+
+        for start in range(0, len(cam_ids), batch):
+            chunk = cam_ids[start:start + batch]
+            encoded = {}
+            for cam_id in chunk:
+                ok, buf = cv2.imencode(".jpg", images[cam_id])
+                if not ok:
+                    continue
+                encoded[str(cam_id)] = base64.b64encode(buf.tobytes()).decode("ascii")
+            if not encoded:
                 continue
-            encoded[str(cam_id)] = base64.b64encode(buf.tobytes()).decode("ascii")
 
-        body = {"prompt": prompt, "images": encoded, "return_all": bool(return_all)}
-        if conf is not None:
-            body["conf"] = conf
+            body = {"prompt": prompt, "images": encoded,
+                    "return_all": bool(return_all)}
+            if conf is not None:
+                body["conf"] = conf
 
-        req = Request(
-            f"{self.url}/segment",
-            data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
+            req = Request(
+                f"{self.url}/segment",
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            )
+            try:
+                with urlopen(req, timeout=self.timeout) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+            except (URLError, HTTPError, OSError) as e:
+                raise GroundingUnavailable(f"Grounding request failed: {e}")
 
-        try:
-            with urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except (URLError, HTTPError, OSError) as e:
-            raise GroundingUnavailable(f"Grounding request failed: {e}")
+            merged["results"].update(payload.get("results") or {})
+            for k, v in payload.items():
+                if k != "results":
+                    merged.setdefault(k, v)
+            # Drop the encoded copies before the next batch rather than
+            # holding every camera's base64 for the whole call.
+            del encoded, body, payload
+
+        return merged
 
     def segment(
         self,

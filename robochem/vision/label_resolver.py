@@ -188,24 +188,38 @@ def _ensure_box(inst: dict, h: int, w: int) -> List[float]:
 
 
 def annotate_instances(image_bgr: np.ndarray, instances: List[dict]) -> np.ndarray:
-    """Draw numbered boxes on a copy of the image for the VLM."""
+    """
+    Draw numbered boxes on a copy of the image for the VLM.
+
+    The number goes in a filled disc at the CENTRE of each container, not at
+    the box's top-left corner. That corner is where the previous version put
+    it, and with two lookalike cups side by side the tag for one sat visually
+    over the other's paper: on 2026-09-21 the model read "A 10 ML WATER"
+    correctly and attached it to the cup standing on the B paper. The reading
+    was never the problem; the association was.
+
+    Centring the tag on the container it belongs to removes that ambiguity
+    while keeping ONE call per camera. Cropping each container into its own
+    call also fixes it, but costs a call and a JPEG encode per container, and
+    that is memory spent at the exact moment this host has none to spare.
+    """
     vis = image_bgr.copy()
     h, w = vis.shape[:2]
+    colour = (0, 255, 255)
     for i, inst in enumerate(instances):
         x1, y1, x2, y2 = _ensure_box(inst, h, w)
         x1, y1 = int(max(0, x1)), int(max(0, y1))
         x2, y2 = int(min(w - 1, x2)), int(min(h - 1, y2))
-        color = (0, 255, 255)
-        cv2.rectangle(vis, (x1, y1), (x2, y2), color, 2)
-        tag = f"{i}"
-        cv2.putText(
-            vis, tag, (x1 + 4, max(18, y1 + 18)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA,
-        )
-        cv2.putText(
-            vis, tag, (x1 + 4, max(18, y1 + 18)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA,
-        )
+        cv2.rectangle(vis, (x1, y1), (x2, y2), colour, 2)
+
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        tag = str(i)
+        radius = 15
+        cv2.circle(vis, (cx, cy), radius, (0, 0, 0), -1)
+        cv2.circle(vis, (cx, cy), radius, colour, 2)
+        (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        cv2.putText(vis, tag, (cx - tw // 2, cy + th // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, colour, 2, cv2.LINE_AA)
     return vis
 
 
@@ -230,6 +244,10 @@ def read_labels_vlm(vlm_client, image_bgr: np.ndarray,
     # the distinction the experiment depends on. Transcribe, do not summarise.
     prompt = f"""This lab photo has {n} containers marked with yellow boxes numbered 0..{n - 1}.
 Each sits on a white paper square with a handwritten label.
+
+Each container has its index printed in a yellow circle ON the container
+itself. The label for that index is on the paper under or beside THAT
+container -- not the nearest paper to the circle, and never a neighbour's.
 
 Transcribe the label for EACH numbered container, COMPLETELY and VERBATIM.
 
@@ -477,9 +495,20 @@ class LabelResolver:
                  per_instance: bool = True):
         self.vlm_client = vlm_client
         self.model = model
-        #: Read each container in its own cropped call. Default True: the
-        #: whole-frame variant reads the handwriting fine but attaches it to
-        #: the wrong numbered box when lookalike cups sit side by side.
+        #: Read each container in its own cropped call. Default True.
+        #:
+        #: Measured on scene_captures/ab_water_20260921_102436, which has the
+        #: A and B water cups side by side:
+        #:
+        #:   per-instance   "a 10 ml water" 4/4 cameras, "b" 4/4, no invented labels
+        #:   whole-frame    "a" 2/4, "b" 0/4, and reads like "WEAK BASE",
+        #:                  "C 10% NaCl", "GLITTER ADD" that are not on the bench
+        #:
+        #: Centring the index tag on each container (see annotate_instances)
+        #: was tried as a cheaper fix and did not close that gap. The crops are
+        #: ~100x100px, so the memory they cost is negligible -- the host freeze
+        #: of 2026-09-25 was the grounding service's 8.9GB resident set against
+        #: 3GB free, not this.
         self.per_instance = per_instance
 
     def resolve(

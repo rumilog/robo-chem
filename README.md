@@ -6,6 +6,9 @@ Barati Farimani Lab, CMU.
 
 ---
 
+Working in this repo: read [`progress.md`](progress.md) before you start and
+update it when you finish — see [`CLAUDE.md`](CLAUDE.md).
+
 ## Requirements
 
 | Piece | Notes |
@@ -37,7 +40,11 @@ perception_env/bin/python perception_service/grounding_service.py \
   --backend sam3 --model weights/sam3.pt
 ```
 
-Service listens on `http://127.0.0.1:5005` by default.
+Service listens on `http://127.0.0.1:5005` by default. It also loads
+`exemplars/` at startup: objects registered there (the printed stirrer and
+scoop, which SAM 3 has no word for) are matched by appearance instead of text,
+and every other prompt goes to SAM 3 exactly as before. `--no-exemplars` turns
+that off. See `exemplars/README.md`.
 
 ### 3. Run a skill
 
@@ -111,14 +118,16 @@ robo-chem/
 │   ├── vision/               # multi-cam localizer, grasp analyzer, grounding client
 │   ├── orchestrator/         # the closed loop over the agents and the skills
 │   └── verification/         # chemistry outcome checks
-├── perception_service/       # Flask SAM 3 / GroundingDINO service
+├── perception_service/       # Flask SAM 3 / GroundingDINO / exemplar service
 ├── scripts/
 │   ├── env.sh                # ROS + frankapy + PYTHONPATH
 │   ├── run_experiment.py     # main skill / task entry
 │   ├── calibrate_cameras.py  # board-free cube calibration
 │   ├── capture_scene.py      # dump color/depth stills
+│   ├── register_object.py    # teach an object SAM cannot be told about
 │   └── smoke_test_*.py
 ├── weights/                  # sam3.pt, etc.
+├── exemplars/                # objects registered by appearance, not by name
 ├── calibration_out/          # extrinsics, taught poses
 ├── diag_out/                 # debug overlays / fused clouds
 ├── scene_captures/           # saved multi-cam scenes
@@ -251,6 +260,9 @@ fail to ground; and verification is on by default.
 2. Extrinsics: green cube in gripper + Kabsch (`scripts/calibrate_cameras.py`).
 3. Validate with `scripts/validate_calibration.py` / `scripts/check_object.py`.
 4. Prefer prompt **`plastic beaker`** for the red translucent beaker; use **`--backend sam3`**.
+5. Custom printed parts have no prompt that works — register them by appearance
+   with `scripts/register_object.py` instead of sweeping for a phrase
+   (`exemplars/README.md`).
 
 ---
 

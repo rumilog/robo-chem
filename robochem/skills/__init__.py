@@ -107,6 +107,8 @@ class SkillsExecutor:
         
         # Pre-instantiate skills for reuse
         self._skill_instances = {}
+        #: object name -> where pick_up took it from, for "put it back".
+        self.pick_sites = {}
     
     def list_skills(self) -> list:
         """
@@ -147,6 +149,7 @@ class SkillsExecutor:
         skill = self._skill_instances[skill_name]
         
         params = {**self.SKILL_ALIASES.get(skill_name, {}), **(params or {})}
+        params = self._resolve_pick_site(skill_name, params)
         
         # Check preconditions
         can_execute, message = skill.check_preconditions(params)
@@ -156,6 +159,48 @@ class SkillsExecutor:
         # Execute the skill
         try:
             success, result = skill.execute(params)
+            if success:
+                self._remember_pick_site(skill_name, params, result)
             return success, result
         except Exception as e:
             return False, {"error": str(e), "phase": "execution"}
+
+    # ---------------------------------------------------------- pick sites
+    #
+    # "Put it back where you found it" cannot be answered by perception: by
+    # the time it is asked, the object is in the gripper and no camera can see
+    # it on the bench. Only the pick knows, so the pick has to say.
+    #
+    # Holding it here rather than in the skills is deliberate — one executor
+    # spans a whole --skill chain, which is the session a hand-off happens in.
+
+    def _remember_pick_site(self, skill_name: str, params: dict, result: dict):
+        """After a successful pick_up, note where the object was taken from."""
+        if skill_name != "pick_up" or not isinstance(result, dict):
+            return
+        name = params.get("object_name")
+        centroid = result.get("centroid")
+        if not name or centroid is None:
+            return
+        site = list(centroid)
+        self.pick_sites[str(name).strip().lower()] = site
+        print(f"[Skills] Noted where '{name}' was picked from: "
+              f"[{site[0]:.4f}, {site[1]:.4f}, {site[2]:.4f}] — "
+              f"place it back by name")
+
+    def _resolve_pick_site(self, skill_name: str, params: dict) -> dict:
+        """Turn place's ``target_location`` name into the site it was picked from."""
+        if skill_name != "place":
+            return params
+        target = params.get("target_location")
+        if not isinstance(target, str):
+            return params
+        site = self.pick_sites.get(target.strip().lower())
+        if site is None:
+            return params           # a real scene object: let vision find it
+        resolved = dict(params)
+        resolved["target_location"] = list(site)
+        print(f"[Skills] '{target}' is the tool in the gripper, so it cannot be "
+              f"seen on the bench; placing it back at the site it was picked "
+              f"from: [{site[0]:.4f}, {site[1]:.4f}, {site[2]:.4f}]")
+        return resolved

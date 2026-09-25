@@ -129,9 +129,16 @@ def main() -> int:
             safe = re.sub(r"[^a-z0-9]+", "_", prompt.lower()).strip("_")
             for cam, mask in masks.items():
                 vis = images[cam].copy()
-                vis[mask.astype(bool)] = (
-                    0.5 * vis[mask.astype(bool)] + 0.5 * np.array([0, 0, 255])
-                ).astype(np.uint8)
+                m = mask.astype(bool)
+                # Blend AND outline. A 50% red blend is invisible on a black
+                # object -- the stirrer's mask looked like a miss until the
+                # contour was drawn -- so the outline is what makes a dark
+                # object's mask readable at a glance.
+                vis[m] = (0.5 * vis[m] + 0.5 * np.array([0, 0, 255])).astype(np.uint8)
+                contours, _ = cv2.findContours(mask.astype(np.uint8),
+                                               cv2.RETR_EXTERNAL,
+                                               cv2.CHAIN_APPROX_SIMPLE)
+                cv2.drawContours(vis, contours, -1, (0, 255, 255), 2)
                 cv2.imwrite(os.path.join(args.save_overlays,
                                          f"{safe}_cam{cam}.png"), vis)
 

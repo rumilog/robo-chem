@@ -1,6 +1,6 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-09-24
+Last updated: 2026-09-25
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
@@ -16,12 +16,32 @@ cd /home/rumi/Desktop/robo-chem
 source scripts/env.sh
 ```
 
-Grounding (separate terminal / env):
+Grounding — **one terminal is enough**, background it:
+
+```bash
+scripts/grounding.sh start      # idempotent; restart | status | stop | log
+```
+
+It has to be its own *process* (perception_env is Python 3.10 for SAM 3 and
+DINOv2; the skills run in the frankapy Python 3.8 venv) but not its own
+*terminal*. `status` also warns when `exemplars/*.npz` are newer than the
+running process.
+
+Still available by hand if preferred:
 
 ```bash
 perception_env/bin/python perception_service/grounding_service.py \
   --backend sam3 --model weights/sam3.pt
 ```
+
+**The exemplar library is read once, at startup.** A service left running from
+before an object was registered answers that name by *text* prompting, and the
+failure looks exactly like the object not being on the bench. On 2026-09-25 a
+service running since Sep 9 reported `'scoop' -> no masks` on three cameras
+while `exemplars/scoop.npz` sat unread on disk; `curl -s $GROUNDING_URL/health`
+distinguishes them — it lists the loaded names, and an old build has no
+`exemplars` key at all. Run `scripts/grounding.sh restart` after every
+`register_object.py`.
 
 ### Pick beaker (upright top-down grasp)
 
@@ -102,6 +122,7 @@ python scripts/run_experiment.py --skill pour \
 | --- | --- |
 | Env bring-up (`scripts/env.sh`, frankapy Py3.8 + ROS Noetic) | Working |
 | SAM 3 grounding service (`perception_service/`, `weights/sam3.pt`) | Working; prefer over GroundingDINO |
+| Exemplar matching for the printed tools (`exemplars/`) | Working — 0.95-1.00 on all 4 cams for stirrer / holder / scoop |
 | Sequential RealSense capture (cams 2–5, one at a time) | Working — avoid streaming all four at once (USB wedge) |
 | Live factory intrinsics + board-free cube extrinsic calib | Working (~3–6 mm held-out) |
 | `pick_up` upright top grasp + reset_joints pre-scan | Working (beaker + spoon params above) |
@@ -119,6 +140,99 @@ python scripts/run_experiment.py --skill pour \
 - Scripts: `calibrate_cameras.py`, `validate_calibration.py`, `check_object.py`
 - Prompt `"plastic beaker"` detects the red translucent beaker more reliably
   than bare `"beaker"`
+
+---
+
+## Custom objects: exemplar matching (added 2026-09-25)
+
+Text prompting ran out on the printed tools. SAM 3 is open-vocabulary, not
+unlimited: `scripts/sweep_prompts.py` spent twenty phrases on the scoop and the
+best honest hit was `"scoop"` on 2/4 cameras (`diag_out/stirrer_prompts/` is the
+same story for the stirrer), while the phrases that scored *well* —
+`"white object"`, 0.95 on 4/4 — were matching the cups. The concept is simply
+not in the model, so no wording fixes it.
+
+These objects are now matched by **appearance**. SAM's automatic mask generator
+segments everything in the frame (no prompt, class-agnostic), DINOv2 embeds each
+candidate crop, and the best cosine match against a reference crop wins.
+Reference embeddings live in `exemplars/*.npz` and are the custom vocabulary.
+
+Dispatch is by name inside the service, so `segment("stirrer")` is unchanged for
+every skill above it: registered names go to the exemplar backend, everything
+else still goes to SAM 3.
+
+### Registering an object
+
+```bash
+source scripts/env.sh
+python scripts/capture_scene.py --label stirrer_white
+
+perception_env/bin/python scripts/register_object.py --name stirrer \
+    --images-dir scene_captures/stirrer_white_<ts>          # drag a box per camera
+```
+
+The service loads `exemplars/` at startup (`--no-exemplars` to skip,
+`--exemplar-thresh` to tune). Verify with the existing sweep:
+
+```bash
+python scripts/sweep_prompts.py --images-dir scene_captures/<run> \
+    --only stirrer --save-overlays diag_out/stirrer_exemplar
+```
+
+### Registered so far (2026-09-25)
+
+| Object | Views | Aliases |
+| --- | --- | --- |
+| `stirrer` | 4 (seated in holder) | — |
+| `stirrer holder` | 8 (4 occupied + 4 empty) | `holder`, `tool holder` |
+| `scoop` | 4 | `white plastic tool` |
+
+Measured on `scene_captures/stirrer_white_20260925_113812` and
+`holder_empty_20260925_120924`: **0.95-1.00 on all four cameras**, margin
+0.43-0.72 over the next-best registered object. Leave-one-camera-out (register
+from three, query the fourth) gives 0.69-0.85 — the honest number for a viewpoint
+with no reference. Cross-object reference similarity: stirrer/holder 0.52,
+stirrer/scoop 0.45, holder/scoop 0.34.
+
+### Four things that cost real debugging time
+
+1. **Register what you want to GRASP.** `ObjectLocalizer.get_object_pose` puts
+   the grasp at the *mean of the fused mask points*. A first pass registered
+   "stirrer" as the white cube **plus** the black cylinder it sits in; it scored
+   0.95+ and would have driven the gripper into the middle of the holder. The
+   cube is the stirrer, the cylinder is its holder, and they are now two
+   objects. A high score only means "this is the shape you showed me".
+
+2. **Register every state.** A holder with the tool in it and an empty holder
+   are 0.49-0.83 similar — not interchangeable. The holder carries both because
+   it is looked for occupied (before a pick) and empty (to put the stirrer
+   back). Use `register_object.py --append`.
+
+3. **Multi-part objects.** A two-tone object is several objects to the mask
+   generator: the stirrer's body, the cube's top and the cube's shaded front
+   face come back separately, so a whole-tool reference matched none of them
+   (0.63 on cam2, head cut off). Merging every adjacent pair blindly gave a lid
+   floating above a mug (0.64). What works is `_grow()` — add the neighbour that
+   improves similarity to the reference most, repeat, stop when nothing does.
+   cam2 0.63 -> 0.95, cam3 0.74 -> 0.99.
+
+4. **Point-grid recall on small objects.** At 32x32 over 848x480 the grid lands
+   ~26px apart, wider than the scoop's shank; on one camera that produced half a
+   scoop, which genuinely resembles the stirrer cube more than a scoop (0.65 vs
+   0.56) and was correctly refused. Raising density everywhere costs 2-3x on
+   every frame *and* shifts which candidates seed `_grow` (cam2 scoop
+   1.00 -> 0.89), so the service retries **only missed frames** at 48x48
+   (`--exemplar-retry-points`). Growth adjacency also had to widen from a fixed
+   8px — the two scoop fragments sat 9px apart — to 16px scaled by candidate
+   size; similarity gates the merge, so the geometry test can be generous.
+
+### Cost
+
+~4s for the first query on a frame (mask generation), ~0.15s for every further
+object on that same frame (candidates and embeddings are cached per image,
+bit-packed). A missed frame that triggers the denser retry costs ~13s. A
+per-camera miss is not a failed run: localization fuses whatever cameras did find
+the object.
 
 ---
 
@@ -246,8 +360,39 @@ perception_env/bin/python scripts/test_skills_offline.py   # no robot needed
   current pour uses absolute tip toward ±X instead
 - Soft paper cups vs rigid beaker need different squeeze; beaker params above
   are the current known-good set
-- USB: keep cameras off the same controller as HID when possible; always
-  sequential open/close
+- **USB: the cameras and the mouse are on the same controller, and it has now
+  wedged the host three times.** Measured 2026-09-25 — this machine has three
+  USB controllers and the cameras are sharing the busy one with the input
+  devices:
+
+  | Controller | Buses | On it |
+  | --- | --- | --- |
+  | `00:14.0` Intel Z370 xHCI | 1 + 2 | **all four cameras AND the mouse/keyboard** |
+  | `01:00.2` NVIDIA TU102 | 3 + 4 | *nothing* |
+  | `04:00.0` ASMedia ASM1142 | 5 + 6 | *nothing* |
+
+  Buses 1 and 2 are the two root hubs of one physical controller (both
+  `0000:00:14.0`), so "different bus" is not separation. The freeze signature in
+  `dmesg` is the Realtek hub at `1-3.1` — the one the mouse and keyboard hang
+  off — dropping with `error -71` (EPROTO) and taking its children with it:
+
+  ```
+  usb 1-3.1: Failed to suspend device, error -71
+  usb 1-3.1: device descriptor read/all, error -71
+  usb 1-3.1.1: USB disconnect, device number 20    <- HID
+  usb 1-3.1.4: USB disconnect, device number 21    <- HID
+  ```
+
+  Sequential capture reduces this but does not remove it: the contention is for
+  the controller, not just for bandwidth at one instant. **The fix is physical**
+  — move the camera hub to the ASMedia (`04:00.0`) or NVIDIA (`01:00.2`) ports,
+  both of which are completely unused. Until then, expect the mouse to die
+  occasionally during a multi-camera scan, and prefer the NVIDIA controller only
+  as a second choice since that GPU is also running SAM 3 and DINOv2.
+- `stirrer` has only the 4 views of it seated in its holder. Once it is lying
+  loose on the bench, capture that and
+  `register_object.py --name stirrer --append` — a tool on its side is a
+  different view, and it will be on its side right after every pick
 
 ---
 
@@ -265,7 +410,10 @@ perception_env/bin/python scripts/test_skills_offline.py   # no robot needed
 | `scripts/test_agents_offline.py` | Offline agent-loop checks (no API key) |
 | `SKILLS_ROADMAP.md` | Skill gap, hardening playbook, integration plan |
 | `robochem/vision/` | Localizer, SAM client, grasp analyzer |
-| `perception_service/grounding_service.py` | SAM 3 / GDINO HTTP service |
+| `perception_service/grounding_service.py` | SAM 3 / GDINO / exemplar HTTP service |
+| `perception_service/exemplar_matcher.py` | Appearance matching for objects SAM has no word for |
+| `scripts/register_object.py` | Teach an object by boxing it once |
+| `exemplars/` | Registered objects + `README.md` on how to add one |
 | `scripts/env.sh` | ROS + frankapy + PYTHONPATH |
 | `scripts/run_experiment.py` | Skill / task entry |
 | `calibration_out/` | Extrinsics, taught poses, reports |
