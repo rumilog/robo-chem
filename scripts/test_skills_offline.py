@@ -116,6 +116,7 @@ class FakeArm:
         self.gripper_width = gripper_width
         self.commands = []
         self.gripper_commands = []
+        self.resets = 0
 
     def get_pose(self):
         return self.pose.copy()
@@ -155,6 +156,7 @@ class FakeArm:
         return True
 
     def reset_joints(self):
+        self.resets = getattr(self, "resets", 0) + 1
         self.pose = FakePose([0.45, 0.0, 0.35], np.diag([1.0, -1.0, -1.0]))
 
 
@@ -671,12 +673,15 @@ def test_dump_keeps_the_bowl_over_the_target():
     offset = [0.051, 0.009, 0.028]
 
     ok, result = skill.execute({"target_container": "cup", "tool_offset": offset,
-                                "dump_angle_deg": 120.0, "step_deg": 30.0,
-                                "seconds_per_step": 0.0, "hold_duration": 0.0,
-                                "shakes": 0})
+                                "hold_duration": 0.0, "shakes": 0})
     check("dump succeeds", ok, f"{result}")
-    check("it tipped past vertical", ok and result["tip_achieved"] > 90.0,
-          f"tip={result.get('tip_achieved')}")
+    # Straight ahead, reach -- not the wrist -- caps the tip over a cup this
+    # far out; the skill must go as far as it says it can, and no further.
+    check("it tipped as far as the arm reaches",
+          ok and 60.0 <= result["tip_commanded"] <= 90.0
+          and result["tip_achieved"] >= result["tip_commanded"] - 1.0,
+          f"tip={result.get('tip_achieved')} of {result.get('tip_commanded')} "
+          f"reachable, {result.get('tip_requested')} asked")
     check("it came back level", ok and result["residual_tilt"] < 5.0,
           f"residual={result.get('residual_tilt')}")
 
@@ -743,13 +748,11 @@ def test_dump_verifies_the_return_to_level():
     skill = make(DumpSkill, vision, arm)
     ok, result = skill.execute({"target_container": "cup",
                                 "tool_offset": [0.051, 0.009, 0.028],
-                                "dump_angle_deg": 90.0, "min_tip_deg": 85.0,
-                                "seconds_per_step": 0.0, "hold_duration": 0.0,
-                                "shakes": 0, "step_retries": 4})
+                                "hold_duration": 0.0, "shakes": 0})
     check("dump succeeds", ok, f"{result}")
     check("it keeps retrying until the wrist is actually level",
-          ok and result["residual_tilt"] < 20.0,
-          f"residual={result.get('residual_tilt'):.1f} deg")
+          ok and abs(result["residual_tilt"]) < 20.0,
+          f"residual={result.get('residual_tilt')} deg")
 
 
 def test_dump_accepts_explicit_coordinates():
@@ -760,8 +763,7 @@ def test_dump_accepts_explicit_coordinates():
     skill = make(DumpSkill, vision, arm)
     ok, result = skill.execute({"target_container": [0.52, -0.08, 0.10],
                                 "tool_offset": [0.051, 0.009, 0.028],
-                                "seconds_per_step": 0.0, "hold_duration": 0.0,
-                                "shakes": 0})
+                                "hold_duration": 0.0, "shakes": 0})
     check("dump succeeds with nothing segmentable", ok, f"{result}")
     # clear_cache IS called once at the end — the target's contents changed.
     # What must not happen is a segmentation pass.
@@ -770,11 +772,14 @@ def test_dump_accepts_explicit_coordinates():
     check("it is logged as a coordinate dump",
           ok and result["dumped_into"] == "coordinates",
           f"{result.get('dumped_into')}")
-    check("it tipped past vertical", ok and result["tip_achieved"] > 90.0,
-          f"{result.get('tip_achieved')}")
+    check("it tipped as far as the arm reaches",
+          ok and result["tip_achieved"] >= result["tip_commanded"] - 1.0,
+          f"{result.get('tip_achieved')} of {result.get('tip_commanded')}")
+    check("it went home first, though no scan was needed",
+          arm.resets >= 1, f"{arm.resets} reset_joints calls")
 
     ok2, r2 = make(DumpSkill, vision, FakeArm(gripper_width=0.03)).execute(
-        {"target_container": [0.52, -0.08], "seconds_per_step": 0.0})
+        {"target_container": [0.52, -0.08]})
     check("a 2-value coordinate is rejected with a clear message",
           not ok2 and "x, y, z" in r2.get("error", ""), f"{r2.get('error')}")
 
@@ -787,7 +792,7 @@ def test_dump_fails_if_the_wrist_cannot_invert():
     skill = make(DumpSkill, vision, arm)
     ok, result = skill.execute({"target_container": "cup",
                                 "tool_offset": [0.051, 0.009, 0.028],
-                                "seconds_per_step": 0.0, "shakes": 0})
+                                "shakes": 0})
     check("dump fails when the wrist stalls", not ok, f"{result}")
     check("the failure says the powder did not come out",
           "come out" in result.get("error", "").lower(),
@@ -803,7 +808,7 @@ def test_dump_accepts_a_wrist_that_stalls_near_90():
     class CappedWristArm(FakeArm):
         """Tracks orientation fine up to CAP degrees, then refuses to go on."""
 
-        CAP = 89.0
+        CAP = 72.0
 
         def goto_pose(self, pose, duration=3.0, use_impedance=True, block=True):
             # Clamp rather than refuse: the real wrist partially tracks an
@@ -822,12 +827,10 @@ def test_dump_accepts_a_wrist_that_stalls_near_90():
     skill = make(DumpSkill, vision, arm)
     ok, result = skill.execute({"target_container": "cup",
                                 "tool_offset": [0.051, 0.009, 0.028],
-                                "dump_angle_deg": 120.0, "min_tip_deg": 85.0,
-                                "seconds_per_step": 0.0, "hold_duration": 0.0,
-                                "shakes": 1})
-    check("a wrist capped at 89 deg still counts as dumped", ok, f"{result}")
+                                "hold_duration": 0.0, "shakes": 1})
+    check("a wrist capped at 72 deg still counts as dumped", ok, f"{result}")
     check("and reports the angle it actually reached",
-          ok and 80.0 < result["tip_achieved"] < 95.0,
+          ok and 68.0 < result["tip_achieved"] < 76.0,
           f"{result.get('tip_achieved')}")
     # Succeeding BELOW the commanded angle is the allowance working: the bowl
     # emptied, the wrist simply could not go as far as asked.
@@ -841,7 +844,7 @@ def test_dump_accepts_a_wrist_that_stalls_near_90():
     arm2.CAP = 40.0
     ok2, r2 = make(DumpSkill, vision, arm2).execute(
         {"target_container": "cup", "tool_offset": [0.051, 0.009, 0.028],
-         "min_tip_deg": 85.0, "seconds_per_step": 0.0, "shakes": 0})
+         "shakes": 0})
     check("a wrist capped at 40 deg still fails", not ok2, f"{r2}")
 
 

@@ -203,9 +203,10 @@ CATALOG: Dict[str, SkillSpec] = {
         params=[
             Param("target_container", "string", "Where the powder goes.", required=True),
             Param("dump_angle_deg", "number",
-                  "How far past level to tip, nose-down. Vertical empties the bowl and "
-                  "keeps the wrist well inside its travel; the shake at the end clears "
-                  "the powder that stands on the lead wall at exactly 90.", default=90.0),
+                  "How far past level to tip, nose-down, straight ahead. The skill "
+                  "stops short of it when the arm cannot reach that far with the bowl "
+                  "held over the target (about 70 over a cup 0.54 m from the base) and "
+                  "says so; the shake at the end clears what clings.", default=90.0),
             Param("tool_offset", "list",
                   "[x, y, z] from the grasp point to the bowl, tool frame, metres. As "
                   "for 'scoop': pass the measurement stated with the gripper contents.",

@@ -4,31 +4,29 @@ Dump Skill
 Empties a loaded scoop into a target container, pouring from JUST above the
 rim with the bowl held over the opening the whole time:
 
-1. Find the target where the arm already is -- no trip home with a loaded
-   scoop.
-2. Carry the bowl straight to just above the target's rim, still cupped the
-   way scoop left it, turning the wrist on the way to the heading it tips at.
-3. Tip nose-down to ~90 degrees in ONE continuous motion. The bowl's centre
+1. Go home (still holding the loaded scoop) and scan the target from there,
+   with the cameras clear.
+2. Carry the bowl straight to just above the target's rim, cupped the way
+   scoop left it, pointing straight ahead as it did at home -- no turn.
+3. Tip nose-down, straight ahead, in ONE continuous motion. The bowl's centre
    stays fixed over the opening; only its height changes, so that the spoon's
    lowest point stays a set clearance above the rim at every angle.
 4. Hold, shake loose what clings, tip back level, lift straight up.
 
-Why, from the first simulated run of the previous dump (2026-09-23): it went
-home to scan, came back 6 cm over the rim and stepped the tip to 120 degrees
-in 30 degree increments. Past ~70 degrees the wrist could not hold the bowl in
-place -- it drifted up to 80 mm toward the base -- and 11% of the powder fell
-outside the cup.
+How far it tips is limited by REACH, not by the wrist. Tipping a forward-
+pointing bowl nose-down turns the gripper back toward the robot, so the wrist
+has to sit beyond the cup and fold back over it. Over the paper cup, 0.54 m
+from the base, the Panda runs out of arm at about 71 degrees: 300 random IK
+seeds found no way at all to hold 80 or 90 there (2026-09-24). A cup at 0.50 m
+allows ~86 degrees, at 0.45 m past 110. So the tip stops where the arm can
+still hold the bowl in place (see ``_wrist_reach``), and says so, rather than
+reaching for ``dump_angle_deg`` and dragging the bowl -- and the powder --
+back toward the base, which is what the first version of this skill did: 80 mm
+of drift and 11% of the powder outside the cup.
 
-The drift was the HEADING the bowl tipped at, not the tip angle alone. With the
-bowl pointing away from the base, tipping it nose-down past vertical points
-the gripper back at the robot, which the Panda cannot do over the bench. An IK
-sweep of headings over the paper cup and the beaker (2026-09-23) found every
-heading from +60 to +150 degrees counterclockwise of "away from the base"
-reaches 90 degrees with joint travel to spare; pointing the bowl AT the base
-is worse than away (joint 5 hits its stop). Checking the whole arm against
-the bench narrowed it: at +90 the forearm swings into the neighbouring beaker
-a few degrees past vertical, while +60 keeps every link 25 mm or more from
-everything up to 105 degrees, over both targets. Hence ``dump_heading_deg``.
+Turning the bowl sideways (``dump_heading_deg``) buys the full 90 degrees
+anywhere on the bench, at the cost of a wrist turn on the way over; +60 was the
+heading that also kept the forearm clear of the neighbouring beaker.
 
 The bowl hangs on a cranked handle 40 mm from the TCP, so every pose here is
 solved for the BOWL and the TCP put wherever that requires -- see
@@ -56,16 +54,42 @@ def _tilt_about(level: np.ndarray, rotation: np.ndarray) -> float:
     return float(np.degrees(np.arctan2(rel[2, 0], rel[0, 0])))
 
 
+# Panda geometry for the reach check, base frame. Joint 2 (the shoulder) is
+# 0.333 m up. Joint 7's axis runs through the TCP and 0.2104 m behind it (the
+# 0.107 m flange plus the Franka hand's 0.1034 m), and joint 6's axis sits
+# 0.088 m off joint 7's, in whichever direction joint 7 turns it.
+PANDA_SHOULDER = np.array([0.0, 0.0, 0.333])
+PANDA_J7_BEHIND_TCP = 0.2104
+PANDA_J6_OFFSET = 0.088
+#: Furthest joint 6 can get from the shoulder with the elbow as straight as
+#: joint 4 allows. Every nose-down limit the sim's IK found sat right on it:
+#: 71 deg at 0.54 m, 86 deg at 0.50 m, 114 deg at 0.45 m all needed
+#: 0.717-0.719 m.
+PANDA_REACH = 0.718
+
+
+def _wrist_reach(tcp: np.ndarray, rotation: np.ndarray) -> float:
+    """
+    How far from the shoulder joint 6 has to be for this TCP pose, metres,
+    with joint 7 turned to bring it as close as possible.
+    """
+    z = np.asarray(rotation, dtype=float)[:, 2]
+    v = np.asarray(tcp, dtype=float) - PANDA_J7_BEHIND_TCP * z - PANDA_SHOULDER
+    along = float(v @ z)
+    across = float(np.linalg.norm(v - along * z))
+    return float(np.hypot(along, across - PANDA_J6_OFFSET))
+
+
 class DumpSkill(BaseSkill):
     """
     Tip a loaded scoop out into a target container.
 
     Pipeline:
     1. Record held width; the scoop must survive the whole motion
-    2. Locate the target from where the arm is (home only if it cannot be seen)
-    3. Carry the bowl to just above the target rim, cupped, turning to the
-       tip heading on the way
-    4. Tip to dump_angle_deg in one motion, bowl centre fixed over the opening
+    2. Home, and locate the target from there
+    3. Carry the bowl to just above the target rim, cupped, pointing ahead
+    4. Tip straight ahead in one motion, bowl centre fixed over the opening,
+       to dump_angle_deg or as far as the arm can reach, whichever is less
     5. Hold, shake, tip back level, lift
     """
 
@@ -81,13 +105,15 @@ class DumpSkill(BaseSkill):
     @property
     def optional_params(self) -> Dict[str, Any]:
         return {
-            # How far past level to tip, nose-down. Vertical is enough to pour
-            # and keeps the wrist well inside its travel. The bowl holds a
-            # little powder on its lead wall at exactly vertical (a powder
-            # stands at its angle of repose); the shake is for that.
+            # How far past level to tip, nose-down. Vertical is enough to pour.
+            # Straight ahead, the arm's reach caps it first unless the target
+            # is close to the base (~71 deg over a cup 0.54 m out); the tip
+            # then stops at the cap -- see the module docstring.
             "dump_angle_deg": 90.0,
             # Below this the bowl has not tipped far enough to count as dumped.
-            "min_tip_deg": 75.0,
+            "min_tip_deg": 60.0,
+            # Keep joint 6 this much short of PANDA_REACH when capping the tip.
+            "reach_margin": 0.006,
             # Tilt the bowl is carried at, nose-UP: cupping the load, the way
             # scoop's exit leaves it (its cup_tilt_deg).
             "carry_tilt_deg": -15.0,
@@ -95,13 +121,13 @@ class DumpSkill(BaseSkill):
             # at every tilt. Small on purpose: powder poured from high
             # scatters, and the rim estimate is good to a few millimetres.
             "rim_clearance": 0.010,
-            # Which way the bowl points while it tips, degrees counterclockwise
-            # (seen from above) of the direction from the robot base to the
-            # target. 0 = pointing away from the base, which cannot tip past
-            # ~70 deg over the bench. 60 keeps the forearm clear of the
-            # neighbouring containers; at 90 it swings into the beaker a few
-            # degrees past vertical.
-            "dump_heading_deg": 60.0,
+            # Which way the bowl points while it tips. None: straight ahead, as
+            # the wrist points at home -- no turn on the way over. A number
+            # turns it that many degrees counterclockwise (seen from above) of
+            # the direction from the robot base to the target: 60 reaches the
+            # full 90 deg anywhere on the bench and keeps the forearm clear of
+            # the neighbouring beaker; at 90 the forearm hits it past ~95 deg.
+            "dump_heading_deg": None,
             # --- timing (each divided by the arm's speed) -----------------
             "transfer_seconds": 5.0,
             "tip_seconds": 4.0,
@@ -110,7 +136,7 @@ class DumpSkill(BaseSkill):
             # the dump angle shift far more than a longer hold does.
             "shakes": 2,
             "shake_deg": 12.0,
-            "shake_seconds": 0.4,       # per half swing
+            "shake_seconds": 0.6,       # per half swing
             "return_seconds": 3.0,
             # Final lift: the spoon's lowest point this far above the rim.
             "lift_height": 0.10,
@@ -118,10 +144,10 @@ class DumpSkill(BaseSkill):
             "transfer_waypoints": 20,
             "tip_waypoints": 24,
             # --- finding the target ---------------------------------------
-            # The previous dump always homed to scan, carrying a loaded scoop
-            # there and back. Now it looks from where it is and homes only if
-            # the target cannot be seen from there.
-            "home_first": False,
+            # Go home before dumping (and scan the target from there, cameras
+            # clear). False: start from wherever scoop left the arm, scanning
+            # from there and homing only if the target cannot be seen.
+            "home_first": True,
             "home_if_unseen": True,
             "reset_before_scan": True,   # how clear_cameras gets out of the way
             # SAM category to search when the target is identified by a
@@ -167,7 +193,7 @@ class DumpSkill(BaseSkill):
         return True, "Preconditions met"
 
     # ---------------------------------------------------------------- target
-    def _find_target(self, target, params) -> Tuple[Any, str]:
+    def _find_target(self, target, params, homed: bool) -> Tuple[Any, str]:
         """(rim_center, rim_z, rim_radius) and how it was found, or (None, why)."""
         if isinstance(target, (list, tuple, np.ndarray)):
             coords = np.asarray(target, dtype=float)
@@ -179,9 +205,7 @@ class DumpSkill(BaseSkill):
             return (coords[:2], float(coords[2]), None), "coordinates"
 
         category = params.get("container_category")
-        if bool(params["home_first"]):
-            if not self.clear_cameras(params, tag="Dump"):
-                return None, "Failed to clear the cameras before scanning"
+        if homed:
             located = self.locate_container(target, force_refresh=True,
                                             category=category)
             how = "scan from home"
@@ -215,6 +239,7 @@ class DumpSkill(BaseSkill):
         clearance = float(params["rim_clearance"])
         tip_tol = float(params["tip_tol_deg"])
         min_tip = float(params["min_tip_deg"])
+        reach_limit = PANDA_REACH - float(params["reach_margin"])
         hover_tol = float(params["hover_tol"])
         tool_offset = self.resolve_tool_offset(params)
 
@@ -222,8 +247,19 @@ class DumpSkill(BaseSkill):
         start_width = self.held_width()
         print(f"[Dump] Holding scoop at {start_width * 1000:.1f}mm")
 
-        # 1. Where the target is, without a trip home if it can be helped.
-        found, how = self._find_target(target, params)
+        # 1. Home first, still holding the loaded scoop, so every dump starts
+        # from the same pose -- and the scan has the cameras clear.
+        homed = False
+        if bool(params["home_first"]):
+            print("[Dump] Back to home first, still holding the scoop...")
+            if not self.go_home():
+                return False, {"error": "Failed to go home before dumping"}
+            self.wait(0.4)
+            homed = True
+            ok, msg = self.check_still_holding(start_width, tag="Dump")
+            if not ok:
+                return False, {"error": f"Lost the scoop while homing: {msg}"}
+        found, how = self._find_target(target, params, homed)
         if found is None:
             return False, {"error": how}
         rim_center, rim_z, rim_radius = found
@@ -250,15 +286,20 @@ class DumpSkill(BaseSkill):
             [bottom[0] + sx * length / 2, bottom[1] + sy * width / 2, bottom[2] - dz]
             for sx in (-1, 1) for sy in (-1, 1) for dz in (0.0, depth)])
 
-        # The heading to tip at, reached by the shorter turn from the wrist's.
+        # The heading to tip at: straight ahead as the wrist points now, or a
+        # set turn from the radial, reached the shorter way round.
         now = self.get_current_pose()
         tcp_now = np.asarray(now.translation, dtype=float)
         R_now = _orthonormalize(np.asarray(now.rotation, dtype=float))
         heading_now = float(np.arctan2(R_now[1, 0], R_now[0, 0]))
         tilt_now = _tilt_about(_level(heading_now), R_now)
-        radial = float(np.arctan2(site[1], site[0]))
-        want = radial + np.radians(float(params["dump_heading_deg"]))
-        turn = float((want - heading_now + np.pi) % (2 * np.pi) - np.pi)
+        heading_rel = params.get("dump_heading_deg")
+        if heading_rel is None:
+            turn = 0.0
+        else:
+            radial = float(np.arctan2(site[1], site[0]))
+            want = radial + np.radians(float(heading_rel))
+            turn = float((want - heading_now + np.pi) % (2 * np.pi) - np.pi)
         heading = heading_now + turn
         level = _level(heading)
 
@@ -310,8 +351,33 @@ class DumpSkill(BaseSkill):
         def centres_for(tilts):
             return [pose_at(t)[0] + rotation_at(t) @ centre_tool for t in tilts]
 
-        # 3. Carry the bowl straight to just above the rim, cupped, turning to
-        # the tip heading on the way. One motion from the scoop's exit.
+        # How far the arm can tip here while still holding the bowl in place.
+        # Past this the wrist cannot stay behind the bowl, and the bowl -- and
+        # the powder -- gets dragged back toward the base instead.
+        tip_to = carry
+        for a in np.arange(carry, dump_angle + 1e-6, 1.0):
+            if _wrist_reach(*pose_at(float(a))) > reach_limit:
+                break
+            tip_to = float(a)
+        if tip_to < dump_angle - 0.5:
+            reach_r = float(np.linalg.norm(site))
+            print(f"[Dump] NOTE: pointing this way the arm can only tip to "
+                  f"{tip_to:.0f}° with the bowl held over '{target}' "
+                  f"({reach_r:.2f} m from the base); stopping there instead of "
+                  f"{dump_angle:.0f}°. Closer to the base, or a sideways "
+                  f"dump_heading_deg, reaches further.")
+        if tip_to < min_tip:
+            return False, {
+                "error": (f"'{target}' is out of reach for a dump: the arm can "
+                          f"tip only {tip_to:.0f}° over it pointing this way, "
+                          f"short of min_tip_deg={min_tip:.0f}°. Move it closer "
+                          f"to the base, or pass dump_heading_deg (60 reaches "
+                          f"90° across the bench)."),
+                "tip_reachable": tip_to,
+            }
+
+        # 3. Carry the bowl straight to just above the rim, cupped, still
+        # pointing ahead (or turning to dump_heading_deg on the way).
         start_tcp, start_R = pose_at(carry)
         start_centre = start_tcp + start_R @ centre_tool
         centre_now = tcp_now + R_now @ centre_tool
@@ -327,9 +393,11 @@ class DumpSkill(BaseSkill):
                 c[2] = centre_now[2] + rise * min(1.0, 2.0 * f)
             centres.append(c)
         print(f"[Dump] Carrying the bowl {np.linalg.norm(start_centre[:2] - centre_now[:2]) * 1000:.0f}mm "
-              f"to over the rim, turning the wrist {np.degrees(turn):+.0f}° to a "
-              f"{float(params['dump_heading_deg']):+.0f}° heading, lowest point "
-              f"{clearance * 1000:.0f}mm above the rim...")
+              f"to over the rim, "
+              + ("pointing straight ahead" if heading_rel is None else
+                 f"turning the wrist {np.degrees(turn):+.0f}° to a "
+                 f"{float(heading_rel):+.0f}° heading")
+              + f", lowest point {clearance * 1000:.0f}mm above the rim...")
         if not run_path(tilt_now + (carry - tilt_now) * fracs,
                         heading_now + turn * fracs, centres,
                         float(params["transfer_seconds"]), "carry"):
@@ -343,17 +411,17 @@ class DumpSkill(BaseSkill):
         record("arrived")
 
         # 4. Tip, in one motion, the bowl centre fixed over the opening.
-        tilts = np.linspace(carry, dump_angle, max(2, int(params["tip_waypoints"])) + 1)[1:]
-        print(f"[Dump] Tipping {carry:+.0f}° -> {dump_angle:+.0f}° over "
+        tilts = np.linspace(carry, tip_to, max(2, int(params["tip_waypoints"])) + 1)[1:]
+        print(f"[Dump] Tipping {carry:+.0f}° -> {tip_to:+.0f}° over "
               f"{float(params['tip_seconds']):.1f}s, bowl held over the rim...")
         if not run_path(tilts, [heading] * len(tilts), centres_for(tilts),
                         float(params["tip_seconds"]), "tip"):
             return False, {"error": "Failed to command the tip"}
         achieved = _tilt_about(level, bowl_now()[1])
-        if achieved < dump_angle - tip_tol:
-            print(f"[Dump]   tipped {achieved:.1f}° of {dump_angle:.0f}°; "
+        if achieved < tip_to - tip_tol:
+            print(f"[Dump]   tipped {achieved:.1f}° of {tip_to:.0f}°; "
                   f"commanding the last pose again")
-            final_tcp, final_R = pose_at(dump_angle)
+            final_tcp, final_R = pose_at(tip_to)
             self.goto_pose_rigid(final_tcp, final_R, duration=1.5)
             achieved = _tilt_about(level, bowl_now()[1])
         tipped_drift = record("tipped")
@@ -364,11 +432,11 @@ class DumpSkill(BaseSkill):
             back_tcp, back_R = pose_at(carry)
             self.goto_pose_rigid(back_tcp, back_R, duration=3.0)
             return False, {
-                "error": (f"Tip stalled at {achieved:.1f}° of {dump_angle:.0f}°, "
+                "error": (f"Tip stalled at {achieved:.1f}° of {tip_to:.0f}°, "
                           f"short of min_tip_deg={min_tip:.0f}° -- the bowl never "
                           f"got far enough over for the powder to come out"),
                 "tip_achieved": achieved,
-                "tip_commanded": dump_angle,
+                "tip_commanded": tip_to,
             }
 
         # 5. Hold, then shake -- swinging back from the dump angle only, so the
@@ -376,19 +444,23 @@ class DumpSkill(BaseSkill):
         hold = float(params["hold_duration"])
         print(f"[Dump] Holding {hold:.1f}s at {achieved:.1f}°...")
         self.wait(hold)
-        top = min(dump_angle, achieved)
+        top = min(tip_to, achieved)
         shakes = max(0, int(params["shakes"]))
         shake_deg = abs(float(params["shake_deg"]))
         if shakes and shake_deg > 0.5:
             print(f"[Dump] Shaking {shakes}x {top - shake_deg:.0f}°<->{top:.0f}° "
                   f"to dislodge...")
-            seq = []
+            # Each half swing is its own motion, starting and ending at rest.
+            # Strung into one path, the swings reverse at speed and the servos
+            # overshoot: the bowl lurched 9 mm off target and to within 3.5 mm
+            # of the rim, with the arm near full reach (sim, 2026-09-24).
+            swing_s = float(params["shake_seconds"])
             for _ in range(shakes):
                 for a, b in ((top, top - shake_deg), (top - shake_deg, top)):
-                    seq.extend(np.linspace(a, b, 5)[1:])
-            if not run_path(seq, [heading] * len(seq), centres_for(seq),
-                            float(params["shake_seconds"]) * 2 * shakes, "shake"):
-                print("[Dump]   shake failed; carrying on")
+                    seg = list(np.linspace(a, b, 5)[1:])
+                    if not run_path(seg, [heading] * len(seg), centres_for(seg),
+                                    swing_s, "shake"):
+                        print("[Dump]   shake failed; carrying on")
             record("shaken")
 
         # 6. Back to level over the rim, and CHECK: an unverified return once
@@ -439,9 +511,11 @@ class DumpSkill(BaseSkill):
             "rim_z": rim_z,
             "rim_radius": rim_radius,
             "heading_deg": float(np.degrees(heading)),
-            "dump_heading_deg": float(params["dump_heading_deg"]),
+            "dump_heading_deg": heading_rel,
             "wrist_turn_deg": float(np.degrees(turn)),
-            "tip_commanded": dump_angle,
+            "tip_requested": dump_angle,
+            "tip_commanded": tip_to,
+            "tip_capped_by_reach": tip_to < dump_angle - 0.5,
             "tip_achieved": achieved,
             "rim_clearance": clearance,
             "bowl_drift_mm": {k: round(v * 1000, 1) for k, v in drift.items()},
