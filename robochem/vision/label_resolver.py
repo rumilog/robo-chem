@@ -86,6 +86,10 @@ SAM_PROMPT_ALIASES = {
     # robomail_Aliyah's robot profile names this position "measuring scoop";
     # the bench object it refers to is the same printed tool.
     "measuring scoop": "white plastic tool",
+    # The exemplar library used this as the object name. With DINOv2 unloaded
+    # it has to be the phrase SAM 3 was swept against, not the word "scoop"
+    # (2/4 cameras on 2026-09-18).
+    "scoop": "white plastic tool",
 }
 
 
@@ -146,7 +150,7 @@ def labels_match(requested: str, observed: str) -> bool:
 # query, never a reagent label. Unlike "cup"/"beaker", these never appear
 # in "cup labeled X" phrasing, so matching on the word alone is safe.
 _DIRECT_SAM_KEYWORDS = {"spoon", "scoop", "pipette", "dropper", "stirrer",
-                        "stirring", "spatula"}
+                        "stirring", "spatula", "cube", "cylinder"}
 
 
 def looks_like_label_query(object_name: str) -> bool:
@@ -292,6 +296,72 @@ Use null for label only if you can read nothing at all. Include every id from
     return _parse_cup_labels(text, n)
 
 
+def _same_container(box, other_box) -> bool:
+    """A second SAM mask of this cup, not the cup next to it.
+
+    Overlap of the smaller box. 0.5 is a duplicate sitting on the same
+    plastic; neighbouring cups on this bench do not overlap that much.
+    """
+    ax1, ay1, ax2, ay2 = box
+    bx1, by1, bx2, by2 = other_box
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0:
+        return False
+    area_a = max(1.0, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1.0, (bx2 - bx1) * (by2 - by1))
+    return inter / min(area_a, area_b) >= 0.5
+
+
+def _paper_sheet_box(image_bgr: np.ndarray, x1, y1, x2, y2):
+    """Bounds of the white sheet this container is standing on, or None.
+
+    The handwriting sits on the paper, not on the plastic. A pad of 0.9x the
+    cup box on 2026-09-25 stopped at y=331 on camera 2 while ``B 10 ML WATER``
+    runs down the sheet in front of the cup, so the reader was shown a sliver
+    of ``10 ML`` and returned null. Follow the sheet instead of growing the
+    pad in every direction, which is what pulled in the neighbour's label.
+    """
+    h, w = image_bgr.shape[:2]
+    bw = max(1.0, x2 - x1)
+    bh = max(1.0, y2 - y1)
+    # Further in front of the cup (larger y) than behind it. Camera 4's
+    # writing sits above the box, so the upward search is not zero.
+    a = int(max(0, x1 - 1.4 * bw))
+    b = int(min(w, x2 + 1.4 * bw))
+    c = int(max(0, y1 - 1.8 * bh))
+    d = int(min(h, y2 + 3.0 * bh))
+    if b - a < 4 or d - c < 4:
+        return None
+    roi = image_bgr[c:d, a:b]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    white = ((hsv[:, :, 1] < 70) & (hsv[:, :, 2] > 145)).astype(np.uint8) * 255
+    # Handwriting splits one sheet into several blobs. Bridge those gaps
+    # without bridging the brown table between two sheets.
+    white = cv2.dilate(white, np.ones((9, 9), np.uint8), iterations=2)
+    n, _labels, stats, _ = cv2.connectedComponentsWithStats(white, 8)
+    search = float((b - a) * (d - c))
+    fx1, fy1, fx2, fy2 = x1 - a, y1 - c, x2 - a, y2 - c
+    best = None
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < 400 or area > 0.65 * search:
+            continue
+        bx, by, bw_, bh_, _ = [int(v) for v in stats[i]]
+        ix1, iy1 = max(bx, fx1), max(by, fy1)
+        ix2, iy2 = min(bx + bw_, fx2), min(by + bh_, fy2)
+        overlap = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        under = (by <= fy2 + 20 and bx < fx2 and bx + bw_ > fx1 and by + bh_ > fy2 - 5)
+        if overlap < 30 and not under:
+            continue
+        if best is None or area > best[0]:
+            best = (area, a + bx, c + by, a + bx + bw_, c + by + bh_)
+    if best is None:
+        return None
+    return best[1:]
+
+
 def crop_around_instance(image_bgr: np.ndarray, inst: dict,
                          pad_scale: float = 0.9, min_pad: int = 30,
                          neighbours: Optional[List[dict]] = None) -> np.ndarray:
@@ -312,9 +382,10 @@ def crop_around_instance(image_bgr: np.ndarray, inst: dict,
     But padding that reaches the neighbour's paper recreates the bug in a new
     form. At 1.8x the box, three of four cameras returned the SAME label for
     two different cups — a real label, read accurately, belonging to the cup
-    next door. So the padding is now tight, and any neighbouring container in
-    range is greyed out: whatever paper it is standing on stops looking like a
-    candidate.
+    next door. So the padding stays tight, and the crop is then extended only
+    to the white sheet this container is standing on. Any neighbouring
+    container in range is greyed out. A second mask of THIS container is not:
+    on camera 2 that duplicate covered the only visible line of the label.
     """
     h, w = image_bgr.shape[:2]
     x1, y1, x2, y2 = _ensure_box(inst, h, w)
@@ -322,7 +393,22 @@ def crop_around_instance(image_bgr: np.ndarray, inst: dict,
     half_w = max((x2 - x1) * pad_scale, min_pad)
     half_h = max((y2 - y1) * pad_scale, min_pad)
     a = int(max(0, cx - half_w)); b = int(min(w, cx + half_w))
-    c = int(max(0, cy - half_h)); d = int(min(h, cy + half_h))
+    # Almost no pad behind the cup. On camera 2 the sheet behind it is a
+    # different reagent, and a few pixels of that paper made the reader
+    # call this cup "A 10 ML WATER".
+    c = int(max(0, y1 - 12))
+    d = int(min(h, cy + half_h))
+    sheet = _paper_sheet_box(image_bgr, x1, y1, x2, y2)
+    if sheet is not None:
+        sx1, _sy1, sx2, sy2 = sheet
+        margin = 8
+        # Sideways and in front of the cup only. Following the sheet upward
+        # on camera 2 reached the citric acid paper behind the clear cup, and
+        # the reader returned "B 5 ML NaCl" for a crop that also contains
+        # "B 10 ML WATER".
+        a = int(max(0, min(a, sx1 - margin)))
+        b = int(min(w, max(b, sx2 + margin)))
+        d = int(min(h, max(d, sy2 + margin)))
     crop = image_bgr[c:d, a:b].copy()
 
     # Grey out any OTHER container caught in the crop, along with a margin
@@ -331,6 +417,8 @@ def crop_around_instance(image_bgr: np.ndarray, inst: dict,
         if other is inst:
             continue
         ox1, oy1, ox2, oy2 = _ensure_box(other, h, w)
+        if _same_container((x1, y1, x2, y2), (ox1, oy1, ox2, oy2)):
+            continue
         if ox2 < a or ox1 > b or oy2 < c or oy1 > d:
             continue                      # not in this crop at all
         m = 18
@@ -448,6 +536,17 @@ def _parse_cup_labels(text: str, n: int) -> List[Optional[str]]:
     return labels
 
 
+def _same_cup_masks(matches) -> bool:
+    """True when every match is another mask of the first, not a second cup."""
+    boxes = []
+    for inst, _lab, _score in matches:
+        box = inst.get("box")
+        if box is None or len(box) != 4:
+            return False
+        boxes.append(tuple(float(v) for v in box))
+    return all(_same_container(boxes[0], other) for other in boxes[1:])
+
+
 def pick_matching_instance(
     instances: List[dict],
     labels: List[Optional[str]],
@@ -471,11 +570,12 @@ def pick_matching_instance(
         print(f"[LabelResolver] AMBIGUOUS: {requested!r} matches "
               f"{sorted(distinct)} — be more specific, or the wrong container "
               f"may be used")
-    elif len(matches) > 1:
+    elif len(matches) > 1 and not _same_cup_masks(matches):
         # Same label on two containers means the crop reached the neighbour's
         # paper: one of these is standing somewhere else entirely. Picking the
         # higher-scoring mask here is a coin flip, and on 2026-09-21 it landed
-        # on a cup 31cm away.
+        # on a cup 31cm away. Two masks of one cup (camera 2, 2026-09-25)
+        # are not that case.
         print(f"[LabelResolver] DUPLICATE: {len(matches)} containers all read "
               f"as {matches[0][1]!r}. Only one can be right — the crop has "
               f"probably picked up a neighbouring label. Position from this "

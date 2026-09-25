@@ -10,6 +10,8 @@ can invoke. Skills follow a consistent interface:
 5. Post-conditions check
 """
 
+import numpy as np
+
 from .base_skill import BaseSkill
 
 # Manipulation skills
@@ -109,6 +111,10 @@ class SkillsExecutor:
         self._skill_instances = {}
         #: object name -> where pick_up took it from, for "put it back".
         self.pick_sites = {}
+        # Where the TCP was when each remembered object was grasped. Putting
+        # the TCP back there re-seats a tool exactly as it sat (the stirrer in
+        # its holder); the centroid alone is only the mean of what was visible.
+        self.pick_grasps = {}
     
     def list_skills(self) -> list:
         """
@@ -183,7 +189,12 @@ class SkillsExecutor:
         if not name or centroid is None:
             return
         site = list(centroid)
-        self.pick_sites[str(name).strip().lower()] = site
+        key = str(name).strip().lower()
+        self.pick_sites[key] = site
+        grasp = result.get("grasp_pose")
+        if grasp is not None:
+            self.pick_grasps[key] = [float(v) for v in
+                                     np.asarray(grasp, dtype=float)[:3, 3]]
         print(f"[Skills] Noted where '{name}' was picked from: "
               f"[{site[0]:.4f}, {site[1]:.4f}, {site[2]:.4f}] — "
               f"place it back by name")
@@ -200,6 +211,9 @@ class SkillsExecutor:
             return params           # a real scene object: let vision find it
         resolved = dict(params)
         resolved["target_location"] = list(site)
+        grasp = self.pick_grasps.get(target.strip().lower())
+        if grasp is not None and resolved.get("pick_grasp_tcp") is None:
+            resolved["pick_grasp_tcp"] = list(grasp)
         print(f"[Skills] '{target}' is the tool in the gripper, so it cannot be "
               f"seen on the bench; placing it back at the site it was picked "
               f"from: [{site[0]:.4f}, {site[1]:.4f}, {site[2]:.4f}]")

@@ -11,7 +11,11 @@ rim with the bowl held over the opening the whole time:
 3. Tip nose-down, straight ahead, in ONE continuous motion. The bowl's centre
    stays fixed over the opening; only its height changes, so that the spoon's
    lowest point stays a set clearance above the rim at every angle.
-4. Hold, shake loose what clings, tip back level, lift straight up.
+4. Hold, shake by tipping back then forwards again, tip back level, lift.
+   A pose that is not actually reached goes to reset_joints, still holding
+   the scoop. Straight ahead the wrist stops near 79° (78.8° on 2026-09-25
+   over B 10 ml water); that is the default dump_angle_deg. Commanding 90°
+   seated the stop and the shake then measured 78.8° -> 78.8°.
 
 How far it tips is limited by REACH, not by the wrist. Tipping a forward-
 pointing bowl nose-down turns the gripper back toward the robot, so the wrist
@@ -109,7 +113,7 @@ class DumpSkill(BaseSkill):
             # Straight ahead, the arm's reach caps it first unless the target
             # is close to the base (~71 deg over a cup 0.54 m out); the tip
             # then stops at the cap -- see the module docstring.
-            "dump_angle_deg": 90.0,
+            "dump_angle_deg": 79.0,
             # Below this the bowl has not tipped far enough to count as dumped.
             "min_tip_deg": 60.0,
             # Keep joint 6 this much short of PANDA_REACH when capping the tip.
@@ -186,7 +190,7 @@ class DumpSkill(BaseSkill):
             return False, ("Gripper is not holding anything. Pick up a scoop "
                            "and scoop something first.")
 
-        angle = float(params.get("dump_angle_deg", 90.0))
+        angle = float(params.get("dump_angle_deg", 79.0))
         if angle < 60.0:
             print(f"[Dump] WARNING: dump_angle_deg={angle:.0f} barely tips the "
                   f"bowl; most of the powder will stay in it.")
@@ -351,6 +355,15 @@ class DumpSkill(BaseSkill):
         def centres_for(tilts):
             return [pose_at(t)[0] + rotation_at(t) @ centre_tool for t in tilts]
 
+        def rest(why: str) -> bool:
+            """Joint-space home. Cartesian goals that miss leave the wrist
+            tipped over the cup; reset_joints does not."""
+            print(f"[Dump] {why} -- reset_joints")
+            if not self.go_home():
+                print("[Dump] reset_joints failed")
+                return False
+            return True
+
         # How far the arm can tip here while still holding the bowl in place.
         # Past this the wrist cannot stay behind the bowl, and the bowl -- and
         # the powder -- gets dragged back toward the base instead.
@@ -401,9 +414,11 @@ class DumpSkill(BaseSkill):
         if not run_path(tilt_now + (carry - tilt_now) * fracs,
                         heading_now + turn * fracs, centres,
                         float(params["transfer_seconds"]), "carry"):
+            rest("Failed to carry the scoop to the target")
             return False, {"error": "Failed to carry the scoop to the target"}
         arrived, err = self.reached(start_tcp, hover_tol)
         if not arrived:
+            rest(f"Bowl stopped {err * 1000:.0f}mm short of the cup")
             return False, {
                 "error": (f"Could not bring the bowl over '{target}' "
                           f"(off by {err * 1000:.0f}mm)"),
@@ -416,21 +431,22 @@ class DumpSkill(BaseSkill):
               f"{float(params['tip_seconds']):.1f}s, bowl held over the rim...")
         if not run_path(tilts, [heading] * len(tilts), centres_for(tilts),
                         float(params["tip_seconds"]), "tip"):
+            rest("Failed to command the tip")
             return False, {"error": "Failed to command the tip"}
         achieved = _tilt_about(level, bowl_now()[1])
         if achieved < tip_to - tip_tol:
-            print(f"[Dump]   tipped {achieved:.1f}° of {tip_to:.0f}°; "
-                  f"commanding the last pose again")
-            final_tcp, final_R = pose_at(tip_to)
-            self.goto_pose_rigid(final_tcp, final_R, duration=1.5)
-            achieved = _tilt_about(level, bowl_now()[1])
+            # Do not re-command the full tip. On 2026-09-25 that 1.5 s push
+            # to 90°, after the arm had already stopped at 77°, seated the
+            # wrist on the joint stop. Every later cartesian goal, including
+            # the shake back to 66°, was then accepted and produced no motion.
+            print(f"[Dump]   tipped {achieved:.1f}° of {tip_to:.0f}° and stopped "
+                  f"there; not pressing further into the stop")
         tipped_drift = record("tipped")
         print(f"[Dump]   measured tip {achieved:.1f}°, bowl "
               f"{tipped_drift * 1000:.1f}mm from over the target")
         if achieved < min_tip:
-            print(f"[Dump] Tip stalled at {achieved:.1f}° -- returning to carry")
-            back_tcp, back_R = pose_at(carry)
-            self.goto_pose_rigid(back_tcp, back_R, duration=3.0)
+            print(f"[Dump] Tip stalled at {achieved:.1f}°")
+            rest(f"Tip stalled at {achieved:.1f}°, short of {min_tip:.0f}°")
             return False, {
                 "error": (f"Tip stalled at {achieved:.1f}° of {tip_to:.0f}°, "
                           f"short of min_tip_deg={min_tip:.0f}° -- the bowl never "
@@ -439,56 +455,118 @@ class DumpSkill(BaseSkill):
                 "tip_commanded": tip_to,
             }
 
-        # 5. Hold, then shake -- swinging back from the dump angle only, so the
-        # wrist never goes further than it just proved it can.
+        # 5. Hold, then shake by tipping BACK along the same arc the pour just
+        # travelled, then FORWARDS to the dump angle again. Not past it: 90°
+        # seated the wrist and a relative tool-Y rock then measured
+        # 78.8° -> 78.8° (2026-09-25). The back pose is one the tip already
+        # reached, so it is not a new goal pressed into the stop.
         hold = float(params["hold_duration"])
         print(f"[Dump] Holding {hold:.1f}s at {achieved:.1f}°...")
         self.wait(hold)
-        top = min(tip_to, achieved)
         shakes = max(0, int(params["shakes"]))
         shake_deg = abs(float(params["shake_deg"]))
+
+        def tilt_now() -> float:
+            return _tilt_about(level, bowl_now()[1])
+
+        def rock(delta_deg: float) -> bool:
+            """Untip by ``delta_deg`` along the dump arc. Used to come back level."""
+            target = tilt_now() - delta_deg
+            return swing_to(target)
+
+        def swing_to(target: float) -> bool:
+            start = tilt_now()
+            n = 4
+            tilts = np.linspace(start, target, n + 1)[1:]
+            seconds = max(1.5, abs(target - start) / 20.0,
+                          float(params["shake_seconds"]))
+            return run_path(tilts, [heading] * len(tilts), centres_for(tilts),
+                            seconds, "shake")
+
+        shook = True
+        homed = False
         if shakes and shake_deg > 0.5:
-            print(f"[Dump] Shaking {shakes}x {top - shake_deg:.0f}°<->{top:.0f}° "
-                  f"to dislodge...")
-            # Each half swing is its own motion, starting and ending at rest.
-            # Strung into one path, the swings reverse at speed and the servos
-            # overshoot: the bowl lurched 9 mm off target and to within 3.5 mm
-            # of the rim, with the arm near full reach (sim, 2026-09-24).
-            swing_s = float(params["shake_seconds"])
+            # Furthest forwards is the angle we actually hold, never past the cap.
+            forward = min(achieved, tip_to)
+            back = forward - shake_deg
+            print(f"[Dump] Shaking {shakes}x: back to {back:.0f}°, "
+                  f"then forwards to {forward:.0f}°...")
+            shook = False
             for _ in range(shakes):
-                for a, b in ((top, top - shake_deg), (top - shake_deg, top)):
-                    seg = list(np.linspace(a, b, 5)[1:])
-                    if not run_path(seg, [heading] * len(seg), centres_for(seg),
-                                    swing_s, "shake"):
-                        print("[Dump]   shake failed; carrying on")
+                before = tilt_now()
+                if not swing_to(back):
+                    print("[Dump]   shake failed; carrying on")
+                    break
+                mid = tilt_now()
+                print(f"[Dump]   {before:.1f}° -> {mid:.1f}°")
+                if before - mid < 3.0:
+                    print("[Dump]   WARNING: the wrist did not tip back, "
+                          "so the shake has nothing to swing.")
+                    break
+                if not swing_to(forward):
+                    print("[Dump]   shake failed; carrying on")
+                    break
+                after = tilt_now()
+                print(f"[Dump]   {mid:.1f}° -> {after:.1f}°")
+                if after - mid < 3.0:
+                    print("[Dump]   WARNING: the wrist did not tip forwards again.")
+                    break
+                shook = True
             record("shaken")
+            if not shook:
+                print("[Dump]   WARNING: the wrist did not shake.")
+                residual = tilt_now()
+                if not rest("Shake did not reach its angle"):
+                    return False, {
+                        "error": "Shake did not reach its angle, and "
+                                 "reset_joints failed",
+                        "tip_achieved": achieved,
+                        "residual_tilt": residual,
+                    }
+                homed = True
 
-        # 6. Back to level over the rim, and CHECK: an unverified return once
-        # left the scoop hanging inverted through the lift (residual 111 deg on
-        # the 2026-09-21 bench run), handing the next skill a tool pointing the
-        # wrong way.
-        print("[Dump] Returning level...")
-        back = np.linspace(top, 0.0, 13)[1:]
-        run_path(back, [heading] * len(back), centres_for(back),
-                 float(params["return_seconds"]), "return")
-        residual = _tilt_about(level, bowl_now()[1])
-        if abs(residual) > tip_tol:
-            level_tcp, level_R = pose_at(0.0)
-            self.goto_pose_rigid(level_tcp, level_R, duration=2.0)
-            residual = _tilt_about(level, bowl_now()[1])
-        print(f"[Dump]   residual tilt {residual:.1f}°")
-        if abs(residual) > tip_tol:
-            print(f"[Dump] WARNING: still {residual:.1f}° from level. The scoop "
-                  f"is lifting away tipped -- re-home before the next skill.")
-        record("level")
-
-        # 7. Straight up, clear of the rim.
-        lift_tcp, lift_R = pose_at(0.0, above_rim=float(params["lift_height"]))
-        print("[Dump] Lifting clear...")
-        if not self.goto_pose_rigid(lift_tcp, lift_R,
-                                    duration=float(params["lift_seconds"])):
-            return False, {"error": "Dumped, but failed to lift clear",
-                           "tip_achieved": achieved}
+        # 6. Unwind the same way, in steps, and CHECK. One cartesian goto from
+        # the stalled pose back to level was accepted on 2026-09-25 and left
+        # the scoop at 77.6°. An unverified return once lifted the scoop still
+        # inverted (residual 111 deg, 2026-09-21). Skipped after a home: the
+        # arm is already in the rest posture.
+        if not homed:
+            residual = tilt_now()
+            print("[Dump] Returning level...")
+            for _ in range(8):
+                if abs(residual) <= tip_tol:
+                    break
+                step = float(np.clip(residual, -20.0, 20.0))
+                before = residual
+                if not rock(+step):
+                    break
+                residual = tilt_now()
+                print(f"[Dump]   {before:.1f}° -> {residual:.1f}°")
+                if before - residual < 2.0:
+                    break
+            print(f"[Dump]   residual tilt {residual:.1f}°")
+            record("level")
+            # A missed pose leaves the wrist out over the cup. Joint-space
+            # home is the recovery; lifting along the failed path is not.
+            if abs(residual) > tip_tol:
+                if not rest(f"Still {residual:.1f}° from level"):
+                    return False, {
+                        "error": (f"Still {residual:.1f}° from level, and "
+                                  f"reset_joints failed"),
+                        "tip_achieved": achieved,
+                        "residual_tilt": residual,
+                    }
+                homed = True
+            if not homed:
+                # 7. Straight up, clear of the rim. Skipped after a home: the
+                # arm is already in the rest posture, still holding the scoop.
+                lift_tcp, lift_R = pose_at(0.0, above_rim=float(params["lift_height"]))
+                print("[Dump] Lifting clear...")
+                if not self.goto_pose_rigid(lift_tcp, lift_R,
+                                            duration=float(params["lift_seconds"])):
+                    rest("Lift did not reach its height")
+                    return False, {"error": "Dumped, but failed to lift clear",
+                                   "tip_achieved": achieved}
 
         ok, msg = self.check_still_holding(start_width, tag="Dump")
         if not ok:
@@ -520,6 +598,7 @@ class DumpSkill(BaseSkill):
             "rim_clearance": clearance,
             "bowl_drift_mm": {k: round(v * 1000, 1) for k, v in drift.items()},
             "residual_tilt": residual,
+            "homed": homed,
             "shakes": shakes,
             "tool_offset": [float(v) for v in tool_offset],
             "bowl_size": [length, width, depth],

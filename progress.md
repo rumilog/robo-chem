@@ -22,26 +22,24 @@ Grounding — **one terminal is enough**, background it:
 scripts/grounding.sh start      # idempotent; restart | status | stop | log
 ```
 
-It has to be its own *process* (perception_env is Python 3.10 for SAM 3 and
-DINOv2; the skills run in the frankapy Python 3.8 venv) but not its own
-*terminal*. `status` also warns when `exemplars/*.npz` are newer than the
-running process.
+It has to be its own *process* (perception_env is Python 3.10 for SAM 3; the
+skills run in the frankapy Python 3.8 venv) but not its own *terminal*.
 
 Still available by hand if preferred:
 
 ```bash
 perception_env/bin/python perception_service/grounding_service.py \
-  --backend sam3 --model weights/sam3.pt
+  --backend sam3 --model weights/sam3.pt --no-exemplars
 ```
 
-**The exemplar library is read once, at startup.** A service left running from
-before an object was registered answers that name by *text* prompting, and the
-failure looks exactly like the object not being on the bench. On 2026-09-25 a
-service running since Sep 9 reported `'scoop' -> no masks` on three cameras
-while `exemplars/scoop.npz` sat unread on disk; `curl -s $GROUNDING_URL/health`
-distinguishes them — it lists the loaded names, and an old build has no
-`exemplars` key at all. Run `scripts/grounding.sh restart` after every
-`register_object.py`.
+**DINOv2 is not loaded.** `scripts/grounding.sh` passes `--no-exemplars`.
+The printed scoop is the SAM 3 phrase `"white plastic tool"` again
+(`scoop`, `rectangular scoop`, `printed scoop`, and `measuring scoop` all
+rewrite to it). Exemplar matching still exists and still works — measured
+0.95-1.00 on 2026-09-25 — but it loads DINOv2 plus a second SAM on top of
+SAM 3, and that combination exhausted this 15GB host. Turn it back on only
+with an explicit `--exemplars exemplars` on the python command, not via
+`grounding.sh`.
 
 ### Pick beaker (upright top-down grasp)
 
@@ -98,6 +96,26 @@ python scripts/run_experiment.py --skill scoop \
 - Measure / tune `tool_length` for the held spoon before trusting dig depth
 - Direct SAM category names (`plastic beaker`, `larger spoon`, `white paper cup`)
   still skip the label path
+- **Camera 2's crop was the cup, not the paper** (2026-09-25,
+  `scene_captures/b10_water_20260925_153459`). SAM boxed the clear cup at
+  (390, 233)–(457, 302). The 0.9× pad ended at y=331. `B 10 ML WATER` is on
+  the sheet in front of the cup, down to about y=450, so the reader saw a
+  sliver of `10 ML` and returned null (`labels [none]`). A second mask of
+  the same cup (score 0.32) was then greyed over that sliver. The crop now
+  follows the white sheet downward and sideways, and does not pad upward
+  into the reagent behind the cup — that upward pad made the reader say
+  `A 10 ML WATER` and `B 5 ML NaCl` for a crop that also contained the B
+  sheet. Re-read of those stills: cam 2 matches `B 10 ML WATER` at score
+  0.79, cam 3 at 0.91, cam 5 at 0.89. Cam 4 still reads the B cup as
+  `A 10 ML WATER` and is not used.
+- **One camera that reads the label is enough** (2026-09-25 dump of
+  `B 10 ml water`). Cam 3 read `B 10 ML WATER` at score 0.90, anchor
+  `[0.4081, 0.0357, 0.0055]`. Cam 4 was a projection match (score 0.73) whose
+  centroid was 52 mm away, so the 50 mm pairwise rule rejected both and the
+  direct SAM prompt `"B 10 ml water"` found nothing. If exactly one camera
+  read the text, that camera's cloud is used alone. Two cameras that both
+  read the label and still disagree are still refused. The 50 mm tolerance
+  was not loosened.
 
 ### Pour into white paper cup
 
@@ -121,8 +139,9 @@ python scripts/run_experiment.py --skill pour \
 | Area | Status |
 | --- | --- |
 | Env bring-up (`scripts/env.sh`, frankapy Py3.8 + ROS Noetic) | Working |
-| SAM 3 grounding service (`perception_service/`, `weights/sam3.pt`) | Working; prefer over GroundingDINO |
-| Exemplar matching for the printed tools (`exemplars/`) | Working — 0.95-1.00 on all 4 cams for stirrer / holder / scoop |
+| SAM 3 grounding service (`perception_service/`, `weights/sam3.pt`) | Working; prefer over GroundingDINO. DINOv2 is off |
+| Scoop via the text prompt `"white plastic tool"` | The live path again (see below). Partial on the 2026-09-18 sweep: cam5 the whole tool, cam2 the handle only |
+| Exemplar matching (`exemplars/`, DINOv2 + SAM-vit-base) | Measured 0.95-1.00, **not loaded**. Opt-in with `--exemplars exemplars` |
 | Sequential RealSense capture (cams 2–5, one at a time) | Working — avoid streaming all four at once (USB wedge) |
 | Live factory intrinsics + board-free cube extrinsic calib | Working (~3–6 mm held-out) |
 | `pick_up` upright top grasp + reset_joints pre-scan | Working (beaker + spoon params above) |
@@ -143,7 +162,84 @@ python scripts/run_experiment.py --skill pour \
 
 ---
 
-## Custom objects: exemplar matching (added 2026-09-25)
+## Custom objects: exemplar matching (added 2026-09-25, unloaded the same day)
+
+Turned back off on 2026-09-25 because the live service was SAM 3 **plus**
+DINOv2-base **plus** SAM-vit-base. The process that had all three loaded was
+idle at **7.1GB resident, 9.2GB peak, 1.4GB swap**. After
+`scripts/grounding.sh restart` with `--no-exemplars`, `/health` reports
+`exemplars: []` and the idle process is **360MB, 0 swap**. The 3.3GB
+weights are not on the GPU until the first `/segment`. Measured on the
+14:40 pick of `"white plastic tool"`: camera 2 took **94.6s**, camera 3
+took **0.35s**, and the robot terminal printed nothing during that wait,
+which reads as a hang. After that query the service sits at 3.2GB resident
+and 5.2GB of GPU, 0 swap. A four-camera `segment_instances` was already
+5.85GB resident / 8.90GB peak before the extra models. The scoop is
+`"white plastic tool"` again.
+
+**The stirrer is `"white cube"` (found 2026-09-25, real robot).** All the
+prompts in `diag_out/stirrer_prompts/` described the whole black assembly or
+guessed at tool words (`"stirrer"`, `"stirring rod"`, `"black cap"`) and none
+of them separated the grasp point from the holder cleanly enough to trust.
+Describing only the part the gripper actually needs — the **white** cube
+sitting on the black cylinder, not the assembly, not the cylinder — worked:
+`pick_up --params '{"object_name":"white cube",...}'` grasped it and the chain
+carried into `stir` (which requires `is_gripper_holding()`, so reaching that
+step is itself the confirmation). Added `"cube"` and `"cylinder"` to
+`label_resolver._DIRECT_SAM_KEYWORDS` so `"white cube"` skips the reagent-label
+path and goes straight to a SAM 3 text prompt — without that it would first
+scan every `"white bowl"` for a paper reading "white cube" and only fall back
+after failing there.
+
+The holder itself is still unconfirmed by this route — try `"black cylinder"`
+next, now that it is also a direct keyword.
+
+**`"white cube"` then failed on the robot (2026-09-25).** The error was
+`Rejecting 'white cube': extent [0.294 0.39 0.13] exceeds 0.35m`. All four
+cameras agreed on the centroid (max pair 34-41 mm), so SAM had found the
+right object. Mask areas in `grounding_service.log` are 1,000-2,900 px, the
+same as the earlier pick that worked. The mask was fine; the depth behind
+it was not.
+
+`_depth_to_points` back-projected every mask pixel's raw depth. Edge pixels
+of a small object often carry the bench depth behind it, plus RealSense
+flying pixels in between. Those become streaks along each camera ray. They
+are dense enough to survive `_remove_outliers` (20 neighbours, 2σ) and hardly
+move the mean, which is why the centroids still agreed. Replay of
+`scene_captures/stirrer_white_20260925_113812`:
+- cam 2's cube cloud: **17.7 × 9.6 × 11.9 cm**, depth tail to 0.66 m behind a
+  cube at 0.47 m.
+- cam 3's: **11 × 12.9 × 12 cm**.
+- Fused after consensus: **19 × 6 × 12 cm** for a 30 mm cube, with z
+  reaching down to the table. That frame happened to pass under 0.35 m; the
+  live one did not. So the earlier success was luck, not a regression.
+
+Fix: `ObjectLocalizer._depth_gate` keeps only pixels within the object's
+apparent size of the mask's median depth. The size is the 2-98 percentile
+pixel box, converted to metres at that median depth, with a 20 mm minimum. A
+cup gets a band as deep as it is wide; a small object gets a tight one.
+Same stills afterwards:
+- cube: cam 2 **3.9 × 4.3 × 3.1 cm**, cam 3 **4.3 × 4.1 × 3.0 cm**, z
+  0.071-0.103 (cube only).
+- `"clear plastic cup"` (b10_water): 3 cameras identical, cam 3 dropped 80
+  of 3,331 points, a tail that made it 2.5 cm too long in x.
+- `"white bowl"` (b10_water and bowls_20260924): identical on every camera.
+
+The replay used nominal 848×480 intrinsics (fx = fy = 610); the robomail
+`.intr` files are 640-wide and unusable. Tried and rejected: **2 px mask
+erosion.** It left cam 2 at 14.5 cm, because the streak pixels are not all
+on the outer ring. The live failing frames were not saved, so this is
+diagnosed from stills of the same cube, not from that exact run. **Not yet
+re-run on the robot.** The replay script is small, so rebuild it rather than
+look for it: grounding client + `_depth_to_points` on `cam{N}_depth.png`.
+`test_depth_gate_drops_edge_streaks_not_containers` added;
+`test_skills_offline.py` 198 pass (the same 2 scoop failures as before),
+`test_agents_offline.py` 61 pass.
+
+The measurements below are still the ones to trust if `--exemplars` comes back
+on.
+
+## Custom objects: what the exemplar path measured
 
 Text prompting ran out on the printed tools. SAM 3 is open-vocabulary, not
 unlimited: `scripts/sweep_prompts.py` spent twenty phrases on the scoop and the
@@ -152,14 +248,11 @@ same story for the stirrer), while the phrases that scored *well* —
 `"white object"`, 0.95 on 4/4 — were matching the cups. The concept is simply
 not in the model, so no wording fixes it.
 
-These objects are now matched by **appearance**. SAM's automatic mask generator
-segments everything in the frame (no prompt, class-agnostic), DINOv2 embeds each
-candidate crop, and the best cosine match against a reference crop wins.
-Reference embeddings live in `exemplars/*.npz` and are the custom vocabulary.
-
-Dispatch is by name inside the service, so `segment("stirrer")` is unchanged for
-every skill above it: registered names go to the exemplar backend, everything
-else still goes to SAM 3.
+When `--exemplars` is passed, these objects are matched by **appearance**.
+SAM's automatic mask generator segments everything in the frame (no prompt,
+class-agnostic), DINOv2 embeds each candidate crop, and the best cosine match
+against a reference crop wins. Reference embeddings live in `exemplars/*.npz`.
+That flag is not the default as of 2026-09-25; see the note above.
 
 ### Registering an object
 
@@ -171,8 +264,9 @@ perception_env/bin/python scripts/register_object.py --name stirrer \
     --images-dir scene_captures/stirrer_white_<ts>          # drag a box per camera
 ```
 
-The service loads `exemplars/` at startup (`--no-exemplars` to skip,
-`--exemplar-thresh` to tune). Verify with the existing sweep:
+The service does **not** load `exemplars/` unless started with
+`--exemplars exemplars` (`--exemplar-thresh` to tune). Verify with the
+existing sweep:
 
 ```bash
 python scripts/sweep_prompts.py --images-dir scene_captures/<run> \
@@ -233,6 +327,88 @@ object on that same frame (candidates and embeddings are cached per image,
 bit-packed). A missed frame that triggers the denser retry costs ~13s. A
 per-camera miss is not a failed run: localization fuses whatever cameras did find
 the object.
+
+---
+
+## Scoop -> dump -> place-back chain (validated 2026-09-25, text prompts only)
+
+One `run_experiment.py` call, four `--skill`/`--params` pairs so the gripper
+stays loaded across steps (a second invocation opens a fresh cell with an
+empty gripper):
+
+```bash
+source scripts/env.sh
+scripts/grounding.sh status   # confirm up, and exemplars: [] -- see below
+
+python scripts/run_experiment.py --workspace-min 0.25 -0.40 -0.13 \
+  --skill pick_up --params '{"object_name":"scoop","z_offset":0.0,"grasp_force":1.0,"forward_offset":-0.010}' \
+  --skill scoop   --params '{"powder_source":"baking soda","tool_offset":[0.051,0.009,0.028],"tool_span":0.0275,"tool_back_reach":0.030,"bowl_length":0.0275,"bowl_width":0.0205,"bowl_depth":0.0115}' \
+  --skill dump    --params '{"target_container":"b 10 ml water","container_category":"clear plastic cup","tool_offset":[0.051,0.009,0.028],"bowl_length":0.0275,"bowl_width":0.0205,"bowl_depth":0.0115}' \
+  --skill place   --params '{"target_location":"scoop"}'
+```
+
+- **`object_name: "scoop"` resolves without exemplars.** `SAM_PROMPT_ALIASES`
+  maps it to `"white plastic tool"`, the SAM 3 text prompt validated in the
+  2026-09-18 sweep. No `--exemplars` flag needed; see the "unloaded" note above
+  for why that flag is off by default now.
+- **`tool_offset: [0.051, 0.009, 0.028]`** — x/y measured by `pick_up`'s
+  `measure_tool_offset` off THIS grasp (it moves if `forward_offset` changes,
+  see below); z is the CAD depth, not the measured one. The cameras look down
+  and cannot see the bowl floor, so `measure_tool_offset` reports a lower bound
+  there (has read as low as 0.011-0.019m depending on grasp) — always take z
+  from the printed scoop's CAD (0.028m for a mid-grip grasp), never from the
+  printed offset directly.
+- **`forward_offset: -0.010` on the pick** moves the grasp off the crank (the
+  one spot on the handle where the cross-section changes and the jaws cannot
+  seat flat) without going so far it overshoots the flat grip, which is only
+  26mm long.
+- **`"target_location": "scoop"` on the final `place`** uses the executor's
+  pick-site memory (`SkillsExecutor.pick_sites`, added 2026-09-25): a
+  successful `pick_up` records where it grasped the object, and `place` resolves
+  a matching name to that site instead of asking vision to find a tool that is
+  in the gripper and cannot be on the bench for a camera to see. A name the
+  executor has not picked passes through unchanged, so this never masks a real
+  scene object.
+- `container_category: "clear plastic cup"` on `dump` — required because the
+  label-category default is now `"white bowl"` (where the reagents live);
+  water needs the clear-cup category explicitly.
+
+### The freeze this chain caused before the exemplar stack was turned off
+
+Running this same chain with `--exemplars` on (DINOv2 + a second SAM resident)
+froze the whole desktop, not just the grounding process, partway through step
+2's `segment_instances` call. Measured cause, in order ruled out:
+
+1. **Not the shared USB controller.** Real and reproducible in `dmesg` (a
+   Realtek HID hub dropping with `error -71` under camera load), but a HID drop
+   kills the mouse, not the whole desktop, and the timing did not match.
+2. **Not per-instance label reads.** Reverting to one whole-frame VLM call per
+   camera was tried and made cross-cup labelling WORSE:
+   `scene_captures/ab_water_20260921_102436`, `"a 10 ml water"` / `"b 10 ml
+   water"` went from 4/4 + 4/4 (per-instance) to 2/4 + 0/4 (whole-frame), with
+   invented labels (`"WEAK BASE"`, `"GLITTER ADD"`) not on the bench. Reverted
+   back; per-instance stays default (`LabelResolver.per_instance = True`).
+3. **Not batching cameras into the /segment call.** Sending 4, 2, or 1 camera(s)
+   per HTTP request all measured the identical **8.90GB peak** — the growth is
+   a one-time CUDA/workspace allocation on first use, not a per-frame cost, so
+   splitting frames across requests cannot lower it.
+4. **The actual cause: host RAM.** This machine has 15GB. The grounding
+   service with SAM 3 + DINOv2 + a second SAM resident sat at **5.85GB idle,
+   8.90GB peak** after the first segmentation of any kind — a permanent step,
+   not a spike that comes back down. With Slack and spare editor windows open,
+   `available` was ~3GB; the peak exceeded it and the kernel started paging
+   rather than OOM-killing anything, which is what a full desktop freeze looks
+   like (no `oom-kill` in `dmesg`, 1.3GB already in swap before the run even
+   started). `vm.swappiness=60` (the default) does not help here: the 64GB
+   swap file was untouched at the time of the freeze, because the resident set
+   was live model weights being paged back in on every inference, not idle
+   memory swap could usefully evict.
+
+Fix: `--no-exemplars` (now `scripts/grounding.sh`'s default). Confirmed
+`/health` idle at **360MB, 0 swap**; loads the 3.3GB SAM 3 weights lazily on
+first `/segment` and settles at **3.2GB resident, 5.2GB GPU, 0 swap** after.
+The trade is the stirrer and its holder have no validated text prompt yet (see
+above) — this chain does not need them, so it is unaffected.
 
 ---
 
@@ -350,6 +526,229 @@ perception_env/bin/python scripts/test_skills_offline.py   # no robot needed
 
 ---
 
+## Dump shake (bench, 2026-09-25)
+
+`"b 10 ml water"`, `tool_offset` all zeros, `rim_clearance` 10 mm then 20 mm.
+Straight ahead the tip stops at **73°** (cup x≈0.45) then **77.5°** (rim
+centre [0.357, 0.043]) of a commanded **90°**. `tip_capped_by_reach` was
+false both times — the geometric reach model (`PANDA_REACH` 0.718 m) thought
+90° was fine, and sim's MuJoCo IK tracks the planned arc, so sim rotates
+further. Those are not the frankapy cartesian controller. With
+`tool_offset` all zeros the "bowl" is the TCP, so the tip is a pure wrist
+fold; sim's printed scoop has a real bowl offset and the TCP orbits. Neither
+run proves 77° is a software cap. Re-commanding that 90° pose for 1.5 s, and
+then streaming the shake (66°↔78°) and the return, were all accepted. The
+wrist never left the stall: **77.5° → 77.6°** on all four half-swings, and
+**77.6°** after the return. Anchoring those streams on the real bowl position
+did not change that. The 90° re-command is what seats the joint on the stop;
+it is no longer issued.
+
+Third dump, same cup, cameras 2 and 3 agreed within 44 mm, rim centre
+[0.449, 0.020], z=0.039. Commanded 90°, stopped at **78.8°**. That angle
+empties the scoop; it is now `dump_angle_deg` **79**, and the shake must not
+command anything past the angle actually held. The ±12° tool-Y rock at the
+stall measured **78.8° → 78.8°** and the skill went to `reset_joints` still
+holding the scoop. The shake is now the pour arc run backwards then forwards
+again: 79° → 67° → 79°, poses the tip already passed through, not a new
+orientation pressed into the stop. Not yet run on the robot. The return
+still unwinds in ≤20° steps along that same arc.
+
+A pose that is not actually reached sends the arm to `reset_joints` via
+`go_home()`. The gripper stays closed (this is not `--reset`, which opens
+the gripper at home). Triggers: carry command fails, bowl arrives short of
+the cup, tip command fails, measured tip below `min_tip_deg` (60), shake
+backoff moves <3°, return still more than `tip_tol` (10°) from level, or
+the lift does not arrive. A tip that clears 60° still counts as dumped; the
+home is the recovery when the shake or the unwind cannot leave the stall.
+Not bench-tested.
+
+## Stir: top-down by default (2026-09-25)
+
+On the robot, `stir` behaved differently from the sim: it tipped the held
+stirrer about 90° onto its side before stirring. The skill's default was
+`tool_axis: "x"`, the flat-spoon path. That path rotates 90° about tool Y to
+stand a handle up. The sim never took it, because `smoke_test_sim.py` passes
+`"tool_axis": "z"`. Nobody passed that on hardware. The agent catalog does not
+expose `tool_axis`, so every agent-planned stir on hardware got the tilt too.
+
+Now the default **is** the sim behaviour. `tool_axis` defaults to `"z"`: the
+stir is done fingers-down, which is the orientation `pick_up` grasps in. After
+the home, the wrist is levelled to exactly straight down with
+`tool_down_rotation()`, keeping its yaw so the stirrer does not spin in the
+jaws. The hover, descent, circle and lift all command that ideal rotation, not
+the measured one. The spoon tilt is still available, opt-in only, with
+`"tool_axis": "x"`.
+
+**`tool_length` now defaults to 0.081 on the `"z"` path.** That is the CAD
+length: 15 mm from TCP to cube centre plus the 66 mm rod, taken from
+`stirrer v1.stl` and the sim's `Prop.tool_length`. It is **not measured on
+the real part yet.** Before this change the hardware default was 0.0, which
+puts the rod tip 81 mm below the intended depth, i.e. into the cup floor.
+**Do not pass pick_up's `suggested_tool_offset` z for the stirrer.** Sim
+measured **0.012** against the 0.081 CAD, because the rod is inside the
+holder during the pick and no camera sees it. The catalog's `tool_length`
+text now says exactly that.
+
+```bash
+python scripts/run_experiment.py \
+  --skill pick_up --params '{"object_name":"white cube"}' \
+  --skill stir    --params '{"target_container":"<cup>","revolutions":2}'
+```
+
+Verified in sim and offline only; **not yet run on the robot**:
+- `smoke_test_sim.py --only "pick + stir"`: all checks pass.
+- A sim pick_up + stir with **no** `tool_axis`/`tool_length`: `tool_axis`
+  `z`, `tool_length` 0.081, no tilt, 0.001° from down, 2/2 revolutions.
+- `test_skills_offline.py`: 184 pass.
+  - The 2 failures are the scoop workspace-floor check. They failed before
+    this change too.
+  - New test: `test_stir_defaults_to_top_down`.
+  - The spoon tests now pass `"tool_axis": "x"`.
+
+Check first on the bench:
+- whether 0.081 puts the rod tip where it should be; `stir_depth` is
+  measured from the tip
+- whether the `"white cube"` grasp centre sits lower on the cube than the
+  cube centre, since the cameras mostly see its top face; if it does, the
+  real `tool_length` is larger than 0.081
+
+### Full chain: scoop → dump → place scoop → stir → stirrer back (2026-09-25)
+
+These are the seven steps in one `run_experiment.py` call. The pick-site
+memory spans the whole chain, so `"scoop"` and `"white cube"` each go back
+to their own pick sites. The chain stops at the first failed step. **Not yet
+run as one chain.** Steps 1-4 are the robot-validated scoop chain with the
+dump offsets used on the bench. Steps 5-7 have not run on the robot in this
+form. The depth gate does not affect the scoop: on
+`new_scoop_20260918_151846`, `"white plastic tool"` lost 1 of 3,040 points
+across the four cameras, and the extents did not change.
+
+```bash
+python scripts/run_experiment.py --workspace-min 0.25 -0.40 -0.13 \
+  --skill pick_up --params '{"object_name":"scoop","z_offset":0.0,"grasp_force":1.0,"forward_offset":-0.010}' \
+  --skill scoop   --params '{"powder_source":"baking soda","tool_offset":[0.051,0.009,0.028],"tool_span":0.0275,"tool_back_reach":0.030,"bowl_length":0.0275,"bowl_width":0.0205,"bowl_depth":0.0115}' \
+  --skill dump    --params '{"target_container":"b 10 ml water","container_category":"clear plastic cup","tool_offset":[0.051,0.009,0.028],"bowl_length":0.0275,"bowl_width":0.0205,"bowl_depth":0.0115,"forward_offset":-0.008,"lateral_offset":-0.015}' \
+  --skill place   --params '{"target_location":"scoop"}' \
+  --skill pick_up --params '{"object_name":"white cube","z_offset":0.0,"grasp_force":1.0}' \
+  --skill stir    --params '{"target_container":"b 10 ml water","container_category":"clear plastic cup","tool_length":0.066,"revolutions":2,"stir_depth":0.02,"lateral_offset":-0.012,"forward_offset":-0.010,"stir_radius":0.022,"seconds_per_revolution":2.0}' \
+  --skill place   --params '{"target_location":"white cube","vertical_insert":true,"release_clearance":0.0,"stop_force_n":1.0}'
+```
+
+### Stirrer back into its holder: vertical insert from memory (2026-09-25)
+
+`place` has a new `vertical_insert` mode. It homes with `reset_joints`
+(still holding), levels the wrist to fingers-down, and **crosses in XY at
+the home height** (z≈0.49 in sim). It then goes straight down to the hover
+and on into the force probe. The plain path moves diagonally from wherever
+the last skill left the arm, which would drag the hanging rod through
+whatever sits between the cup and the holder.
+
+**It releases with the TCP back at the grasp position, not the centroid.**
+The executor now also remembers pick_up's `grasp_pose` translation
+(`SkillsExecutor.pick_grasps`). When the place target names a remembered
+pick, it passes that as `pick_grasp_tcp`. Putting the TCP back where it held
+the seated stirrer re-seats the stirrer. In sim the grasp was 1.7 mm below
+the centroid.
+
+**`place`'s `stop_force_n` probe is now relative to a resting baseline**
+(5 readings at the probe start), like stir's guard. Before, it compared the
+raw Z reading to the threshold. On the real arm that raw reading carries a
+bias, which would release in mid-air or never release. Both helpers now use
+`BaseSkill.mean_push_up_n`.
+
+```bash
+python scripts/run_experiment.py --workspace-min 0.25 -0.40 -0.13 \
+  --skill pick_up --params '{"object_name":"white cube","z_offset":0.0,"grasp_force":1.0}' \
+  --skill stir    --params '{"target_container":"b 10 ml water","container_category":"clear plastic cup","tool_length":0.066,"revolutions":2,"stir_depth":0.02,"lateral_offset":-0.012,"forward_offset":-0.010,"stir_radius":0.022,"seconds_per_revolution":2.0}' \
+  --skill place   --params '{"target_location":"white cube","vertical_insert":true,"release_clearance":0.0,"stop_force_n":1.0}'
+```
+
+Sim, the same chain with `"stirring rod"`:
+- The order printed as home, XY at z=0.487, down to 0.30, then probing from
+  grasp+15 mm.
+- Contact at z=0.1045, 1 mm below the grasp, **+2.9 N**.
+- Stirrer **0.2 mm** from its seat, **0.00°** tilt, gripper empty.
+- `smoke_test_sim.py --only "pick + stir,scoop then stir"` still passes.
+
+**Not yet run on the robot.** The descent is guarded only from grasp+15 mm
+down to grasp−20 mm (`probe_above` / `probe_below`). The ~70 mm above that,
+where the rod enters the bore, is position-only. That is safe only while
+the rod sits in the jaws as it did at the pick. If the stir contact made it
+slide or tilt, raise `probe_above` to about 0.08 and `probe_seconds` to
+0.4 (about 30 s of probing).
+
+A probe that feels nothing refuses to release and keeps hold. The scoop's
+validated `place` back to its pick site is unchanged, since
+`vertical_insert` defaults to false.
+
+### Stir circle centre offset and radius (2026-09-25)
+
+After the first top-down stir of `b 10 ml water` on the robot, the circle
+needed to sit **1.2 cm to the right** and be wider. `stir` now takes
+`forward_offset` / `lateral_offset`, in the same convention as pour, scoop
+and dump: +X away from the base, +Y toward the robot's left. The offset
+moves the circle centre off the measured rim centre. It is treated as a
+correction onto the true cup centre, so it does **not** shrink the
+wall-clearance clamp. The radius is still clamped to
+`rim_radius − wall_clearance` (12 mm). If a wider `stir_radius` comes back
+smaller, the log prints `Clamping stir radius`; that means the cup is the
+limit, not the parameter. Command sent for the next bench run, which
+assumes the robot's right:
+
+```bash
+python scripts/run_experiment.py --workspace-min 0.25 -0.40 -0.13 \
+  --skill pick_up --params '{"object_name":"white cube","z_offset":0.0,"grasp_force":1.0}' \
+  --skill stir    --params '{"target_container":"b 10 ml water","container_category":"clear plastic cup","tool_length":0.066,"revolutions":2,"stir_depth":0.02,"lateral_offset":-0.012,"stir_radius":0.022}'
+```
+
+Not yet run.
+
+### Force-guarded descent into the cup (2026-09-25)
+
+Stir no longer pushes blindly down to the computed depth. It moves quickly to
+where the rod tip is 10 mm above the rim, then steps down 2 mm at a time
+(`probe_step`, `probe_seconds` 0.4). After each step it reads the vertical
+force. The trigger is a **change of more than `stop_force_n` (1.0 N)** from a
+baseline, averaged over 5 readings taken at rest before the descent starts.
+Raw Franka force estimates carry a pose-dependent bias, so an absolute
+threshold is not used. A change in **either** direction stops the descent.
+frankapy says a press reads +Z, but only sim has checked that sign; stopping
+on either sign means a wrong sign cannot turn into "never stop", and a false
+stop only costs depth.
+
+- Contact with the rod tip **at or above the rim**: the rod has landed on the
+  rim, not in the cup. Stir lifts back to the hover and fails.
+- Contact **inside** the cup: stir backs off 3 mm (`contact_backoff`), stirs
+  there, and reports `stopped_by_force`, `contact_force_n`, `contact_z`,
+  `contact_tip_below_rim` and `stir_z`.
+- No force reading on the arm: stir warns and falls back to a position-only
+  descent (`force_guarded: false`). `"stop_force_n": null` turns the guard off.
+- The guard covers the **descent only**. The streamed circle has no force
+  check.
+
+Sim, pick_up + stir of the plastic beaker with `tool_length` 0.066 (sim's true
+value is 0.081, so the rod reaches 15 mm deeper than planned):
+- `stir_depth` 0.02: no contact, stirred at the planned z=0.142.
+- `stir_depth` 0.09: contact at z=0.102, **+10.5 N**, tip 60 mm below the
+  rim; stirred at z=0.105 and completed 2/2 revolutions.
+
+The +10.5 N shows that sim contact is stiff: one 2 mm step past the floor
+already reads 10 N. **Not yet run on the robot.** Two things to watch on the
+first run:
+1. `grasp_force` 1.0 N may let the cube **slide up in the jaws** before
+   1 N of reaction reaches the wrist. Sim cannot show this because its grasp
+   is a magnet. The width check does not catch it either, since sliding does
+   not change the jaw width. If the rod rides up, raise `grasp_force` toward
+   the 1.5 N cap, or lower `stop_force_n`.
+2. How noisy the resting force baseline is on the real arm. If the stop fires
+   in mid-air, raise `stop_force_n`. If it presses hard before stopping,
+   use `probe_step` 0.001.
+
+`test_stir_stops_descending_on_contact` covers: floor contact with a −2.5 N
+sensor bias, contact on the rim, no contact, and an arm with no force
+reading. `test_skills_offline.py`: 195 pass, and the 2 failures are the same
+scoop workspace-floor ones as before.
+
 ## Known issues / next
 
 - Toward-base tip can hit a physical/singularity limit mid-trajectory (~40°);
@@ -388,7 +787,7 @@ perception_env/bin/python scripts/test_skills_offline.py   # no robot needed
   — move the camera hub to the ASMedia (`04:00.0`) or NVIDIA (`01:00.2`) ports,
   both of which are completely unused. Until then, expect the mouse to die
   occasionally during a multi-camera scan, and prefer the NVIDIA controller only
-  as a second choice since that GPU is also running SAM 3 and DINOv2.
+  as a second choice since that GPU is also running SAM 3.
 - `stirrer` has only the 4 views of it seated in its holder. Once it is lying
   loose on the bench, capture that and
   `register_object.py --name stirrer --append` — a tool on its side is a
@@ -402,7 +801,7 @@ perception_env/bin/python scripts/test_skills_offline.py   # no robot needed
 | --- | --- |
 | `robochem/skills/pick_up.py` | Pick skill |
 | `robochem/skills/pour.py` | Pour skill |
-| `robochem/skills/{place,scoop,stir,dispense}.py` | Rewritten 2026-09-08, not yet bench-tested |
+| `robochem/skills/{place,scoop,stir,dispense}.py` | Rewritten 2026-09-08, not yet bench-tested (stir top-down default 2026-09-25) |
 | `robochem/agents/` | LLM planner: scene, plan, skill call, vocabulary |
 | `robochem/orchestrator/agent_orchestrator.py` | The closed loop over agents + skills |
 | `robochem/integration/plato_bridge.py` | The other merge: runs `robomail_Aliyah` plans on the real cell |

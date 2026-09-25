@@ -74,6 +74,19 @@ class PlaceSkill(BaseSkill):
             "probe_below": 0.020,      # give up this far below it
             "probe_step": 0.002,
             "probe_seconds": 1.0,      # per step; also what the reading settles over
+            # Put a tool back into a holder straight down, e.g. the stirrer.
+            # reset_joints first (holding on), level the wrist to fingers-down,
+            # cross in XY at the home height, and only then descend vertically.
+            # The plain path moves diagonally from wherever the last skill
+            # left the arm, which drags a hanging rod through whatever is
+            # between there and the holder.
+            "vertical_insert": False,
+            # The TCP position of the pick this object came from. The executor
+            # fills it in when target_location names a remembered pick. With
+            # vertical_insert the release is measured from it, not from the
+            # centroid: putting the TCP back where it was holding the seated
+            # tool re-seats the tool.
+            "pick_grasp_tcp": None,
         }
 
     def check_preconditions(self, params: Dict[str, Any]) -> Tuple[bool, str]:
@@ -104,14 +117,34 @@ class PlaceSkill(BaseSkill):
         start_width = self.held_width()
         print(f"[Place] Holding at {start_width * 1000:.1f}mm at start")
 
-        # Keep the orientation the object was picked with. Re-flattening the
-        # wrist here would twist a held beaker against the table on the way
-        # down; pick_up already left us in a sane top-down pose.
-        hold_rotation = np.asarray(self.get_current_pose().rotation, dtype=float)
+        insert = bool(params["vertical_insert"])
+        if insert:
+            print("[Place] Vertical insert: reset_joints (home) first, holding on...")
+            if not self.go_home():
+                return False, {"error": "Failed to reset_joints before inserting",
+                               "still_holding": True}
+            self.wait(0.4)
+            # Straight down, keeping the closing axis' yaw, so the rod goes
+            # into the bore along its own axis.
+            hold_rotation = self.tool_down_rotation()
+        else:
+            # Keep the orientation the object was picked with. Re-flattening
+            # the wrist here would twist a held beaker against the table on
+            # the way down; pick_up already left us in a sane top-down pose.
+            hold_rotation = np.asarray(self.get_current_pose().rotation, dtype=float)
 
         target_pos, surface_z, located = self._resolve_target(params, target)
         if target_pos is None:
             return False, {"error": f"Cannot locate target '{target}'"}
+
+        grasp_tcp = params.get("pick_grasp_tcp")
+        if insert and grasp_tcp is not None:
+            grasp_tcp = np.asarray(grasp_tcp, dtype=float)
+            print(f"[Place] Returning the TCP to where it grasped: "
+                  f"{np.round(grasp_tcp, 4)} (centroid was "
+                  f"{np.round(target_pos, 4)})")
+            target_pos = grasp_tcp.copy()
+            surface_z = float(grasp_tcp[2])
 
         # After the scan we are at home; confirm the object survived the trip.
         ok, msg = self.check_still_holding(start_width, tag="Place")
@@ -127,6 +160,24 @@ class PlaceSkill(BaseSkill):
         # Step 1: hover well above the release site.
         hover = target_pos.copy()
         hover[2] = max(release_z + approach_height, self.safe_height)
+        if insert:
+            # Cross at the home height FIRST, so the only motion near the bench
+            # is the straight-down one.
+            here = np.asarray(self.get_current_pose().translation, dtype=float)
+            transit = hover.copy()
+            transit[2] = max(float(here[2]), hover[2])
+            print(f"[Place] Crossing in XY at z={transit[2]:.4f} to "
+                  f"{np.round(transit, 4)}...")
+            if not self.goto_pose_rigid(transit, hold_rotation, duration=4.0):
+                return False, {"error": "Failed to command the XY transit",
+                               "still_holding": True}
+            arrived, err = self.reached(transit, hover_tol)
+            if not arrived:
+                return False, {
+                    "error": (f"XY transit above '{target}' unreachable (off by "
+                              f"{err * 1000:.0f}mm); still holding the object"),
+                    "still_holding": True,
+                }
         print(f"[Place] Hovering at {np.round(hover, 4)}...")
         if not self.goto_pose_rigid(hover, hold_rotation, duration=3.0):
             return False, {"error": "Failed to command hover pose"}
@@ -159,6 +210,18 @@ class PlaceSkill(BaseSkill):
                   f"{stop_force:.1f}N")
 
             probe = target_pos.copy()
+            # Contact is a CHANGE from a reading at rest above the seat: the
+            # raw estimate on the real arm carries a pose-dependent bias of
+            # its own, which an absolute threshold would read as contact (a
+            # release in mid-air) or mask (no release at all).
+            probe[2] = z_from
+            if not self.goto_pose_rigid(probe, hold_rotation, duration=2.0):
+                self.goto_pose_rigid(hover, hold_rotation, duration=3.0)
+                return False, {"error": "Failed to reach the probe start",
+                               "still_holding": True}
+            self.wait(0.3)
+            baseline = self.mean_push_up_n(samples=5, gap=0.05)
+            print(f"[Place]   baseline {baseline:+.2f}N at z={z_from:.4f}")
             z = z_from
             while z >= z_to - 1e-9:
                 probe[2] = z
@@ -167,7 +230,7 @@ class PlaceSkill(BaseSkill):
                     self.goto_pose_rigid(hover, hold_rotation, duration=3.0)
                     return False, {"error": "Failed to command a probe step",
                                    "still_holding": True}
-                push = self.ee_push_up_n()
+                push = self.mean_push_up_n() - baseline
                 print(f"[Place]   z={z:.4f}  push={push:+.2f}N")
                 if push is not None and push > stop_force:
                     seated_by_force, contact_force, contact_z = True, push, z
@@ -249,6 +312,8 @@ class PlaceSkill(BaseSkill):
             "release_width": released_width,
             "held_width_at_start": start_width,
             "located_target": located is not None,
+            "vertical_insert": insert,
+            "returned_to_grasp": bool(insert and grasp_tcp is not None),
             "seated_by_force": seated_by_force,
             "contact_force_n": contact_force,
             "contact_z": contact_z,

@@ -1036,3 +1036,14 @@ class BaseSkill(ABC):
         """Upward force the world is pushing back with, in newtons, or None."""
         wrench = self.ee_wrench()
         return None if wrench is None else float(wrench[2])
+
+    def mean_push_up_n(self, samples: int = 3, gap: float = 0.03) -> float:
+        """Mean world-Z external force over a few readings, in newtons."""
+        readings = []
+        for i in range(samples):
+            push = self.ee_push_up_n()
+            if push is not None:
+                readings.append(push)
+            if i + 1 < samples:
+                self.wait(gap)
+        return float(np.mean(readings)) if readings else 0.0

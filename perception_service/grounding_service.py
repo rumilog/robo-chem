@@ -22,16 +22,16 @@ Two backends, same HTTP contract:
          a fallback. Scores only ~0.3-0.6 here and tends to expand its box to
          surrounding structure, so prefer sam3 unless the weights are missing.
 
-Both are text backends, and text runs out on the printed tools: they have no
-name SAM 3 knows, and scripts/sweep_prompts.py could not find one (see
-diag_out/stirrer_prompts). So a third path sits in front of them:
+Both are text backends. The printed scoop is the phrase "white plastic tool"
+(label_resolver.SAM_PROMPT_ALIASES). A third path exists but is off unless
+--exemplars is passed, because it loads DINOv2 and a second SAM on top of
+whichever backend is already resident:
 
   exemplar  Segment everything, embed each candidate, keep the one matching a
             reference crop you boxed by hand once
             (perception_service/exemplar_matcher.py). It handles ONLY the names
             registered in exemplars/*.npz; every other prompt still goes to the
-            text backend, so nothing else changes. Register with
-            scripts/register_object.py.
+            text backend. Register with scripts/register_object.py.
 
 Usage:
     perception_env/bin/python perception_service/grounding_service.py \
@@ -50,7 +50,6 @@ import numpy as np
 from flask import Flask, jsonify, request
 
 from exemplar_matcher import (
-    DEFAULT_EXEMPLAR_DIR,
     ExemplarBackend,
     ExemplarLibrary,
 )
@@ -444,11 +443,12 @@ def main():
     parser.add_argument(
         "--exemplars",
         default=None,
-        help="directory of registered objects (default: exemplars/ if it has "
-             "any .npz). These names bypass the text backend entirely.",
+        help="directory of registered objects. Off unless this is passed: "
+             "loading it also loads DINOv2 and a second SAM, which is the "
+             "RAM spike. These names then bypass the text backend entirely.",
     )
     parser.add_argument("--no-exemplars", action="store_true",
-                        help="ignore exemplars/ and answer everything with text")
+                        help="ignore --exemplars and answer everything with text")
     parser.add_argument("--exemplar-thresh", type=float, default=0.60,
                         help="minimum cosine similarity to a reference view "
                              "(scripts/register_object.py suggests one)")
@@ -471,17 +471,16 @@ def main():
     STATE["name"] = STATE["backend"].name
     STATE["conf"] = args.conf
 
-    if not args.no_exemplars:
-        ex_dir = args.exemplars or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            DEFAULT_EXEMPLAR_DIR,
-        )
+    # Exemplars are opt-in. Auto-loading them stacked DINOv2 and SAM-vit-base
+    # on top of SAM 3 and exhausted this 15GB host (2026-09-25). The printed
+    # scoop goes back to the text prompt "white plastic tool".
+    if args.exemplars and not args.no_exemplars:
+        ex_dir = args.exemplars
         library = (
             ExemplarLibrary.load(ex_dir) if os.path.isdir(ex_dir)
             else ExemplarLibrary([])
         )
         if len(library):
-            # Only pay for the extra two models when something is registered.
             STATE["exemplars"] = ExemplarBackend(
                 library,
                 threshold=args.exemplar_thresh,
@@ -491,8 +490,10 @@ def main():
             log.info(f"exemplar matching for {library.names} (thresh "
                      f"{args.exemplar_thresh}); all other prompts go to "
                      f"{STATE['name']}")
-        elif args.exemplars:
+        else:
             log.warning(f"no exemplars found in {ex_dir}")
+    else:
+        log.info("exemplar matching off; every prompt goes to the text backend")
 
     log.info(f"serving {STATE['name']} on http://{args.host}:{args.port}")
     app.run(host=args.host, port=args.port, threaded=False)

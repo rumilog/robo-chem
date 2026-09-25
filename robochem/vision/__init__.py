@@ -19,6 +19,15 @@ from .label_resolver import (LabelResolver, looks_like_label_query,
                              resolve_sam_prompt)
 
 
+def _label_read_cameras(observed) -> list:
+    """Cameras whose text was read, not filled in by projecting another view."""
+    readers = []
+    for cam, text in (observed or {}).items():
+        if text and not str(text).startswith("(projected"):
+            readers.append(cam)
+    return readers
+
+
 class VisionSystem:
     """
     Unified vision system that combines all visual perception capabilities.
@@ -234,11 +243,32 @@ class VisionSystem:
             print(f"[VisionSystem] No cup labelled {label!r} in any camera")
             return None
 
-        return self._fuse_masks(
-            label, masks, confidences, data,
-            extra={"label_matches": observed, "category": category,
-                   "resolved_by": how},
-        )
+        extra = {"label_matches": observed, "category": category,
+                 "resolved_by": how}
+        located = self._fuse_masks(label, masks, confidences, data, extra=extra)
+        if located is not None:
+            return located
+
+        # A second camera matched by projection can sit on a different cup.
+        # Two disagreeing views are both rejected, which throws away the one
+        # camera that actually read the label. On 2026-09-25 only cam 3 read
+        # "B 10 ML WATER"; cam 4 was 52 mm away and the cup was refused.
+        # Trust that single read. Two cameras that both read the label and
+        # still disagree are a different failure — neither is trusted.
+        readers = _label_read_cameras(observed)
+        if len(readers) == 1 and readers[0] in masks:
+            cam = readers[0]
+            print(f"[VisionSystem] Only cam {cam} read {label!r}; "
+                  f"using that camera's location")
+            only_extra = dict(extra)
+            only_extra["resolved_by"] = (
+                f"single camera {cam} (only view that read the label)")
+            only_extra["label_matches"] = {cam: observed.get(cam)}
+            return self._fuse_masks(
+                label, {cam: masks[cam]},
+                {cam: confidences.get(cam)}, data, extra=only_extra,
+            )
+        return None
 
     def _resolve_by_projection(self, label, images, instances, data):
         """

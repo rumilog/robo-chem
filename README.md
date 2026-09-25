@@ -37,14 +37,13 @@ source scripts/env.sh
 ```bash
 cd /home/rumi/Desktop/robo-chem
 perception_env/bin/python perception_service/grounding_service.py \
-  --backend sam3 --model weights/sam3.pt
+  --backend sam3 --model weights/sam3.pt --no-exemplars
 ```
 
-Service listens on `http://127.0.0.1:5005` by default. It also loads
-`exemplars/` at startup: objects registered there (the printed stirrer and
-scoop, which SAM 3 has no word for) are matched by appearance instead of text,
-and every other prompt goes to SAM 3 exactly as before. `--no-exemplars` turns
-that off. See `exemplars/README.md`.
+Service listens on `http://127.0.0.1:5005` by default. The printed scoop is
+the text prompt `"white plastic tool"`. Exemplar matching (DINOv2 plus a
+second SAM, for the stirrer and the holder) stays unloaded unless you pass
+`--exemplars exemplars`. See `exemplars/README.md`.
 
 ### 3. Run a skill
 
@@ -260,8 +259,9 @@ fail to ground; and verification is on by default.
 2. Extrinsics: green cube in gripper + Kabsch (`scripts/calibrate_cameras.py`).
 3. Validate with `scripts/validate_calibration.py` / `scripts/check_object.py`.
 4. Prefer prompt **`plastic beaker`** for the red translucent beaker; use **`--backend sam3`**.
-5. Custom printed parts have no prompt that works — register them by appearance
-   with `scripts/register_object.py` instead of sweeping for a phrase
+5. The printed scoop is the prompt **`white plastic tool`**. Appearance
+   matching for the stirrer and holder is opt-in (`--exemplars exemplars`);
+   it is off by default because DINOv2 plus a second SAM exhausts RAM
    (`exemplars/README.md`).
 
 ---
