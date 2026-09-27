@@ -622,7 +622,7 @@ def main() -> int:
         print(f"bed surface z={bed_z:.4f}, cup rim z={rim_z:.4f}, "
               + (f"{len(grains)} granules" if args.granules else
                  f"drawn powder bed {source_prop.powder_level * 1000:.0f}mm deep, "
-                 f"dish inside radius {(source_prop.radius - source_prop.wall) * 1000:.1f}mm"))
+                 f"dish inside radius {source_prop.inner_radius * 1000:.1f}mm"))
 
         before = grains_in_bowl(cell, args.source, args.pick or "larger spoon")
         # Where the cup starts. A stroke that shoves the cup has not just made
@@ -694,15 +694,15 @@ def main() -> int:
                 parse_params(args.params).get("scoop_depth", 0.015))
         if args.skill == "scoop":
             # The dish's INSIDE floor and inside radius, from the model:
-            # scene._add_container stands the cup on a base disc 2*wall thick
-            # and rings it with a wall `wall` thick. Perception can see neither
+            # scene._add_container stands the cup on a base floor_height thick
+            # and rings it with a wall (Prop.inner_radius). Perception can see neither
             # under a bed (its lowest points are the outer bottom, ~1 mm low;
             # its "opening radius" is the outside of the rim plus the centre
             # error), so hand the truth in, as with the surface: the test is of
             # the stroke, not of the estimates.
             params["container_floor_z"] = float(cell.scene.bench.table_z
-                                                + 2 * source_prop.wall)
-            params["container_radius"] = float(source_prop.radius - source_prop.wall)
+                                                + source_prop.floor_height)
+            params["container_radius"] = float(source_prop.inner_radius)
             params["container_center"] = [float(v) for v in cup_xyz[:2]]
             if tool_prop is not None and tool_prop.bowl_size is not None:
                 params["bowl_width"] = float(2 * tool_prop.bowl_size[1])

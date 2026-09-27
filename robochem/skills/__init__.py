@@ -109,6 +109,8 @@ class SkillsExecutor:
         self._skill_instances = {}
         #: object name -> where pick_up took it from, for "put it back".
         self.pick_sites = {}
+        #: what pick_up last put in the jaws, until place or an open clears it.
+        self.held = None
     
     def list_skills(self) -> list:
         """
@@ -150,6 +152,7 @@ class SkillsExecutor:
         
         params = {**self.SKILL_ALIASES.get(skill_name, {}), **(params or {})}
         params = self._resolve_pick_site(skill_name, params)
+        params = self._fill_tool_geometry(skill_name, skill, params)
         
         # Check preconditions
         can_execute, message = skill.check_preconditions(params)
@@ -161,6 +164,7 @@ class SkillsExecutor:
             success, result = skill.execute(params)
             if success:
                 self._remember_pick_site(skill_name, params, result)
+                self._track_held(skill_name, params)
             return success, result
         except Exception as e:
             return False, {"error": str(e), "phase": "execution"}
@@ -187,6 +191,52 @@ class SkillsExecutor:
         print(f"[Skills] Noted where '{name}' was picked from: "
               f"[{site[0]:.4f}, {site[1]:.4f}, {site[2]:.4f}] — "
               f"place it back by name")
+
+    # ------------------------------------------------------- tool geometry
+    #
+    # scoop and dump plan around the bowl -- its size, and where it hangs
+    # below the jaws -- and neither a camera nor a planning model can supply
+    # that once the tool is held. The pick knows what the tool is, so the
+    # executor looks it up (tool_geometry.TOOLS) and fills in what a call left
+    # out. A 2026-09-25 agent run in sim passed no bowl size at all; scoop then
+    # planned for a point and drove the real 27 mm bowl into the dish wall.
+
+    def _track_held(self, skill_name: str, params: dict):
+        if skill_name == "pick_up":
+            self.held = params.get("object_name")
+        elif skill_name in ("place", "open_gripper") or params.get("action") == "open":
+            self.held = None
+
+    def _fill_tool_geometry(self, skill_name: str, skill, params: dict) -> dict:
+        from .tool_geometry import lookup
+        tool = lookup(self.held)
+        if tool is None:
+            return params
+        known = set(getattr(skill, "optional_params", {}) or {})
+        filled = dict(params)
+        added = []
+        for key in ("bowl_length", "bowl_width", "bowl_depth",
+                    "tool_span", "tool_back_reach"):
+            if key in known and not filled.get(key):
+                filled[key] = tool[key]
+                added.append(f"{key}={tool[key] * 1000:.1f}mm")
+        if "tool_offset" in known:
+            cad = [float(v) for v in tool["tool_offset"]]
+            given = filled.get("tool_offset")
+            if given is None and not filled.get("tool_length"):
+                filled["tool_offset"] = cad
+                added.append(f"tool_offset={cad} (CAD)")
+            elif given is not None and float(given[2]) < cad[2]:
+                # pick_up's z is a lower bound: the underside of the bowl is
+                # occluded, so the cloud stops short of it. Too shallow a z
+                # puts the bowl lower than planned -- into a floor.
+                filled["tool_offset"] = [float(given[0]), float(given[1]), cad[2]]
+                added.append(f"tool_offset z {float(given[2]) * 1000:.1f} -> "
+                             f"{cad[2] * 1000:.1f}mm (CAD depth; measured is a lower bound)")
+        if added:
+            print(f"[Skills] '{tool['name']}' is in the gripper; for {skill_name} "
+                  f"using its CAD geometry: " + ", ".join(added))
+        return filled
 
     def _resolve_pick_site(self, skill_name: str, params: dict) -> dict:
         """Turn place's ``target_location`` name into the site it was picked from."""

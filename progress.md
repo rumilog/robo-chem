@@ -301,6 +301,152 @@ model must not be asked to guess a depth no camera measured. Until then the
 agent run surfaces the measured value with its lower-bound caveat, which is why
 the model passed 3.9 mm rather than inventing something.
 
+### Re-check with a scripted planner (sim, 2026-09-25)
+
+No API key on the workstation, so the real `AgentOrchestrator` ran on the real
+MuJoCo cell with `FakeLLM` from `scripts/test_agents_offline.py` standing in for
+the model. Everything else was live: SimVision frames and inventory, the skills,
+the arm. The scripted skill-call agent copied the measured `tool_offset` out of
+the prompt, the way a model would. pick_up → scoop → dump → place (back where
+the spoon was picked) all ran and reported success, with no replan.
+
+Reported success is not the same as clean, and this is the gap a real-model run
+will hit:
+
+- **scoop rammed the citric acid dish**: 88k contact steps between the bowl
+  and the dish, the fingers touched it too, and the dish moved **22 mm**. With
+  nothing passing `container_center` / `container_radius`, the stroke is sized
+  from `locate_container`: centre 17 mm off, opening radius read as **66 mm**
+  for a 48.3 mm inside. So it planned 116 mm of travel in a dish that fits
+  about 57 mm. `film_sim_skill.py` and `smoke_test_sim.py` pass the truth, which
+  is why they are clean. The open fix is to make `locate_container` fit a
+  circle to the rim band, instead of taking the median plus the 90th-percentile
+  radius. **Adopted the same day, see below.** RANSAC plus an algebraic (Kåsa) circle
+  fit on only the top 5 mm of the cloud gave the results below. The 15 mm band
+  would include the powder surface, 9 mm under the rim. The fit lands on the
+  wall's mid-line (50.3 outside, 48.3 inside), so the inside radius is the fit
+  minus a wall. This is sim depth with 2 mm noise and exact masks; the rim on
+  real SAM masks will be rougher.
+
+  | Container | Median + p90: centre off / radius | Circle fit: centre off / radius |
+  | --- | --- | --- |
+  | citric acid | 17.1 / 65.5 mm | 0.6 / 50.3 mm |
+  | baking soda | 33.6 / 73.3 mm | 1.0 / 50.2 mm |
+  | paper cup | 1.7 / 40.9 mm | 0.1 / 38.2 mm |
+
+  The live VLM run (`agent_run_20260925_163429`) hit the dish in exactly this
+  way. The scoop took `dish_radius` 65.9 mm from the "measured opening", planned
+  ±58 mm of travel, and had `bowl_length`/`bowl_width`/`bowl_depth` at 0 because
+  the model has no way to know them, so the bowl was treated as a point.
+- **dump was fine from perception alone**. It found the paper cup centre within
+  1.7 mm. By the geometric estimate 1.31 of 1.83 ml went into the cup. Reach at
+  0.54 m capped the straight-ahead tip at 68°.
+- **measured tool offset**: [0.031, 0.008, 0.027] against CAD [0.0257, 0, 0.0294].
+- **a plan that names `"table"` as the place target fails** with `Cannot locate
+  target 'table'`. `place` wants something on the inventory, for example the
+  tool's own name to put it back where it was picked.
+- **real-model dry run** (gpt-4.1, same day, `--sim --dry-run`): it planned
+  the same four steps and all four resolved to valid calls. It passed no
+  `tool_offset`, because a dry run never executes pick_up and so there is no
+  measurement to carry. For "beside the citric acid cup" it chose `place`
+  target `"citric acid cup"`; watch where that puts the spoon in a live run.
+
+### Full chain without the planner (sim, 2026-09-25)
+
+This runs pick → scoop → dump → spoon back → pick stirrer → stir → stirrer back
+in one session, with no model. Repeated `--skill`/`--params` run in order
+against one cell, so the held tool carries over. Since the circle fit and the
+tool geometry fill-in below, the scoop needs no ground truth except the floor
+(see "Still open").
+
+```bash
+python scripts/run_experiment.py --sim --workspace-min 0.25 -0.40 -0.13 \
+  --skill pick_up --params '{"object_name":"larger spoon","z_offset":0.0,"grasp_force":1.0}' \
+  --skill scoop   --params '{"powder_source":"citric acid","container_floor_z":0.008}' \
+  --skill dump    --params '{"target_container":"white paper cup"}' \
+  --skill place   --params '{"target_location":"larger spoon"}' \
+  --skill pick_up --params '{"object_name":"stirring rod"}' \
+  --skill stir    --params '{"target_container":"white paper cup","tool_axis":"z","tool_length":0.081,"revolutions":2}' \
+  --skill place   --params '{"target_location":"stirrer holder","on_top":true,"release_clearance":0.015,"stop_force_n":1.0}'
+```
+
+Measured headless (`--no-viewer --sim-fast`, with every arm and held-tool
+contact counted per skill): all 7 steps succeed, and nothing on the bench moves
+more than 3 mm. The only contacts are the grasps themselves, the spoon leaving
+the table, and the stirrer's rod in its holder's bore. The dump tips to 68° (the
+reach cap at 0.54 m).
+
+**Using the plastic beaker as the dump + stir target instead is not clean.** The
+beaker is closer, so the dump reaches 89°. But the stirrer holder stands 16 cm
+straight ahead of the beaker at (0.62, 0.14). With the bowl pointing ahead,
+link7 swept into the seated stirrer during the tip (12.8k contact steps).
+
+### Powder dish, rim circle fit, tool geometry (2026-09-25)
+
+**The dish, measured on the bench:** 91 mm inside, 102 mm outside, 29 mm tall,
+8 mm base. It is now modelled exactly. `Prop.floor_thickness` is new;
+`inner_radius`, `outer_radius` and `floor_height` are the properties everything
+reads. The old model had 96.6 / 104.6 / 31 / 4 mm; its "outside" was the
+panels' mid-line, not their outer face. `scoop`'s `floor_thickness` default
+went 4 → 8 mm with it. 4 mm would now put the 3 mm floor gap 1 mm into the
+floor.
+
+**`locate_container` fits a circle to the rim** (`_fit_rim_circle`): RANSAC plus
+Kåsa on the top 5 mm of the cloud. `rim_radius` is still the inside of the rim,
+because scoop, arc_scoop and stir read it as the opening. It is taken as the
+5th percentile of the rim points' distance from the fitted centre. The fitted
+circle itself, the wall's mid-line, is `rim_mid_radius`. With too little rim to
+fit, it falls back to the old median and says so (`rim_method`). Measured in sim:
+
+| Container | Centre off | Inside radius: read / true |
+| --- | --- | --- |
+| citric acid dish | 1.0 mm (median: 17) | 44.6 / 45.5 mm |
+| baking soda dish | 1.4 mm (median: 34) | 44.3 / 45.5 mm |
+| paper cup | 0.2 mm | 35.4 / 36.5 mm |
+| beaker | 0.8 mm | 31.9 / 33.0 mm |
+
+All four read about 1 mm small, which is the safe side.
+
+**Tool geometry is filled in by the executor** (`robochem/skills/tool_geometry.py`).
+`SkillsExecutor` remembers what `pick_up` put in the jaws (`held`), and before
+scoop, dump or arc_scoop it fills any missing `bowl_length` / `bowl_width` /
+`bowl_depth` / `tool_span` / `tool_back_reach` from the tool's CAD. It fills
+`tool_offset` too when none was passed. A passed one keeps its x/y but has its
+z raised to the CAD 29.4 mm, since the measured z is a lower bound. With the
+circle fit, this took the no-truth agent run from ramming the dish (88k
+contacts, dish moved 22 mm) to **zero contacts**.
+
+**Powder depth decides whether the floor-referenced scoop collects anything.**
+The tip stays 3 mm off the floor and the mouth is about 10 mm above the tip, so
+in this 21 mm-deep dish (sim, all truth passed): 12 mm of powder gave 0%,
+14 mm 4%, 16 mm 41%, 18 mm 100%. The sim default is now 18 mm, surface 3 mm
+under the rim. **The real fill level is not known yet.**
+
+**The drawn bed has to LOOK like powder, or the planner will not scoop it.**
+A flat `fill_rgba` bed in a white dish rendered as one white disc under the
+cage's lights. The scene agent reported the citric acid dish "empty" on every
+run, and in one live run the planner stopped with 0 sub-tasks: "The 'citric
+acid cup' is empty". The bed now has a speckled texture, with the geom colour
+at 0.55 of `fill_rgba`; at full white the upward face saturates and the speckle
+vanishes. After that, two of two dry runs said "white powder" and planned all
+four steps.
+
+**Still open: the floor estimate.** With no truth passed, the scoop took the
+inside floor as `base_z + floor_thickness` = 10.5 mm against a true 8.0 mm.
+The cloud's lowest points are the dish's outer wall about 2.5 mm up, not its
+bottom edge. Effect on the collected powder, no truth passed otherwise:
+
+| tool_offset | floor | collected |
+| --- | --- | --- |
+| measured (z raised to CAD) | estimated 10.5 mm | 2% |
+| CAD | estimated 10.5 mm | 3% |
+| measured (z raised to CAD) | true 8.0 mm | 36% |
+| CAD | true 8.0 mm | 64% |
+
+The measured tool offset is 5 mm long in x and 8 mm off in y. At the 60° bite,
+x error becomes about 4 mm of height. Candidates: reference the floor to the
+table (z = 0 on this bench) instead of the cloud, and prefer the CAD offset.
+
 ```bash
 # no key, no robot: vocabulary, parameter checks, gripper bookkeeping, replanning
 perception_env/bin/python scripts/test_agents_offline.py

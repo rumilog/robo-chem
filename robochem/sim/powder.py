@@ -77,9 +77,9 @@ def bed_from_prop(scene, prop) -> PowderBed:
     """The bed a container prop holds, from its model geometry and powder_level."""
     body = scene.prop_bodies[prop.name]
     pos = scene.data.xpos[body]
-    floor = pos[2] - prop.height / 2 + 2 * prop.wall
+    floor = pos[2] - prop.height / 2 + prop.floor_height
     return PowderBed(centre=np.asarray(pos[:2], float).copy(),
-                     inner_radius=prop.radius - prop.wall,
+                     inner_radius=prop.inner_radius,
                      floor_z=float(floor),
                      surface_z=float(floor + prop.powder_level))
 
@@ -107,8 +107,8 @@ def openings_from_bench(scene) -> List[Opening]:
         out.append(Opening(
             name=prop.name,
             centre=np.asarray(pos[:2], float).copy(),
-            inner_radius=prop.radius - prop.wall,
-            floor_z=float(pos[2] - prop.height / 2 + 2 * prop.wall),
+            inner_radius=prop.inner_radius,
+            floor_z=float(pos[2] - prop.height / 2 + prop.floor_height),
             heap_geom=mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_GEOM,
                                         f"{prop.body}_received"),
             heap_body=mujoco.mj_name2id(scene.model, mujoco.mjtObj.mjOBJ_BODY,

@@ -241,9 +241,10 @@ class ScoopSkill(BaseSkill):
             # When container_floor_z is not given, the inside floor is taken as
             # the measured outer bottom (base_z) plus this. MEASURE IT for the
             # container in use — it is the floor thickness plus whatever the
-            # outer bottom estimate reads low. The simulated reagent dish is
-            # 4mm.
-            "floor_thickness": 0.004,
+            # outer bottom estimate reads low. The powder dishes on the bench
+            # have an 8mm base (measured 2026-09-25; 4mm before, on the old
+            # dish, would now put a 3mm floor gap 1mm INTO the floor).
+            "floor_thickness": 0.008,
             # Gap kept between the lowest point of the head and the inside
             # floor. This is NOT a guess about where the floor is — that is
             # container_floor_z / floor_thickness — it only absorbs how far
@@ -603,7 +604,9 @@ class ScoopSkill(BaseSkill):
             dish_source = "container_radius"
         else:
             dish_radius = float(rim_radius)
-            dish_source = "measured opening (pass container_radius if known)"
+            dish_source = (f"measured inside of the rim, {located.get('rim_method', 'median')}"
+                           if located.get("rim_mid_radius") is not None else
+                           "measured opening (pass container_radius if known)")
         reach_limit = dish_radius - wall_clearance
         # "Forward" is the way the level bowl points, flattened -- the stroke
         # runs along the tool, whichever way the scoop was picked up.

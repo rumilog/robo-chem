@@ -40,6 +40,9 @@ class Prop:
     # used by robochem.sim.powder to estimate what a scoop collects. Granules
     # (``fill``) are the physical alternative and only appear with granules=True.
     powder_level: float = 0.0
+    # A container's base, bottom to inside floor, metres. None keeps the old
+    # model, where the base is as thick as the wall panels (2 * wall).
+    floor_thickness: Optional[float] = None
     static: bool = False            # True = welded to the table, never moves
 
     # A prop whose real shape matters to perception carries its CAD instead of
@@ -82,6 +85,23 @@ class Prop:
     def body(self) -> str:
         """MuJoCo body name -- the semantic name is not XML-safe."""
         return "prop_" + "".join(c if c.isalnum() else "_" for c in self.name).lower()
+
+    # A container's wall is a ring of panels 2 * wall thick, CENTRED on
+    # ``radius`` (scene._add_container), so radius is the wall's mid-line:
+    @property
+    def inner_radius(self) -> float:
+        """Inside radius of a container: the panels' inner face."""
+        return self.radius - self.wall
+
+    @property
+    def outer_radius(self) -> float:
+        """Outside radius of a container: the panels' outer face."""
+        return self.radius + self.wall
+
+    @property
+    def floor_height(self) -> float:
+        """Height of a container's inside floor above the table."""
+        return self.floor_thickness if self.floor_thickness is not None else 2 * self.wall
 
     @property
     def grasp_offset(self) -> Tuple[float, float, float]:
@@ -150,28 +170,36 @@ def default_bench() -> List[Prop]:
         Prop(
             name="citric acid cup",
             pos=(0.38, -0.26),
-            # The larger dishes bought for the bench (was 0.0345, a 65mm-inside
-            # dish): measured 3.96 in = 100.6mm across the outside. The inside
-            # is not measured yet -- 96.6mm assumes the 2mm wall below. The
-            # scoop's stroke is sized to the INSIDE radius (radius - wall), so
-            # correct the wall once the inside diameter is known.
-            radius=0.0503,
-            height=0.031,      # the lab's reagent cups are shallow dishes
-            wall=0.002,
+            # The powder dishes on the bench, measured 2026-09-25: 91mm across
+            # the inside, 102mm across the outside, 29mm tall, an 8mm base.
+            # radius is the wall's mid-line (see Prop.inner_radius), so
+            # 45.5mm inside + 51.0mm outside -> radius 48.25, wall 2.75. The
+            # scoop's stroke is sized to the inside radius and its depth to
+            # the inside floor, so these four numbers are the ones that matter.
+            radius=0.04825,
+            height=0.029,
+            wall=0.00275,
+            floor_thickness=0.008,
             rgba=(0.97, 0.97, 0.97, 1.0),
             mass=0.01,
             label="citric acid",
             fill=90,           # granules, only with granules=True
             grain_radius=0.003,
             fill_rgba=(0.98, 0.98, 0.94, 1.0),
-            powder_level=0.018,  # powder 18mm deep: surface 9mm under the rim
+            # 18mm of powder on the 8mm base: surface 3mm under the rim. Not
+            # measured -- set it to the real fill. It decides whether a scoop
+            # collects anything: the stroke keeps the tip 3mm off the floor and
+            # the mouth sits ~10mm above the tip, so in this 21mm-deep dish
+            # 14mm of powder gave 4% of a bowl, 16mm 41%, 18mm 100% (sim).
+            powder_level=0.018,
         ),
         Prop(
             name="baking soda cup",
             pos=(0.38, 0.26),
-            radius=0.0503,     # same 3.96 in dish as the citric acid cup
-            height=0.031,
-            wall=0.002,
+            radius=0.04825,    # the same dish as the citric acid cup
+            height=0.029,
+            wall=0.00275,
+            floor_thickness=0.008,
             rgba=(0.97, 0.97, 0.97, 1.0),
             mass=0.01,
             label="baking soda",

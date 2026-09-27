@@ -145,11 +145,13 @@ def _add_container(spec, prop: Prop, table_z: float):
     body.add_freejoint()
 
     half_h = prop.height / 2
-    inner = prop.radius - prop.wall
+    inner = prop.inner_radius
+    # The base: the container's full outside footprint, floor_height thick, so
+    # the inside floor sits exactly floor_height above the table.
     body.add_geom(
         type=mujoco.mjtGeom.mjGEOM_CYLINDER,
-        size=[prop.radius, prop.wall, 0],
-        pos=[0, 0, -half_h + prop.wall],
+        size=[prop.outer_radius, prop.floor_height / 2, 0],
+        pos=[0, 0, -half_h + prop.floor_height / 2],
         rgba=list(prop.rgba),
         density=500,
     )
@@ -406,7 +408,7 @@ def _add_mesh_scoop(spec, prop: Prop, table_z: float):
     return body
 
 
-def _add_powder_bed(cup_body, prop: Prop):
+def _add_powder_bed(spec, cup_body, prop: Prop):
     """
     A drawn powder bed: a solid-looking fill from the inside floor up to
     ``prop.powder_level``, with no contacts and no mass.
@@ -420,15 +422,30 @@ def _add_powder_bed(cup_body, prop: Prop):
     robochem.sim.powder.
     """
     half_h = prop.height / 2
-    inner = prop.radius - prop.wall
-    level = min(prop.powder_level, prop.height - 2 * prop.wall)
+    inner = prop.inner_radius
+    level = min(prop.powder_level, prop.height - prop.floor_height)
     bed = cup_body.add_body(name=prop.body + "_powder",
-                            pos=[0, 0, -half_h + 2 * prop.wall + level / 2])
+                            pos=[0, 0, -half_h + prop.floor_height + level / 2])
+    # Speckled and a shade darker than the dish, so it reads as powder. Flat
+    # fill_rgba in a white dish rendered as one white disc, and the scene agent
+    # reported the citric acid dish "empty" -- then, once, refused to plan a
+    # scoop at all (2026-09-25). A real bed has grain the cameras do see.
+    rgb = [0.92 * c for c in prop.fill_rgba[:3]]
+    tex = spec.add_texture(
+        name=prop.body + "_powder_tex", type=mujoco.mjtTexture.mjTEXTURE_CUBE,
+        builtin=mujoco.mjtBuiltin.mjBUILTIN_FLAT, mark=mujoco.mjtMark.mjMARK_RANDOM,
+        random=0.3, rgb1=rgb, rgb2=rgb, markrgb=[0.7 * c for c in rgb],
+        width=256, height=256)
+    mat = spec.add_material(name=prop.body + "_powder_mat")
+    mat.textures[int(mujoco.mjtTextureRole.mjTEXROLE_RGB)] = tex.name
     bed.add_geom(
         type=mujoco.mjtGeom.mjGEOM_CYLINDER,
         name=prop.body + "_powder_bed",
         size=[inner - 0.0005, level / 2, 0],
-        rgba=list(prop.fill_rgba),
+        material=mat.name,
+        # The geom colour scales the texture. At full white the cage's lights
+        # saturate the upward face and the speckle vanishes; 0.55 keeps it.
+        rgba=[0.55 * c for c in prop.fill_rgba[:3]] + [prop.fill_rgba[3]],
         contype=0, conaffinity=0, density=0,
         group=2,
     )
@@ -443,7 +460,7 @@ def _add_heap(cup_body, prop: Prop):
     cup alone.
     """
     heap = cup_body.add_body(name=prop.body + "_received",
-                             pos=[0, 0, -prop.height / 2 + 2 * prop.wall])
+                             pos=[0, 0, -prop.height / 2 + prop.floor_height])
     heap.add_geom(
         type=mujoco.mjtGeom.mjGEOM_CYLINDER,
         name=prop.body + "_received",
@@ -500,7 +517,7 @@ def _add_grains(spec, prop: Prop, table_z: float) -> List[str]:
     """Loose granules resting in a reagent cup, so pours and scoops show flow."""
     names = []
     rng = np.random.default_rng(abs(hash(prop.name)) % (2**32))
-    inner = prop.radius - prop.wall * 2
+    inner = prop.inner_radius - prop.wall     # a wall's margin off the inside face
     sites = _grain_sites(inner, prop.grain_radius, rng)
     if not sites:
         return names
@@ -510,7 +527,7 @@ def _add_grains(spec, prop: Prop, table_z: float) -> List[str]:
         body = spec.worldbody.add_body(
             name=name,
             pos=[prop.pos[0] + x, prop.pos[1] + y,
-                 table_z + prop.wall * 2 + prop.grain_radius * 2
+                 table_z + prop.floor_height + prop.grain_radius * 2
                  + 2.3 * prop.grain_radius * (i // len(sites))],
         )
         body.add_freejoint()
@@ -663,7 +680,7 @@ def build_scene(
         else:
             cup = _add_container(spec, prop, bench.table_z)
             if not granules and prop.powder_level > 0:
-                _add_powder_bed(cup, prop)
+                _add_powder_bed(spec, cup, prop)
             _add_heap(cup, prop)
         if granules and prop.fill:
             grain_names[prop.name] = _add_grains(spec, prop, bench.table_z)

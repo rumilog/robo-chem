@@ -128,7 +128,7 @@ def test_spoon_and_scoop(cell) -> bool:
                   # The stroke is sized to the dish, so give it the real inside
                   # radius: perception's "opening radius" reads the outside of
                   # the rim plus its centre error.
-                  "container_radius": cup.radius - cup.wall,
+                  "container_radius": cup.inner_radius,
                   # ...and its real centre: perception's leans ~16 mm toward the
                   # cameras on the 90 mm dish, which puts the bowl in the wall.
                   "container_center": list(cell.vision.ground_truth("citric acid")[:2])}
@@ -163,7 +163,7 @@ def test_scoop_and_dump(cell) -> bool:
     scooped, _ = cell.skills.execute(
         "scoop", {"powder_source": "citric acid", **tool,
                   "tool_span": 0.0275, "tool_back_reach": 0.030,
-                  "container_radius": cup.radius - cup.wall,
+                  "container_radius": cup.inner_radius,
                   "container_center": list(cell.vision.ground_truth("citric acid")[:2])}
     )
     ok &= check("scoop reports success", scooped)
@@ -228,7 +228,7 @@ def test_scoop_then_stir(cell) -> bool:
     scooped, _ = cell.skills.execute(
         "scoop", {"powder_source": "citric acid", **tool,
                   "tool_span": 0.0275, "tool_back_reach": 0.030,
-                  "container_radius": cup.radius - cup.wall,
+                  "container_radius": cup.inner_radius,
                   "container_center": list(cell.vision.ground_truth("citric acid")[:2])}
     )
     ok &= check("scoop reports success", scooped)

@@ -91,6 +91,51 @@ def tool_y_delta(angle_degrees: float) -> np.ndarray:
     return np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]])
 
 
+def _circle_lsq(xy: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Algebraic (Kasa) least-squares circle through 2-D points: centre, radius."""
+    A = np.column_stack([xy[:, 0], xy[:, 1], np.ones(len(xy))])
+    b = (xy ** 2).sum(axis=1)
+    c, *_ = np.linalg.lstsq(A, b, rcond=None)
+    centre = c[:2] / 2.0
+    r2 = float(c[2] + centre @ centre)
+    return centre, (float(np.sqrt(r2)) if r2 > 0 else float("nan"))
+
+
+def _fit_rim_circle(xy: np.ndarray, tol: float = 0.002, iters: int = 300,
+                    max_points: int = 3000, seed: int = 0):
+    """
+    RANSAC circle through a container's rim points, seen from above.
+
+    Returns (centre, radius, inlier_fraction), or None when there is too little
+    to fit. Seeded, so the same cloud always gives the same answer.
+
+    A circle, not a median, because the cage never sees a whole rim: each
+    camera sees the arc facing it, the points pile up there, and a median or a
+    centroid follows the pile. A circle through any decent arc lands on the
+    true centre -- 0.6 mm on the citric acid dish in sim where the median was
+    17 mm off, 1.0 mm on the baking soda dish where it was 34 mm off.
+    """
+    xy = np.asarray(xy, dtype=float)
+    if len(xy) < 30:
+        return None
+    rng = np.random.default_rng(seed)
+    if len(xy) > max_points:
+        xy = xy[rng.choice(len(xy), max_points, replace=False)]
+    best, best_count = None, 0
+    for _ in range(iters):
+        centre, r = _circle_lsq(xy[rng.choice(len(xy), 3, replace=False)])
+        if not np.isfinite(r):
+            continue
+        inliers = np.abs(np.linalg.norm(xy - centre, axis=1) - r) < tol
+        count = int(inliers.sum())
+        if count > best_count:
+            best, best_count = inliers, count
+    if best is None or best_count < 10:
+        return None
+    centre, r = _circle_lsq(xy[best])
+    return centre, r, best_count / len(xy)
+
+
 def _rotations_for(rotation, count: int):
     """
     Normalize ``rotation`` to one orthonormal 3x3 per path point.
@@ -151,6 +196,10 @@ class BaseSkill(ABC):
     - check_preconditions method
     - execute method
     """
+
+    #: A fitted rim wider than this is not a container on this bench but a
+    #: circle through clutter; locate_container falls back rather than trust it.
+    MAX_RIM_RADIUS = 0.2
     
     def __init__(self, robot_interface, vision_system, config: Dict[str, Any] = None):
         """
@@ -329,7 +378,8 @@ class BaseSkill(ABC):
     def locate_container(self, object_name: str,
                          force_refresh: bool = True,
                          rim_band: float = 0.015,
-                         category: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                         category: Optional[str] = None,
+                         rim_fit_band: float = 0.005) -> Optional[Dict[str, Any]]:
         """
         Localize a container and measure the geometry skills actually need.
 
@@ -343,7 +393,10 @@ class BaseSkill(ABC):
             object_name: Semantic name to segment
             force_refresh: Re-segment rather than trusting the cache. Default
                 True because containers move between skills.
-            rim_band: Thickness of the top slab used to estimate the opening.
+            rim_band: Thickness of the top slab the fallback estimate uses.
+            rim_fit_band: Thickness of the top slab the rim circle is fitted
+                to. Thin on purpose: a 15 mm slab reaches the powder surface
+                in a shallow dish (9 mm under the rim), and powder is not rim.
             category: SAM category to search when resolving a written label.
                 Defaults to white paper cups. A label on a CLEAR cup will not
                 be found without this — the label path only ever looks at
@@ -352,7 +405,9 @@ class BaseSkill(ABC):
 
         Returns:
             Dict with points, centroid, top_z, base_z, height, rim_center
-            (XY of the opening) and rim_radius, or None if not located.
+            (XY of the opening), rim_radius (the INSIDE of the rim -- what an
+            opening can take), rim_mid_radius (the fitted rim circle, the
+            wall's mid-line) and rim_method, or None if not located.
         """
         if category:
             located = self.vision.locate(object_name, force_refresh=force_refresh,
@@ -374,13 +429,39 @@ class BaseSkill(ABC):
         top_z = float(np.percentile(points[:, 2], 97))
         base_z = float(np.percentile(points[:, 2], 3))
 
-        rim = points[points[:, 2] > top_z - rim_band]
-        if len(rim) < 10:
-            rim = points
-        rim_center = np.array([float(np.median(rim[:, 0])),
-                               float(np.median(rim[:, 1]))])
-        radial = np.linalg.norm(rim[:, :2] - rim_center, axis=1)
-        rim_radius = float(np.percentile(radial, 90))
+        # The opening, as a circle fitted to the top of the rim.
+        top = points[points[:, 2] > top_z - rim_fit_band][:, :2]
+        fit = _fit_rim_circle(top)
+        rim_mid_radius = None
+        if (fit is not None and 0.005 < fit[1] < self.MAX_RIM_RADIUS
+                and fit[2] >= 0.3):
+            rim_center, rim_mid_radius = np.asarray(fit[0], dtype=float), float(fit[1])
+            # The fitted circle runs along the middle of the rim; what fits
+            # through the opening is its inside edge. Take that from the rim
+            # points themselves -- a low percentile of their distance from the
+            # centre -- ignoring anything well inside the wall.
+            radial = np.linalg.norm(top - rim_center, axis=1)
+            near = radial[np.abs(radial - rim_mid_radius) < 0.015]
+            rim_radius = float(min(np.percentile(near, 5), rim_mid_radius))
+            rim_method = f"circle fit ({fit[2] * 100:.0f}% of {len(top)} rim points)"
+        else:
+            # Too little rim to fit. The old estimate: median of a thicker top
+            # slab for the centre, 90th percentile for the radius. It leans
+            # toward the cameras and reads wide (17 mm off, 66 for 48 mm on the
+            # citric acid dish in sim), so say so.
+            rim = points[points[:, 2] > top_z - rim_band]
+            if len(rim) < 10:
+                rim = points
+            rim_center = np.array([float(np.median(rim[:, 0])),
+                                   float(np.median(rim[:, 1]))])
+            radial = np.linalg.norm(rim[:, :2] - rim_center, axis=1)
+            rim_radius = float(np.percentile(radial, 90))
+            rim_method = ("median fallback: "
+                          + ("too few rim points" if fit is None else
+                             f"circle fit rejected (r={fit[1] * 1000:.0f}mm, "
+                             f"{fit[2] * 100:.0f}% inliers)"))
+            print(f"[Vision] '{object_name}' rim: {rim_method} -- the centre "
+                  f"leans toward the cameras and the radius reads wide")
 
         return {
             "name": object_name,
@@ -390,11 +471,13 @@ class BaseSkill(ABC):
             "top_z": top_z,
             "base_z": base_z,
             "height": top_z - base_z,
-            # Median of the rim band, not the full-cloud centroid: cage
-            # coverage is one-sided, so the fused cloud leans toward whichever
-            # cameras saw the object and the centroid sits off the opening.
+            # Not the full-cloud centroid: cage coverage is one-sided, so the
+            # fused cloud leans toward whichever cameras saw the object and the
+            # centroid sits off the opening. See _fit_rim_circle.
             "rim_center": rim_center,
             "rim_radius": rim_radius,
+            "rim_mid_radius": rim_mid_radius,
+            "rim_method": rim_method,
             "cameras": located.get("cameras"),
         }
 
