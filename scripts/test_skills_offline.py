@@ -573,6 +573,88 @@ def test_projection_skips_a_camera_that_cannot_see_it():
           4 not in masks)
 
 
+def test_one_label_camera_is_trusted_when_the_other_disagrees():
+    """A projection onto a different cup must not veto the camera that read it."""
+    print("\n[vision: one label read survives a disagreeing second camera]")
+    from robochem.vision import VisionSystem
+
+    vs = VisionSystem.__new__(VisionSystem)
+    vs.consensus_tolerance = 0.05
+    vs.max_object_extent = 0.35
+    vs.min_object_height = -0.02
+    vs.min_object_points = 50
+    vs.min_instance_score = 0.5
+    vs.labeled_cup_category = "clear plastic cup"
+    vs.compute_dimensions = lambda points: np.array([0.05, 0.05, 0.04])
+
+    # The 2026-09-25 dump: cam 3 read the label, cam 4's projection was 52 mm off.
+    cam3 = np.array([[0.4081, 0.0357, 0.0055]] * 80)
+    cam4 = np.array([[0.3939, -0.0124, -0.0092]] * 80)
+    clouds = {3: cam3, 4: cam4}
+    mask = np.zeros((4, 4), bool)
+    mask[0, 0] = True
+
+    class Loc:
+        def __init__(self):
+            self._cached_pointclouds = {}
+            self._cached_centroids = {}
+            self.camera_ids = [2, 3, 4, 5]
+
+        def capture_pointclouds(self):
+            return {"images": {c: None for c in self.camera_ids},
+                    "depth_images": {}, "intrinsics": {}}
+
+        def get_object_points_by_camera(self, masks, depth_images=None,
+                                        intrinsics=None):
+            return {c: clouds[c] for c in masks if c in clouds}
+
+        def _remove_outliers(self, points, neighbors=20, std_ratio=2.0):
+            return points
+
+        def cache_object(self, name, pointcloud, centroid=None):
+            self._cached_pointclouds[name] = pointcloud
+            self._cached_centroids[name] = (
+                centroid if centroid is not None else pointcloud.mean(axis=0))
+
+    class Grounding:
+        def segment_instances(self, images, category):
+            return {3: [{"mask": mask}], 4: [{"mask": mask}]}
+
+    vs.object_localizer = Loc()
+    vs.scene_analyzer = type("SA", (), {"grounding": Grounding()})()
+
+    def projected(label, images, instances, data):
+        return (
+            {3: mask, 4: mask},
+            {3: 0.90, 4: 0.73},
+            {3: "B 10 ML WATER", 4: "(projected from [3])"},
+            "projection from cameras [3]",
+        )
+
+    vs._resolve_by_projection = projected
+    located = vs.locate_labeled("B 10 ml water", category="clear plastic cup")
+    check("the cup is located from the one camera that read the label",
+          located is not None and located["cameras"] == [3],
+          f"{None if located is None else located.get('cameras')}")
+    if located is not None:
+        err = float(np.linalg.norm(located["centroid"] - cam3[0]))
+        check("the position is that camera's, not a blend with the other",
+              err < 0.01, f"centroid off by {err * 1000:.0f}mm")
+
+    def both_read(label, images, instances, data):
+        return (
+            {3: mask, 4: mask},
+            {3: 0.90, 4: 0.80},
+            {3: "B 10 ML WATER", 4: "B 10 ML WATER"},
+            "per-camera label reads (fallback)",
+        )
+
+    vs._resolve_by_projection = both_read
+    refused = vs.locate_labeled("B 10 ml water", category="clear plastic cup")
+    check("two cameras that both read the label and disagree are still refused",
+          refused is None, f"{None if refused is None else refused.get('cameras')}")
+
+
 def test_label_crop_excludes_neighbours():
     """The crop must not reach a neighbouring container's paper."""
     print("\n[labels: crop is tight and masks neighbours]")
@@ -600,6 +682,21 @@ def test_label_crop_excludes_neighbours():
     check("a lone container's crop has nothing greyed out",
           not lone_grey.any(), f"{lone_grey.sum()} grey px")
 
+    # Camera 2, 2026-09-25: the sheet runs well below the cup box, and a
+    # second mask of the same cup used to be greyed over the only visible text.
+    sheet = np.full((480, 848, 3), (30, 40, 80), np.uint8)
+    sheet[300:450, 340:520] = (245, 245, 245)
+    cup = {"box": [391, 233, 458, 303], "mask": None}
+    dup = {"box": [400, 263, 450, 302], "mask": None}
+    grown = crop_around_instance(sheet, cup, neighbours=[cup, dup])
+    white = np.all(grown.astype(int) > 200, axis=2)
+    check("the crop includes the paper in front of the cup",
+          int(white.sum()) > 500, f"{int(white.sum())} white px")
+    grey = np.all(np.abs(grown.astype(int) - 128) < 3, axis=2)
+    check("a second mask of the same cup is not greyed out",
+          not grey.any(),
+          f"{int(grey.sum())} grey px in {grown.shape[1]}x{grown.shape[0]}")
+
 
 def test_duplicate_labels_are_flagged():
     """Two containers reading the same label means the crop bled."""
@@ -621,6 +718,18 @@ def test_duplicate_labels_are_flagged():
     check("a single clean match says nothing",
           "DUPLICATE" not in buf2.getvalue() and "AMBIGUOUS" not in buf2.getvalue(),
           buf2.getvalue().strip() or "(silent)")
+
+    same_cup = [
+        {"score": 0.79, "box": [391, 233, 458, 303]},
+        {"score": 0.32, "box": [400, 263, 450, 302]},
+    ]
+    buf3 = io.StringIO()
+    with contextlib.redirect_stdout(buf3):
+        inst, lab = pick_matching_instance(
+            same_cup, ["B 10 ML WATER", "B 10 ML WATER"], "b 10 ml water")
+    check("two masks of one cup are not called a duplicate",
+          "DUPLICATE" not in buf3.getvalue() and inst is same_cup[0],
+          buf3.getvalue().strip() or f"picked score {inst.get('score') if inst else None}")
 
 
 def test_label_matching_distinguishes_replicates():
@@ -924,6 +1033,55 @@ def test_pick_up_grasp_offsets():
           ok0 and abs(run({"forward_offset": 0.0})[1]["grasp_pose"][0][3] - x0) < 1e-9)
 
 
+def test_stir_defaults_to_top_down():
+    """
+    With no tool_axis, stir is the sim's top-down stir: fingers at the table.
+
+    Hardware used to get the spoon default and a 90deg tool-Y tilt that laid
+    the stirrer on its side. The default must never tilt, must level a wrist
+    reset_joints left a few degrees off, and must hold fingers-down for every
+    pose it commands.
+    """
+    print("\n[stir: default is top-down, the pick_up orientation]")
+    cup = cylinder_cloud([0.50, 0.0], base_z=0.02, height=0.08, radius=0.045)
+    vision = FakeVision({"cup": cup})
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    arm.pose.rotation = np.diag([1.0, -1.0, -1.0]) @ _tool_y(3.0)
+    skill = make(StirSkill, vision, arm)
+
+    tilts, rotations, targets = [], [], []
+    skill.rotate_about_tool_axis = lambda *a, **k: tilts.append(a) or True
+    rigid = skill.goto_pose_rigid
+
+    def spy(xyz, rotation, **kw):
+        rotations.append(np.asarray(rotation, dtype=float))
+        targets.append(np.asarray(xyz, dtype=float))
+        return rigid(xyz, rotation, **kw)
+    skill.goto_pose_rigid = spy
+
+    ok, result = skill.execute({"target_container": "cup", "revolutions": 1,
+                                "smooth": False, "waypoints_per_rev": 6,
+                                "seconds_per_waypoint": 0.0})
+    check("default stir succeeds from a top-down grasp", ok, f"{result}")
+    check("reports tool_axis 'z'", ok and result["tool_axis"] == "z")
+    check("no tool-Y tilt is ever commanded", not tilts, f"{tilts}")
+    worst = max(float(np.degrees(np.arccos(np.clip(-R[2, 2], -1, 1))))
+                for R in rotations) if rotations else 180.0
+    check("every commanded pose is fingers straight down",
+          worst < 0.1, f"worst {worst:.2f} deg from down over {len(rotations)} poses")
+    check("the 3 deg reset_joints lean was levelled out",
+          skill.tool_tip_deg() < 0.1, f"{skill.tool_tip_deg():.2f} deg")
+    check("tool_length defaults to the stirrer CAD (0.081)",
+          ok and abs(result["tool_length"] - 0.081) < 1e-9,
+          f"{result.get('tool_length')}")
+    rim_z = skill.locate_container("cup")["top_z"]
+    expected_z = rim_z - 0.03 + 0.081
+    circle_z = [t[2] for t in targets[-7:-1]]
+    check("circle TCP sits tool_length above the immersion depth",
+          circle_z and all(abs(z - expected_z) < 1e-6 for z in circle_z),
+          f"{np.round(circle_z, 4)} vs {expected_z:.4f}")
+
+
 def test_stir_tilts_a_flat_spoon_upright():
     """A 90deg tilt toward the base stands a flat-grasped spoon up."""
     print("\n[stir: flat spoon tilted upright toward the base]")
@@ -938,6 +1096,7 @@ def test_stir_tilts_a_flat_spoon_upright():
           f"long axis={skill.tool_long_axis_deg():.1f} deg")
 
     ok, result = skill.execute({"target_container": "cup", "revolutions": 1,
+                                "tool_axis": "x",
                                 "waypoints_per_rev": 6,
                                 "seconds_per_waypoint": 0.0})
     check("stir succeeds from a flat grasp", ok, f"{result}")
@@ -962,6 +1121,7 @@ def test_stir_tilt_does_not_overshoot_on_retry():
     arm.pose.rotation = FLAT_GRASP_R.copy()
     skill = make(StirSkill, vision, arm)
     ok, result = skill.execute({"target_container": "cup", "revolutions": 1,
+                                "tool_axis": "x",
                                 "waypoints_per_rev": 6, "orient_retries": 5,
                                 "seconds_per_waypoint": 0.0})
     check("a lagging wrist still converges", ok, f"{result}")
@@ -977,7 +1137,7 @@ def test_stir_refuses_a_spoon_that_will_not_stand_up():
     arm = FakeArm(tracking=1.0, gripper_width=0.03, tilt_gain=0.02)
     arm.pose.rotation = FLAT_GRASP_R.copy()
     skill = make(StirSkill, vision, arm)
-    ok, result = skill.execute({"target_container": "cup"})
+    ok, result = skill.execute({"target_container": "cup", "tool_axis": "x"})
     check("stir fails when the spoon stays horizontal", not ok, f"{result}")
     check("the failure says a horizontal spoon cannot enter",
           "horizontal" in result.get("error", "").lower(),
@@ -1185,9 +1345,9 @@ def test_stir_in_air_needs_no_container():
     # What must not happen is a segmentation pass.
     check("no segmentation was attempted", vision.locate_calls == 0,
           f"locate() called {vision.locate_calls} times")
-    check("the tool was still swung upright",
-          ok and result["long_axis_deg"] < 15.0,
-          f"long axis={result.get('long_axis_deg')}")
+    check("the in-air stir is top-down too (fingers at the table)",
+          ok and result["tool_angle_from_down_deg"] < 1.0,
+          f"tool Z {result.get('tool_angle_from_down_deg')} deg from down")
     check("the full circle ran", ok and result["revolutions_completed"] == 2.0,
           f"{result.get('revolutions_completed')}")
 
@@ -1197,6 +1357,138 @@ def test_stir_in_air_needs_no_container():
     check("the commanded path spans roughly the circle diameter",
           (max(xs) - min(xs)) > 0.05 and (max(ys) - min(ys)) > 0.05,
           f"x span={max(xs) - min(xs):.3f}, y span={max(ys) - min(ys):.3f}")
+
+
+class PressArm(FakeArm):
+    """
+    A FakeArm with a force reading: a stiff surface at ``surface_z`` (TCP
+    height) pushes back 1N per mm of penetration, on top of a constant sensor
+    bias the skill must subtract rather than mistake for contact.
+    """
+
+    def __init__(self, surface_z, bias=-2.5):
+        super().__init__(tracking=1.0, gripper_width=0.03)
+        self.surface_z = surface_z
+        self.bias = bias
+
+    def get_ee_force_torque(self):
+        press = max(0.0, self.surface_z - float(self.pose.translation[2]))
+        return np.array([0.0, 0.0, self.bias + 1000.0 * press, 0.0, 0.0, 0.0])
+
+
+def test_stir_stops_descending_on_contact():
+    """A rod that meets the floor early stops there instead of pushing on."""
+    print("\n[stir: force-guarded descent]")
+    cup = cylinder_cloud([0.50, 0.0], base_z=0.02, height=0.08, radius=0.045)
+    opts = {"target_container": "cup", "revolutions": 1, "smooth": False,
+            "waypoints_per_rev": 6, "seconds_per_waypoint": 0.0,
+            "probe_seconds": 0.0}
+    rim_z = make(StirSkill, FakeVision({"cup": cup}), FakeArm()) \
+        .locate_container("cup")["top_z"]
+    tool = StirSkill.STIRRER_TOOL_LENGTH
+    planned = rim_z - 0.03 + tool
+
+    # Floor 15mm below the rim, i.e. 15mm shallower than the 30mm asked for.
+    surface = rim_z - 0.015 + tool
+    arm = PressArm(surface)
+    ok, result = make(StirSkill, FakeVision({"cup": cup}), arm).execute(dict(opts))
+    check("stir still succeeds after stopping short", ok, f"{result}")
+    check("the descent was stopped by force",
+          ok and result["stopped_by_force"] is True, f"{result.get('stopped_by_force')}")
+    lowest = min(c[0][2] for c in arm.commands)
+    check("never commanded more than one step past the contact",
+          lowest > surface - 0.004, f"lowest z={lowest:.4f}, surface {surface:.4f}")
+    check("never commanded the planned depth",
+          lowest > planned + 0.005, f"lowest z={lowest:.4f}, planned {planned:.4f}")
+    check("stirs backed off above the contact",
+          ok and result["stir_z"] > result["contact_z"]
+          and abs(result["stir_z"] - result["contact_z"] - 0.003) < 1e-6,
+          f"stir_z={result.get('stir_z')}, contact_z={result.get('contact_z')}")
+    check("the -2.5N sensor bias was not read as contact",
+          ok and 1.0 < result["contact_force_n"] < 4.0,
+          f"{result.get('contact_force_n')}")
+
+    # Something 5mm ABOVE the rim at the rod tip: it landed on the rim.
+    arm = PressArm(rim_z + 0.005 + tool)
+    ok, result = make(StirSkill, FakeVision({"cup": cup}), arm).execute(dict(opts))
+    check("contact above the rim is refused, not stirred", not ok, f"{result}")
+    check("the refusal says it landed on the rim",
+          "rim" in result.get("error", "").lower(), f"{result.get('error')}")
+    check("it lifted back out to the hover",
+          arm.pose.translation[2] > rim_z + tool + 0.05,
+          f"z={arm.pose.translation[2]:.4f}")
+
+    # Nothing in the way: the full planned depth, no early stop.
+    arm = PressArm(0.0)
+    ok, result = make(StirSkill, FakeVision({"cup": cup}), arm).execute(dict(opts))
+    check("with nothing in the way it reaches the planned depth",
+          ok and abs(result["stir_z"] - planned) < 1e-6
+          and result["force_guarded"] is True and result["stopped_by_force"] is False,
+          f"{result.get('stir_z')} vs {planned:.4f}")
+
+    # No force reading at all: position-only, as before, and it says so.
+    ok, result = make(StirSkill, FakeVision({"cup": cup}), FakeArm(
+        tracking=1.0, gripper_width=0.03)).execute(dict(opts))
+    check("an arm with no force reading falls back to position",
+          ok and result["force_guarded"] is False, f"{result}")
+
+
+def test_depth_gate_drops_edge_streaks_not_containers():
+    """
+    Mask edge pixels carrying the bench depth behind a small object must go;
+    a real container's own depth spread must not.
+    """
+    print("\n[perception: depth gate on mask edge streaks]")
+    import types
+    from robochem.vision.object_localizer import ObjectLocalizer
+    loc = ObjectLocalizer.__new__(ObjectLocalizer)
+    intr = types.SimpleNamespace(fx=610.0, fy=610.0, cx=424.0, cy=240.0)
+
+    # A 30mm cube at 0.47m is ~40px across. Its 2px border reads the bench
+    # 0.19m behind it, the way cams 2/3 did on the stirrer stills.
+    depth = np.zeros((480, 848), dtype=np.uint16)
+    mask = np.zeros_like(depth, dtype=bool)
+    mask[200:240, 400:440] = True
+    depth[200:240, 400:440] = 660
+    depth[202:238, 402:438] = 470
+    pts = loc._depth_to_points(depth, mask, intr)
+    zs = pts[:, 2]
+    check("the bench-depth border is dropped from a small object",
+          zs.max() < 0.50, f"depth {zs.min():.3f}..{zs.max():.3f} m")
+    check("the object's own pixels are all kept",
+          len(pts) == 36 * 36, f"{len(pts)} of {36 * 36}")
+
+    # A cup ~150px across at 0.5m, its depth spread over 0.45-0.58m.
+    depth = np.zeros((480, 848), dtype=np.uint16)
+    mask = np.zeros_like(depth, dtype=bool)
+    mask[150:300, 350:500] = True
+    depth[150:300, 350:500] = np.linspace(450, 580, 150).astype(np.uint16)[:, None]
+    pts = loc._depth_to_points(depth, mask, intr)
+    check("a container's full depth spread survives",
+          len(pts) == 150 * 150, f"{len(pts)} of {150 * 150}")
+
+
+def test_stir_offsets_shift_the_circle_centre():
+    """forward/lateral_offset move the circle, in the pour/scoop convention."""
+    print("\n[stir: forward/lateral offset shifts the circle centre]")
+    cup = cylinder_cloud([0.50, 0.0], base_z=0.02, height=0.08, radius=0.045)
+    opts = {"target_container": "cup", "revolutions": 1, "smooth": False,
+            "waypoints_per_rev": 8, "seconds_per_waypoint": 0.0,
+            "stir_radius": 0.02}
+    ok0, base = make(StirSkill, FakeVision({"cup": cup}), FakeArm(
+        tracking=1.0, gripper_width=0.03)).execute(dict(opts))
+    arm = FakeArm(tracking=1.0, gripper_width=0.03)
+    ok, result = make(StirSkill, FakeVision({"cup": cup}), arm).execute(
+        dict(opts, lateral_offset=-0.012))
+    check("stir succeeds with an offset", ok0 and ok, f"{result}")
+    shift = np.asarray(result["center"]) - np.asarray(base["center"]) if ok0 and ok else None
+    check("lateral_offset -0.012 moves the centre 12mm toward -Y only",
+          shift is not None and np.allclose(shift, [0.0, -0.012], atol=1e-9),
+          f"{shift}")
+    ys = [c[0][1] for c in arm.commands[-9:-1]]
+    check("the traced circle is centred on the shifted point",
+          ok and abs((max(ys) + min(ys)) / 2 - result["center"][1]) < 1e-3,
+          f"circle y mid {(max(ys) + min(ys)) / 2:.4f} vs {result['center'][1]:.4f}")
 
 
 def test_stir_detects_a_dropped_stirrer():
@@ -1520,6 +1812,7 @@ def main():
     test_projection_identifies_once_and_propagates()
     test_projection_refuses_when_seeds_disagree()
     test_projection_skips_a_camera_that_cannot_see_it()
+    test_one_label_camera_is_trusted_when_the_other_disagrees()
     test_label_crop_excludes_neighbours()
     test_duplicate_labels_are_flagged()
     test_label_matching_distinguishes_replicates()
@@ -1530,6 +1823,7 @@ def main():
     test_dump_fails_if_the_wrist_cannot_invert()
     test_dump_accepts_a_wrist_that_stalls_near_90()
     test_dump_needs_something_held()
+    test_stir_defaults_to_top_down()
     test_stir_tilts_a_flat_spoon_upright()
     test_stir_tilt_does_not_overshoot_on_retry()
     test_stir_refuses_a_spoon_that_will_not_stand_up()
@@ -1540,6 +1834,9 @@ def main():
     test_stir_falls_back_when_streaming_is_unavailable()
     test_stir_in_air_needs_no_container()
     test_stir_detects_a_dropped_stirrer()
+    test_stir_offsets_shift_the_circle_centre()
+    test_depth_gate_drops_edge_streaks_not_containers()
+    test_stir_stops_descending_on_contact()
     test_scoop_requires_a_real_tilt()
     test_scoop_site_offsets_and_unknown_params()
     test_dispense_never_drops_the_pipette()

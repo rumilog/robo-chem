@@ -29,7 +29,10 @@ python scripts/capture_scene.py --label stirrer
 perception_env/bin/python scripts/register_object.py --name stirrer \
     --images-dir scene_captures/stirrer_<ts>
 
-# 3. restart the grounding service (it loads exemplars/ at startup)
+# 3. start the grounding service WITH the library (off by default; DINOv2
+#    plus a second SAM is too much RAM on this host):
+#    perception_env/bin/python perception_service/grounding_service.py \
+#        --backend sam3 --model weights/sam3.pt --exemplars exemplars
 # 4. check it, and LOOK at the overlays
 python scripts/sweep_prompts.py --images-dir scene_captures/stirrer_<ts> \
     --only stirrer --save-overlays diag_out/stirrer_exemplar

@@ -185,8 +185,11 @@ def test_scoop_and_dump(cell) -> bool:
         # while it tips, instead of wandering 80 mm toward the base.
         drift = max(result.get("bowl_drift_mm", {}).values(), default=1e9)
         ok &= check("bowl stayed over the cup", drift < 5.0, f"{drift:.1f} mm at worst")
+        # dump's own bar for level is tip_tol_deg (10). Since 2026-09-25 it
+        # unwinds in 20 deg steps and stops once inside it, e.g. 68 -> 48 ->
+        # 28 -> 8, so "level" here means within that, not within 5.
         residual = abs(float(result.get("residual_tilt", 90.0)))
-        ok &= check("came back level", residual < 5.0, f"{residual:.1f} deg")
+        ok &= check("came back level", residual <= 10.0, f"{residual:.1f} deg")
     return ok
 
 

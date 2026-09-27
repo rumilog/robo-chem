@@ -298,8 +298,36 @@ class ObjectLocalizer:
         
         return by_camera
     
+    @staticmethod
+    def _depth_gate(u, v, z, fx, fy, min_band: float = 0.02) -> np.ndarray:
+        """
+        Keep mask pixels whose depth is plausibly ON the object.
+
+        A mask's edge pixels often carry the depth of whatever is behind the
+        object (the bench, the table), plus RealSense "flying pixels" smeared
+        between the two. Back-projected, those become streaks along the camera
+        ray, dense enough to survive ``_remove_outliers``. On a small object
+        they dominate the extent: the 30mm stirrer cube fused to
+        19 x 6 x 12cm on scene_captures/stirrer_white_20260925_113812, and
+        to 29 x 39 x 13cm on the robot on 2026-09-25, which the 0.35m
+        plausibility check then refused.
+
+        A convex object cannot span more depth than it is wide, so pixels
+        farther than the object's apparent size from its median depth are
+        dropped. The size comes from the mask itself (2-98 percentile pixel
+        box at the median depth), so a cup keeps a band as deep as the cup is
+        wide and only a small object gets a tight one.
+        """
+        if len(z) < 10:
+            return np.ones(len(z), dtype=bool)
+        med = float(np.median(z))
+        du = np.percentile(u, 98) - np.percentile(u, 2)
+        dv = np.percentile(v, 98) - np.percentile(v, 2)
+        size = float(np.hypot(du * med / fx, dv * med / fy))
+        return np.abs(z - med) <= max(min_band, size)
+
     def _depth_to_points(
-        self, 
+        self,
         depth: np.ndarray, 
         mask: np.ndarray,
         intrinsics
@@ -322,10 +350,10 @@ class ObjectLocalizer:
         # Filter invalid depth
         valid = (z > 0.1) & (z < 2.0)
         v, u, z = v[valid], u[valid], z[valid]
-        
+
         if len(z) == 0:
             return np.array([]).reshape(0, 3)
-        
+
         # perception.CameraIntrinsics exposes cx/cy; native pyrealsense2
         # intrinsics expose ppx/ppy. Guessing here silently produces
         # plausible-looking but wrong 3D points, so fail loudly instead.
@@ -333,13 +361,16 @@ class ObjectLocalizer:
         fy = getattr(intrinsics, "fy", None)
         cx = getattr(intrinsics, "cx", getattr(intrinsics, "ppx", None))
         cy = getattr(intrinsics, "cy", getattr(intrinsics, "ppy", None))
-        
+
         if None in (fx, fy, cx, cy):
             raise ValueError(
                 f"Could not read fx/fy/cx/cy from intrinsics of type "
                 f"{type(intrinsics).__name__}"
             )
-        
+
+        keep = self._depth_gate(u, v, z, fx, fy)
+        u, v, z = u[keep], v[keep], z[keep]
+
         # Project to 3D
         x = (u - cx) * z / fx
         y = (v - cy) * z / fy

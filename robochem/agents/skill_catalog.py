@@ -203,10 +203,12 @@ CATALOG: Dict[str, SkillSpec] = {
         params=[
             Param("target_container", "string", "Where the powder goes.", required=True),
             Param("dump_angle_deg", "number",
-                  "How far past level to tip, nose-down, straight ahead. The skill "
-                  "stops short of it when the arm cannot reach that far with the bowl "
-                  "held over the target (about 70 over a cup 0.54 m from the base) and "
-                  "says so; the shake at the end clears what clings.", default=90.0),
+                  "How far past level to tip, nose-down, straight ahead. 79 is as far "
+                  "as the wrist goes over a cup on this bench; commanding more seats "
+                  "the joint and the shake does not move. The skill stops short of it "
+                  "when the arm cannot reach that far with the bowl held over the "
+                  "target and says so. The shake tips back along that arc, then "
+                  "forwards to this angle again.", default=79.0),
             Param("tool_offset", "list",
                   "[x, y, z] from the grasp point to the bowl, tool frame, metres. As "
                   "for 'scoop': pass the measurement stated with the gripper contents.",
@@ -231,8 +233,9 @@ CATALOG: Dict[str, SkillSpec] = {
     ),
     "stir": SkillSpec(
         name="stir",
-        summary="Trace circles inside a container with the held stirring implement.",
-        requires=f"{_HELD} a stirrer, spoon or rod",
+        summary="Trace circles inside a container with the held stirrer, gripper "
+                "pointing straight down (the pick_up orientation).",
+        requires=f"{_HELD} the stirrer, picked from above by its head",
         effect="the container's contents are mixed; the implement is still held",
         params=[
             Param("target_container", "string", "Container to stir.", required=True),
@@ -241,9 +244,11 @@ CATALOG: Dict[str, SkillSpec] = {
                   "How far below the rim to immerse the implement, metres.", default=0.03),
             Param("tool_length", "number",
                   "How far the implement's tip hangs below the grasp point, metres. "
-                  "'stir' takes only this depth, not a full offset vector. Use the z "
-                  "component of the measurement stated with the gripper contents.",
-                  default=0.0),
+                  "Omit it for the stirrer: its CAD length (0.081) is used. Do not "
+                  "pass the measured offset for the stirrer -- it is picked out of "
+                  "its holder, so the cameras never see the rod and that measurement "
+                  "is far too short.",
+                  default=None),
         ],
     ),
     "move_to": SkillSpec(

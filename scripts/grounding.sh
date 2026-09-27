@@ -2,7 +2,7 @@
 # Start / check / stop the grounding service in the BACKGROUND.
 #
 # The service has to be its own process -- it lives in perception_env
-# (Python 3.10, SAM 3 + DINOv2) while the skills run in the frankapy venv
+# (Python 3.10, SAM 3) while the skills run in the frankapy venv
 # (Python 3.8) -- but it does NOT need its own terminal. Backgrounding it here
 # means one terminal for the whole session.
 #
@@ -11,12 +11,10 @@
 #   python scripts/run_experiment.py --skill ...
 #
 # `start` is idempotent: if a healthy service is already up it says so and
-# leaves it alone. Use `restart` after registering an exemplar -- the library
-# is read once at startup, and a service that predates exemplars/ answers
-# registered names by text prompting instead, which looks exactly like the
-# object not being there (2026-09-25: a service left running since Sep 9
-# reported `scoop -> no masks` on three cameras while exemplars/scoop.npz sat
-# unread on disk).
+# leaves it alone. Exemplar matching (DINOv2 + a second SAM) is off: it
+# stacked on top of SAM 3 and exhausted RAM on this host (2026-09-25). The
+# printed scoop is the text prompt "white plastic tool". Pass --exemplars
+# exemplars on the python command, not through this script, to turn it back on.
 
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -26,7 +24,7 @@ URL="${GROUNDING_URL:-http://127.0.0.1:5005}"
 LOG="$ROOT/diag_out/grounding_service.log"
 PIDFILE="$ROOT/diag_out/grounding_service.pid"
 PY="$ROOT/perception_env/bin/python"
-ARGS=(--backend sam3 --model "$ROOT/weights/sam3.pt")
+ARGS=(--backend sam3 --model "$ROOT/weights/sam3.pt" --no-exemplars)
 
 health() { curl -s --max-time 5 "$URL/health" 2>/dev/null; }
 
@@ -45,17 +43,6 @@ status() {
     fi
     echo "grounding: up at $URL  (pid ${pid:-?})"
     echo "  $h"
-    # A service older than the exemplar library answers registered names by
-    # text prompt, which reads as "object not found" rather than as staleness.
-    if [ -d exemplars ] && [ -n "$pid" ]; then
-        local newer
-        newer="$(find exemplars -name '*.npz' -newermt "@$(stat -c %X "/proc/$pid" 2>/dev/null || echo 0)" 2>/dev/null | head -3)"
-        if [ -n "$newer" ]; then
-            echo "  WARNING: these exemplars are newer than the running service:"
-            echo "$newer" | sed 's/^/    /'
-            echo "  It has not loaded them. Run: scripts/grounding.sh restart"
-        fi
-    fi
     return 0
 }
 

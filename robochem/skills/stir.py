@@ -4,11 +4,20 @@ Stir Skill
 Agitates the contents of a container with a held stirrer, without transferring
 anything between containers.
 
+Stirs TOP-DOWN by default: fingers pointing at the table, the same wrist
+orientation pick_up grasps with. The printed stirrer is taken by its cube from
+straight above, so its rod already hangs straight down the tool Z and there is
+nothing to re-orient -- the wrist is only levelled to exactly straight down and
+held there for the whole stir. This is what the sim has always run
+(smoke_test_sim passes tool_axis="z"); hardware used to fall through to the
+spoon default below and tip the stirrer 90 deg onto its side.
+
 Hardened along the same lines as pick_up / pour:
-  - homes first, still holding the tool, so the uprighting tilt has full wrist
-    travel — from the pose pick_up leaves out over the bench it does not
-  - a 90 deg tilt toward the base stands a flat-grasped spoon up, verified
-    against straight down rather than by an angle magnitude
+  - homes first, still holding the tool, so the wrist has full travel — from
+    the pose pick_up leaves out over the bench it does not
+  - opt-in (tool_axis="x"): a 90 deg tilt toward the base stands a
+    flat-grasped spoon up, verified against straight down rather than by an
+    angle magnitude
   - reset_joints before scanning, then measure the rim in the world frame
   - circle radius is clamped to the measured opening, so the stirrer cannot
     scrape the wall or knock the cup over
@@ -30,9 +39,11 @@ class StirSkill(BaseSkill):
 
     Pipeline:
     1. Record held width; the stirrer must survive the whole motion
-    2. Clear the cameras, scan the container, measure rim height and radius
-    3. Tilt toward the base so a flat-grasped spoon stands vertical
-    4. Hover over the rim centre, then descend to the immersion depth
+    2. Home, then level the wrist to fingers-straight-down (the pick_up
+       orientation). Only with tool_axis="x": tilt a flat spoon vertical
+    3. Clear the cameras, scan the container, measure rim height and radius
+    4. Hover over the rim centre, then feel down to the immersion depth in
+       small steps, stopping early if the rod meets anything (stop_force_n)
     5. Approach the rim of the circle, then trace N revolutions, each one a
        single streamed motion
     6. Lift clear, re-centre, and verify the tool is still held
@@ -41,11 +52,20 @@ class StirSkill(BaseSkill):
     name = "stir"
     required_params = ["target_container"]
 
+    # Printed stirrer, TCP at the cube centre -> rod tip: 15mm + 66mm (CAD,
+    # "stirrer v1.stl"; the sim bench's Prop.tool_length). Not yet measured on
+    # the real part.
+    STIRRER_TOOL_LENGTH = 0.081
+
     @property
     def optional_params(self) -> Dict[str, Any]:
         return {
             "revolutions": 3,          # How many full circles to walk
             "stir_radius": 0.015,      # Requested circle radius (metres)
+            # Shift the circle centre off the measured rim centre (metres).
+            # +X away from the base, +Y toward the robot's left.
+            "forward_offset": 0.0,
+            "lateral_offset": 0.0,
             "stir_depth": 0.03,        # Immersion below the rim (metres)
             # A circle cannot be one min-jerk move (those interpolate straight
             # lines), so unlike scoop's push this genuinely needs subdividing.
@@ -103,19 +123,43 @@ class StirSkill(BaseSkill):
             # generous — a stirrer that scrapes the wall tips soft cups over.
             "wall_clearance": 0.012,
             # How far the tool tip sits below the gripper TCP, in metres.
-            # MEASURE THIS for your stirrer: the arm commands the TCP, not the
-            # tip, so an unmeasured tool either dredges the bottom or never
-            # touches the liquid.
-            "tool_length": 0.0,
+            # The arm commands the TCP, not the tip, so an unmeasured tool
+            # either dredges the bottom or never touches the liquid.
+            # None = the tool_axis default: 0.081 for "z", the printed
+            # stirrer's CAD (15mm half-cube + 66mm rod, "stirrer v1.stl", the
+            # same number smoke_test_sim passes), and 0.0 for "x". Do NOT feed
+            # pick_up's suggested_tool_offset here for the stirrer: it is
+            # picked out of its holder, so the cameras see the cube and none of
+            # the rod, and the measurement comes back ~70mm short -- which
+            # would drive the rod tip into the cup floor.
+            "tool_length": None,
             # Which axis of the tool frame the working length runs along.
-            #   "x"  a spoon gripped across its flat handle, so the handle
-            #        sticks out sideways and has to be stood up (the default,
-            #        and what verticalize was written for)
             #   "z"  a rod gripped end-on -- the printed stirrer, taken by its
             #        cube from straight above. It comes out of pick_up already
-            #        pointing down, and the "x" check would read that correct
-            #        pose as 90 deg off and tip it flat.
-            "tool_axis": "x",
+            #        pointing down, so the stir is done top-down in the
+            #        pick_up orientation. The default, and what sim runs.
+            #   "x"  a spoon gripped across its flat handle, so the handle
+            #        sticks out sideways and has to be stood up by a 90 deg
+            #        tilt (verticalize). Opt-in only: on the stirrer this reads
+            #        the correct pose as 90 deg off and tips it flat.
+            "tool_axis": "z",
+            # Feel the way down into the container, and stop on contact
+            # instead of pushing to the computed depth. A tool_length that is
+            # short by a centimetre otherwise rams the rod into the cup floor.
+            # Stepped, like place's probe: the arm moves probe_step at a time
+            # and the vertical force is read between steps, relative to a
+            # baseline taken at rest just above the rim (the raw estimate
+            # carries a pose-dependent bias of its own).
+            # None disables it and descends on position alone.
+            "stop_force_n": 1.0,
+            # Start feeling this far above the rim (at the rod TIP), so a rod
+            # that lands on the rim is caught, not just one that hits the floor.
+            "probe_above_rim": 0.010,
+            "probe_step": 0.002,
+            "probe_seconds": 0.4,
+            # After contact, rise this much before stirring, so the circle is
+            # not dragged along whatever the rod touched.
+            "contact_backoff": 0.003,
             "hover_tol": 0.05,
             "descend_tol": 0.03,
             # Circle waypoints are allowed to run loose: the stirrer is in
@@ -147,13 +191,16 @@ class StirSkill(BaseSkill):
         stir_depth = float(params["stir_depth"])
         per_rev = max(4, int(params["waypoints_per_rev"]))
         dwell = float(params["seconds_per_waypoint"])
-        tool_length = float(params["tool_length"])
         wall_clearance = float(params["wall_clearance"])
         in_air = bool(params["in_air"])
         verticalize = bool(params["verticalize"])
         tool_axis = str(params["tool_axis"]).lower()
         if tool_axis not in ("x", "z"):
             return False, {"error": f"tool_axis must be 'x' or 'z', got {tool_axis!r}"}
+        if params.get("tool_length") is None:
+            tool_length = self.STIRRER_TOOL_LENGTH if tool_axis == "z" else 0.0
+        else:
+            tool_length = float(params["tool_length"])
         verticalize_deg = float(params["verticalize_deg"])
         orient_tol = float(params["orient_tol_deg"])
         orient_retries = max(1, int(params["orient_retries"]))
@@ -195,6 +242,19 @@ class StirSkill(BaseSkill):
                 }
             print(f"[Stir] Rod already vertical ({tip:.1f}° from down); "
                   f"nothing to stand up")
+
+            # Level the wrist to EXACTLY fingers-down -- the pick_up grasp
+            # orientation -- and hold that for the whole stir, rather than
+            # inheriting whatever few degrees reset_joints left. The closing
+            # axis keeps its yaw, so the stirrer is not spun in the jaws.
+            down = self.tool_down_rotation()
+            here = np.asarray(self.get_current_pose().translation, dtype=float)
+            if tip > 0.5:
+                if not self.goto_pose_rigid(here, down, duration=1.5):
+                    return False, {"error": "Failed to level the wrist top-down"}
+                self.wait(0.2)
+                print(f"[Stir] Levelled top-down: {self.tool_tip_deg():.1f}° "
+                      f"from down")
 
         # pick_up takes a spoon lying flat with a top grasp, which leaves the
         # handle horizontal along +X, pointing away from the base, with tool Z
@@ -239,7 +299,10 @@ class StirSkill(BaseSkill):
                 }
             print(f"[Stir] Spoon vertical ({handle:.1f}° from down)")
 
-        rotation = _orthonormalize(
+        # The rod path commands the ideal top-down rotation, not the measured
+        # one, so a wrist that settled a fraction of a degree off is not
+        # carried into every hover, circle and lift pose.
+        rotation = down if tool_axis == "z" else _orthonormalize(
             np.asarray(self.get_current_pose().rotation, dtype=float)
         )
 
@@ -280,6 +343,20 @@ class StirSkill(BaseSkill):
             print(f"[Stir] '{target}' rim centre {np.round(center, 4)}, "
                   f"z={rim_z:.4f}, radius {rim_radius * 1000:.0f}mm")
 
+            # Correct a measured centre the bench shows to be off, the same
+            # convention as pour / scoop / dump: +X away from the base, +Y the
+            # world's +Y (the robot's LEFT, looking out from the base). The
+            # radius clamp below is NOT reduced by the shift: it is a
+            # correction onto the real cup centre, not a move away from it.
+            shift = np.array([float(params["forward_offset"]),
+                              float(params["lateral_offset"])])
+            if np.any(shift):
+                measured = np.asarray(center, dtype=float)
+                center = measured + shift
+                print(f"[Stir] Circle centre shifted forward(X)={shift[0]:+.3f}m "
+                      f"lateral(Y)={shift[1]:+.3f}m: {np.round(measured, 4)} -> "
+                      f"{np.round(center, 4)}")
+
             max_radius = max(0.0, rim_radius - wall_clearance)
             radius = min(requested_radius, max_radius)
             if radius < requested_radius:
@@ -303,6 +380,8 @@ class StirSkill(BaseSkill):
                               f"{self.workspace_min[2]:.3f}"),
                 }
 
+        force_info = {"force_guarded": False, "stopped_by_force": False}
+
         # 3. Get over the circle, then down into it. Skipped in air: the tool
         # is already at the demo height and there is nothing to descend into.
         hover = np.array([center[0], center[1], stir_z])
@@ -319,11 +398,27 @@ class StirSkill(BaseSkill):
                               f"(off by {err * 1000:.0f}mm)"),
                 }
 
+            stop_force = params.get("stop_force_n")
+            if stop_force is not None and self.ee_wrench() is None:
+                print("[Stir] WARNING: stop_force_n is set but this arm reports "
+                      "no force — descending on position alone")
+                stop_force = None
+
             entry = np.array([center[0], center[1], stir_z])
-            print(f"[Stir] Lowering to z={stir_z:.4f} "
-                  f"({stir_depth * 1000:.0f}mm below the rim)...")
-            if not self.goto_pose_rigid(entry, rotation, duration=4.0):
-                return False, {"error": "Failed to command entry pose"}
+            if stop_force is not None:
+                felt = self._feel_down(center, stir_z, rim_z, tool_length,
+                                       rotation, float(stop_force), params)
+                if felt.get("error"):
+                    self.goto_pose_rigid(hover, rotation, duration=3.0)
+                    return False, felt
+                force_info = felt
+                stir_z = felt["stir_z"]
+                entry = np.array([center[0], center[1], stir_z])
+            else:
+                print(f"[Stir] Lowering to z={stir_z:.4f} "
+                      f"({stir_depth * 1000:.0f}mm below the rim)...")
+                if not self.goto_pose_rigid(entry, rotation, duration=4.0):
+                    return False, {"error": "Failed to command entry pose"}
             arrived, err = self.reached(entry, float(params["descend_tol"]))
             if not arrived:
                 print(f"[Stir] Entry stopped {err * 1000:.0f}mm short — lifting out")
@@ -459,7 +554,10 @@ class StirSkill(BaseSkill):
             "stirred_container": target,
             "in_air": in_air,
             "center": [float(center[0]), float(center[1])],
+            "forward_offset": float(params["forward_offset"]),
+            "lateral_offset": float(params["lateral_offset"]),
             "tool_axis": tool_axis,
+            "tool_length": tool_length,
             "verticalized": verticalize and tool_axis == "x",
             # The handle measure, kept under its original name for callers that
             # already read it.
@@ -478,7 +576,81 @@ class StirSkill(BaseSkill):
             "stir_depth": stir_depth,
             "smooth": streamed,
             "seconds_per_revolution": rev_seconds if streamed else None,
+            "stir_z": float(stir_z),
+            **force_info,
         }
+
+    def _feel_down(self, center, stir_z: float, rim_z: float,
+                   tool_length: float, rotation, stop_force: float,
+                   params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Step down to ``stir_z``, stopping early if anything pushes back.
+
+        Returns the z to stir at plus what was felt, or ``{"error": ...}``.
+        Contact while the rod tip is still at or above the rim means it landed
+        ON the rim, not in the cup: that is a miss, not a shallow stir, and is
+        refused. Contact inside the container means the tip reached the floor
+        (or something on it) early; the stir goes ahead a little above that.
+
+        The trigger is the CHANGE in vertical force from a baseline taken at
+        rest, in either direction. frankapy signs it as the force on the
+        robot, so a press reads positive, but that sign has only been checked
+        in sim; a change either way stops the descent, and a false stop only
+        costs depth.
+        """
+        step = max(0.0005, float(params["probe_step"]))
+        seconds = float(params["probe_seconds"])
+        z_from = max(stir_z, rim_z + float(params["probe_above_rim"]) + tool_length)
+        probe = np.array([center[0], center[1], z_from])
+
+        print(f"[Stir] Lowering to z={z_from:.4f} (rod tip "
+              f"{float(params['probe_above_rim']) * 1000:.0f}mm above the rim)...")
+        if not self.goto_pose_rigid(probe, rotation, duration=3.0):
+            return {"error": "Failed to command the pose above the rim"}
+        self.wait(0.3)
+        baseline = self.mean_push_up_n(samples=5, gap=0.05)
+        print(f"[Stir] Feeling down to z={stir_z:.4f} in {step * 1000:.0f}mm "
+              f"steps, stopping on a {stop_force:.1f}N change "
+              f"(baseline {baseline:+.2f}N)")
+
+        z = z_from
+        while z > stir_z + 1e-9:
+            z = max(stir_z, z - step)
+            probe[2] = z
+            if not self.goto_pose_rigid(probe, rotation, duration=seconds):
+                return {"error": "Failed to command a descent step"}
+            delta = self.mean_push_up_n() - baseline
+            if abs(delta) <= stop_force:
+                continue
+
+            tip_below_rim = rim_z - (z - tool_length)
+            print(f"[Stir] Contact at z={z:.4f}: {delta:+.2f}N from baseline, "
+                  f"rod tip {tip_below_rim * 1000:.0f}mm below the rim")
+            felt = {
+                "force_guarded": True,
+                "stopped_by_force": True,
+                "contact_force_n": float(delta),
+                "contact_z": float(z),
+                "contact_tip_below_rim": float(tip_below_rim),
+            }
+            if tip_below_rim <= 0.0:
+                felt["error"] = (f"The stirrer hit something at or above the "
+                                 f"rim ({delta:+.2f}N with the tip "
+                                 f"{-tip_below_rim * 1000:.0f}mm above it) — "
+                                 f"it is landing on the rim, not in the cup")
+                return felt
+            backoff = float(params["contact_backoff"])
+            felt["stir_z"] = min(z + backoff, z_from)
+            print(f"[Stir] Backing off {backoff * 1000:.0f}mm and stirring at "
+                  f"z={felt['stir_z']:.4f} instead of {stir_z:.4f}")
+            probe[2] = felt["stir_z"]
+            if not self.goto_pose_rigid(probe, rotation, duration=1.0):
+                felt["error"] = "Failed to back off after contact"
+            return felt
+
+        print(f"[Stir] Reached z={stir_z:.4f} without contact")
+        return {"force_guarded": True, "stopped_by_force": False,
+                "contact_force_n": None, "stir_z": float(stir_z)}
 
     def _circle_path(self, center_xy: np.ndarray, radius: float, z: float,
                      seconds: float, rate_hz: float) -> List[np.ndarray]:
