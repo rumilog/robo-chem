@@ -759,8 +759,12 @@ class SimFrankaArm:
             # Close until the pads read `limit` newtons, then hold there rather
             # than driving on to the commanded width. Holding at the width it
             # stalled at would keep squeezing, because the servo's own preload
-            # is what presses: force = kg*commanded - kb*actual, so the command
-            # that leaves exactly `limit` on the pads is (kb*w - limit)/kg.
+            # is what presses. The actuator drives the "split" tendon, whose
+            # length is HALF the jaw width (0.5 per finger), so the pads carry
+            # kg*commanded - kb*actual/2 and the command that leaves exactly
+            # `limit` on them is (kb*w/2 - limit)/kg. Without the /2 the hold
+            # came out at 2w - limit/kg: the stirrer's jaws opened to 42 mm on
+            # a 30 mm cube, and the spoon's clipped to 0, through its handle.
             kg = float(self.model.actuator_gainprm[7, 0]) * CTRL_PER_METRE
             kb = -float(self.model.actuator_biasprm[7, 1])
             held = []
@@ -781,7 +785,7 @@ class SimFrankaArm:
                     return
                 if self._finger_contact_force() >= limit:
                     w = float(self.data.qpos[7] + self.data.qpos[8])
-                    hold = (kb * w - limit) / kg
+                    hold = (kb * w / 2 - limit) / kg
                     self.data.ctrl[7] = float(np.clip(
                         hold * CTRL_PER_METRE, target_ctrl, 255.0))
                     held.append(True)
@@ -865,7 +869,18 @@ class SimFrankaArm:
             # A real grasp stalls the fingers on the object; the skills read
             # that width back to confirm they are holding something.
             self._held_width = min(prop.grasp_width, MAX_GRIPPER_WIDTH)
-            self.data.qpos[7] = self.data.qpos[8] = self._held_width / 2
+            # Leave the jaws where the part stopped them, and hold them there.
+            # From here on the part no longer collides with the hand, so a
+            # closing command has nothing to stop it: it would drive the pads
+            # through the part. Setting them to grasp_width instead pushed the
+            # pads ~1 mm into the stirrer's cube (their faces sit inside the
+            # joint gap), which reads on screen as the jaws clipping into it.
+            gap = float(self.data.qpos[7] + self.data.qpos[8])
+            if gap > prop.grasp_width + 0.005:
+                # Stalled on something else first; close them onto the part.
+                gap = prop.grasp_width
+                self.data.qpos[7] = self.data.qpos[8] = gap / 2
+            self.data.ctrl[7] = gap * CTRL_PER_METRE
             mujoco.mj_forward(self.model, self.data)
             if self.verbose:
                 print(f"[sim] grasped {prop.name!r} "

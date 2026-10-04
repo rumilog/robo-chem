@@ -49,6 +49,23 @@ class PourSkill(BaseSkill):
             "step_retries": 3,
             # After hold: joint-space home (same as pre-scan).
             "reset_after_pour": True,
+            # --- keeping the held cup's lip just over the target -----------
+            # The held cup's shape relative to the jaws: its rim's height above
+            # the TCP, its height and radius. SkillsExecutor fills these from
+            # the pick that took it; with them pour plans every tip step so
+            # the lip -- the rim's lowest point, where the liquid leaves --
+            # stays lip_clearance over the target's rim and lip_inset of the
+            # target's radius toward the base from its centre, and no part of
+            # the cup comes within body_clearance of the target's rim height.
+            # Without them it uses the fixed site above (forward_offset,
+            # approach_height), which put the lip 155-185 mm over the target
+            # (sim, 2026-10-03).
+            "source_top_above_tcp": None,
+            "source_height": None,
+            "source_radius": None,
+            "lip_clearance": 0.015,
+            "body_clearance": 0.010,
+            "lip_inset": 0.4,
         }
 
     def check_preconditions(self, params: Dict[str, Any]) -> Tuple[bool, str]:
@@ -73,6 +90,11 @@ class PourSkill(BaseSkill):
         reset_after = bool(params["reset_after_pour"])
 
         lean_xy = np.array([-1.0, 0.0])  # toward base
+        if not tip_only and all(params.get(k) is not None for k in
+                                ("source_top_above_tcp", "source_height", "source_radius")):
+            return self._pour_over_lip(params, target, pour_tip, hold_duration,
+                                       step_deg, step_dur, tip_tol, step_retries,
+                                       reset_after, lean_xy)
         print(f"[Pour] Tip toward base (−X) to {pour_tip:.0f}° from vertical")
         print(f"[Pour] Advance +X by {tip_advance * 100:.2f} cm each "
               f"{step_deg:.0f}° tip step")
@@ -170,6 +192,145 @@ class PourSkill(BaseSkill):
             "forward_offset": fwd,
             "lateral_offset": lat,
             "tip_advance_m": tip_advance,
+        }
+
+    # ------------------------------------------------- lip over the target
+    @staticmethod
+    def _cup_points(top: float, height: float, radius: float, rings: int = 6,
+                    per_ring: int = 32) -> np.ndarray:
+        """The held cup's outline in the TOOL frame (z down): rings rim to bottom."""
+        phi = np.linspace(0.0, 2 * np.pi, per_ring, endpoint=False)
+        out = []
+        for k in range(rings):
+            z = -top + height * k / (rings - 1)          # rim first, then down
+            out.append(np.c_[radius * np.cos(phi), radius * np.sin(phi),
+                             np.full(per_ring, z)])
+        return np.vstack(out)
+
+    def _lip_pose(self, R: np.ndarray, cup: np.ndarray, per_ring: int,
+                  lip_xy: np.ndarray, rim_z: float, lip_clear: float,
+                  body_clear: float, lean_xy=(-1.0, 0.0)) -> Tuple[np.ndarray, float]:
+        """
+        TCP position putting the lip at ``lip_xy``, ``lip_clear`` over the
+        target's rim, raised as far as needed for every point of the cup to
+        stay ``body_clear`` over it. Returns (xyz, lip height over the rim).
+        """
+        world = cup @ R.T                                  # relative to the TCP
+        rim = world[:per_ring]
+        # Upright, every rim point is lowest; take the one on the side the cup
+        # will tip toward, so the start already sits where the pour goes on.
+        lean = np.asarray(lean_xy, dtype=float)
+        lip = rim[int(np.argmin(rim[:, 2] - 1e-4 * (rim[:, :2] @ lean)))]
+        xy = np.asarray(lip_xy, dtype=float) - lip[:2]
+        z = max(rim_z + lip_clear - lip[2],
+                rim_z + body_clear - float(world[:, 2].min()))
+        return np.array([xy[0], xy[1], z]), float(z + lip[2] - rim_z)
+
+    def _pour_over_lip(self, params, target, pour_tip, hold_duration, step_deg,
+                       step_dur, tip_tol, step_retries, reset_after, lean_xy):
+        top = float(params["source_top_above_tcp"])
+        height = float(params["source_height"])
+        radius = float(params["source_radius"])
+        lip_clear = float(params["lip_clearance"])
+        body_clear = float(params["body_clearance"])
+        print(f"[Pour] Held cup from the pick: rim {top * 1000:+.0f}mm over the TCP, "
+              f"{height * 1000:.0f}mm tall, radius {radius * 1000:.0f}mm")
+
+        if params.get("reset_before_scan", True):
+            print("[Pour] reset_joints (home, joint-space) clear of cameras before scan...")
+            if not self.go_home():
+                return False, {"error": "Failed to reset_joints before scanning"}
+        self.wait(0.3)
+        self.vision.clear_cache()
+        located = self.locate_container(target, force_refresh=True)
+        if located is None:
+            return False, {"error": f"Cannot locate '{target}'"}
+        centre = np.asarray(located["rim_center"], dtype=float)[:2]
+        rim_z = float(located["top_z"])
+        inside = float(located["rim_radius"])
+        lip_xy = centre + lean_xy * float(params["lip_inset"]) * inside
+        print(f"[Pour] '{target}' rim centre {np.round(centre, 4)}, z={rim_z:.4f}, "
+              f"radius {inside * 1000:.0f}mm; the lip goes to {np.round(lip_xy, 4)}, "
+              f"{lip_clear * 1000:.0f}mm over the rim")
+
+        per_ring = 32
+        cup = self._cup_points(top, height, radius, per_ring=per_ring)
+        closing = np.array([-lean_xy[1], lean_xy[0]])
+        angles = list(np.arange(0.0, pour_tip + 1e-6, step_deg))
+        if abs(angles[-1] - pour_tip) > 0.5:
+            angles.append(pour_tip)
+        plan = []
+        for deg in angles:
+            R = self._rotation_lean(closing, float(deg), lean_xy)
+            xyz, lip_h = self._lip_pose(R, cup, per_ring, lip_xy, rim_z, lip_clear,
+                                        body_clear, lean_xy)
+            plan.append((float(deg), R, self._clamp_position(xyz), lip_h))
+
+        # Over the target, higher by a margin, upright; then down onto the plan.
+        start = plan[0][2].copy()
+        above = start.copy()
+        above[2] += 0.06
+        print(f"[Pour] Over the target at {np.round(above, 4)}, then down to "
+              f"{np.round(start, 4)}...")
+        for xyz, R in ((above, plan[0][1]), (start, plan[0][1])):
+            try:
+                self._goto_orientation(xyz, R, duration=float(max(step_dur, 3.0)))
+            except Exception as e:
+                return False, {"error": f"Failed to reach the pour start: {e}"}
+
+        tip_now = self._tip_deg(np.asarray(self.get_current_pose().rotation))
+        lips = []
+        for deg, R, xyz, lip_h in plan[1:]:
+            reached = False
+            for attempt in range(1, step_retries + 1):
+                duration = float(step_dur * (1.0 + 0.4 * (attempt - 1)))
+                print(f"[Pour] → tip {deg:.0f}°, TCP {np.round(xyz, 4)}, lip "
+                      f"{lip_h * 1000:.0f}mm over the rim (attempt {attempt}/{step_retries})")
+                try:
+                    self._goto_orientation(xyz, R, duration=duration)
+                except Exception as e:
+                    print(f"[Pour]   goto_pose error: {e}")
+                    continue
+                tip_now = self._tip_deg(np.asarray(self.get_current_pose().rotation))
+                if tip_now >= deg - tip_tol:
+                    reached = True
+                    break
+                print(f"[Pour]   short of {deg:.0f}° ({tip_now:.1f}°) — retrying")
+            if not reached:
+                print("[Pour] Incomplete tip — reset_joints to clear...")
+                self.go_home()
+                return False, {"error": (f"Pour tip incomplete: commanded {deg:.0f}°, "
+                                         f"measured {tip_now:.1f}°"),
+                               "tip_after": tip_now}
+            lips.append(round(lip_h * 1000, 1))
+
+        print(f"[Pour] Holding {hold_duration}s at tip={tip_now:.1f}°...")
+        self.wait(hold_duration)
+
+        # Back upright where it is, lifted clear, before going anywhere: a
+        # cup that still holds something keeps it once it is level.
+        last = plan[-1][2].copy()
+        last[2] += 0.04
+        try:
+            self._goto_orientation(last, plan[0][1], duration=float(max(step_dur, 3.0)))
+        except Exception as e:
+            print(f"[Pour] Warning: could not right the cup in place: {e}")
+        if reset_after:
+            print("[Pour] reset_joints (home, joint-space) after pour...")
+            if not self.go_home():
+                return False, {"error": "Pour tip ok but reset_joints after hold failed",
+                               "tip_after": tip_now}
+
+        print(f"[Pour] Done pouring into '{target}'")
+        return True, {
+            "poured_into": target,
+            "pour_angle": pour_tip,
+            "tip_dir": "toward_base",
+            "tip_after": tip_now,
+            "mode": "lip_over_target",
+            "lip_over_rim_mm": lips,
+            "lip_xy": [float(v) for v in lip_xy],
+            "target_rim_z": rim_z,
         }
 
     def _tip_sequence(

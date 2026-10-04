@@ -30,7 +30,7 @@ and replans when one fails. --dry-run does all of that except the executing, so
 you can see what the model would do for the price of the tokens:
 
     perception_env/bin/python scripts/run_experiment.py --sim --dry-run \
-        --task "Scoop citric acid into the white paper cup"
+        --task "Scoop citric acid into clear cup a"
 """
 
 import argparse
@@ -95,10 +95,20 @@ def build_sim_stack(args):
     which cell it got. ``cameras`` is empty because the simulated cage is
     rendered on demand rather than held open.
     """
+    import secrets
+
     from robochem.sim import build_cell
 
     print(f"Building the simulated cell (speed x{args.sim_speed}, "
           f"viewer={'on' if not args.no_viewer else 'off'})")
+    # A new layout every run unless one is asked for: a skill tuned against a
+    # single bench has not been tested, only fitted.
+    seed = None
+    if not args.sim_fixed_layout:
+        seed = (args.sim_layout_seed if args.sim_layout_seed is not None
+                else secrets.randbelow(1_000_000))
+        print(f"Random layout, seed {seed} (repeat it with --sim-layout-seed "
+              f"{seed}; --sim-fixed-layout for the default bench)")
     cell = build_cell(
         viewer=not args.no_viewer,
         realtime=not args.sim_fast,
@@ -109,6 +119,7 @@ def build_sim_stack(args):
         calib_dir=args.sim_calib_dir,
         workspace_min=args.workspace_min,
         workspace_max=args.workspace_max,
+        layout_seed=seed,
     )
     if args.reset:
         cell.reset()
@@ -158,6 +169,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task", help="Natural language task description")
     parser.add_argument("--instruction-image", help="Image containing written instructions")
+    parser.add_argument("--follow-steps", action="store_true",
+                        help="With --instruction-image: give the planner the sheet's "
+                             "steps as well as its goal, so it carries out the written "
+                             "procedure. Without it the planner gets the goal alone "
+                             "and decides the steps itself (the research design)")
     parser.add_argument("--skill", action="append", metavar="NAME",
                         help="Run a skill instead of a full task. Repeat it to "
                              "run a sequence in ONE session, which is the only "
@@ -215,6 +231,12 @@ def main() -> int:
                      help="Directory of realsense_cameraNw.npy to place the "
                           "simulated cage at. Point this at robomail's calib/ to "
                           "reproduce whatever extrinsics the robot is running")
+    sim.add_argument("--sim-layout-seed", type=int, default=None,
+                     help="Seed for where the cups and dishes stand. Omitted: a new "
+                          "random layout every run, its seed printed so the run "
+                          "can be repeated")
+    sim.add_argument("--sim-fixed-layout", action="store_true",
+                     help="The fixed default layout instead of a random one")
     sim.add_argument("--sim-hold", type=float, default=None,
                      help="Seconds to keep the viewer open after the run "
                           "(default: until you close the window)")
@@ -314,6 +336,7 @@ def main() -> int:
         outcome = orchestrator.run(
             task=args.task,
             instruction_image=args.instruction_image,
+            follow_steps=args.follow_steps,
         )
 
         print("\n" + "=" * 60)
@@ -321,6 +344,11 @@ def main() -> int:
         return 0 if outcome.success else 1
 
     finally:
+        lab = getattr(skills, "sim_lab", None)
+        if lab is not None:
+            # What the run left in each container: the sim's own books
+            # (robochem.sim.lab), not something the planner was told.
+            print("\n[lab] contents at the end of the run:\n" + lab.summary())
         if args.sim and not args.no_viewer:
             print("\nRun finished. Close the viewer window to exit"
                   + (f" (or wait {args.sim_hold:.0f}s)" if args.sim_hold else "") + ".")

@@ -113,6 +113,8 @@ class SkillsExecutor:
         self.pick_sites = {}
         #: what pick_up last put in the jaws, until place or an open clears it.
         self.held = None
+        #: what that pick measured of it (suggested offset, extent along x).
+        self.held_measure = {}
         # Where the TCP was when each remembered object was grasped. Putting
         # the TCP back there re-seats a tool exactly as it sat (the stirrer in
         # its holder); the centroid alone is only the mean of what was visible.
@@ -170,7 +172,7 @@ class SkillsExecutor:
             success, result = skill.execute(params)
             if success:
                 self._remember_pick_site(skill_name, params, result)
-                self._track_held(skill_name, params)
+                self._track_held(skill_name, params, result)
             return success, result
         except Exception as e:
             return False, {"error": str(e), "phase": "execution"}
@@ -212,14 +214,76 @@ class SkillsExecutor:
     # out. A 2026-09-25 agent run in sim passed no bowl size at all; scoop then
     # planned for a point and drove the real 27 mm bowl into the dish wall.
 
-    def _track_held(self, skill_name: str, params: dict):
+    def _track_held(self, skill_name: str, params: dict, result=None):
         if skill_name == "pick_up":
             self.held = params.get("object_name")
+            result = result if isinstance(result, dict) else {}
+            # What the pick measured of the tool, for _fill_tool_geometry.
+            self.held_measure = {"suggested": result.get("suggested_tool_offset"),
+                                 "extent_x": result.get("tool_extent_x")}
+            grasp = result.get("grasp_pose")
+            top, bottom = result.get("object_top_z"), result.get("object_bottom_z")
+            if grasp is not None and top is not None and bottom is not None:
+                tcp_z = float(np.asarray(grasp, dtype=float)[2, 3])
+                table = self.config.get("table_z")
+                # The cloud's bottom reads 3-6 mm high (the bottom edge is
+                # seen only at a grazing angle); standing on a known table,
+                # the table is the bottom.
+                if table is not None and -0.005 <= bottom - float(table) <= 0.012:
+                    bottom = float(table)
+                self.held_measure["container"] = {
+                    "top_above_tcp": float(top) - tcp_z,
+                    "height": float(top) - float(bottom),
+                    "radius": float(result.get("object_radius") or 0.0),
+                }
         elif skill_name in ("place", "open_gripper") or params.get("action") == "open":
             self.held = None
+            self.held_measure = {}
+
+    def _offset_from_tip(self, tool: dict, cad: list):
+        """
+        The tool offset with x read off where the tool's two ends were seen at
+        the pick, y and z from the CAD. None without a usable measurement.
+
+        The CAD x assumes one grasp point and the jaws close wherever the
+        cloud's centroid put them: 2.8 mm toward the bowl once the sim's depth
+        lost its antialiasing, enough to cut a scoop to a fifth (2026-10-03).
+        pick_up's own x is the median of the bowl end, 7.7 mm off there. The
+        middle of the cloud's span plus the CAD distance from the part's
+        middle to its bowl came within 1.5 mm.
+        """
+        extent = (getattr(self, "held_measure", None) or {}).get("extent_x")
+        to_bowl = tool.get("span_mid_to_bowl")
+        if not extent or to_bowl is None or abs(cad[0]) < 0.005:
+            return None
+        x = (extent[0] + extent[1]) / 2 + np.sign(cad[0]) * to_bowl
+        if x * cad[0] <= 0 or abs(x - cad[0]) > 0.03:
+            return None                 # not the part we know: keep the CAD
+        return [float(x), cad[1], cad[2]]
+
+    def _fill_held_container(self, skill_name: str, params: dict) -> dict:
+        """
+        Give pour the held cup's shape, as pick_up measured it, so it can keep
+        the cup's lip just over the target. Without it pour falls back to its
+        old fixed site, 15 cm above the target (sim, 2026-10-03: the lip ran
+        155-185 mm over the target's rim).
+        """
+        if skill_name != "pour":
+            return params
+        shape = (getattr(self, "held_measure", None) or {}).get("container")
+        if not shape or shape.get("radius", 0) <= 0:
+            return params
+        filled = dict(params)
+        for key, value in (("source_top_above_tcp", shape["top_above_tcp"]),
+                           ("source_height", shape["height"]),
+                           ("source_radius", shape["radius"])):
+            if filled.get(key) is None:
+                filled[key] = value
+        return filled
 
     def _fill_tool_geometry(self, skill_name: str, skill, params: dict) -> dict:
         from .tool_geometry import lookup
+        params = self._fill_held_container(skill_name, params)
         tool = lookup(self.held)
         if tool is None:
             return params
@@ -228,15 +292,46 @@ class SkillsExecutor:
         added = []
         for key in ("bowl_length", "bowl_width", "bowl_depth",
                     "tool_span", "tool_back_reach"):
-            if key in known and not filled.get(key):
+            if key in known and not filled.get(key) and tool.get(key) is not None:
                 filled[key] = tool[key]
                 added.append(f"{key}={tool[key] * 1000:.1f}mm")
-        if "tool_offset" in known:
+        if "tool_offset" in known and tool.get("tool_offset") is not None:
             cad = [float(v) for v in tool["tool_offset"]]
             given = filled.get("tool_offset")
-            if given is None and not filled.get("tool_length"):
+            wrong_end = (given is not None and abs(cad[0]) > 0.005
+                         and float(given[0]) * cad[0] < 0)
+            off_side = given is not None and abs(float(given[1]) - cad[1]) > 0.02
+            measured = (getattr(self, "held_measure", None) or {}).get("suggested")
+            copied = (given is not None and measured is not None
+                      and np.allclose(np.asarray(given, float), np.asarray(measured, float),
+                                      atol=1e-4))
+            from_tip = self._offset_from_tip(tool, cad)
+            if (given is None or copied) and from_tip is not None and not filled.get("tool_length"):
+                # No offset, or pick_up's own copied over by a planner: the
+                # bowl's far edge says better where the jaws closed. A value
+                # anyone passed on purpose -- the bench-tuned [0.051, ...] --
+                # is not this case and is left alone below.
+                filled["tool_offset"] = from_tip
+                added.append(f"tool_offset x {from_tip[0] * 1000:.1f}mm from where the "
+                             f"tool's ends were seen at the pick, y/z from CAD"
+                             + (f" (instead of pick_up's {[round(float(v), 4) for v in given]})"
+                                if copied else ""))
+            elif given is None and not filled.get("tool_length"):
                 filled["tool_offset"] = cad
                 added.append(f"tool_offset={cad} (CAD)")
+            elif wrong_end or off_side:
+                # pick_up takes the bulkier end of the cloud for the bowl, and
+                # a grasp well off the handle's middle can tip that count to
+                # the handle. x then points the wrong way: on 2026-10-02 a
+                # measured -30 mm (CAD +25.7) aimed the scoop 55 mm off, and
+                # the hand flung two dishes off the bench. Where along the
+                # handle the jaws closed moves x by centimetres, never across
+                # the grasp, so a flipped sign is a bad measurement, not a grasp.
+                filled["tool_offset"] = cad
+                why = ("points to the other end of the tool" if wrong_end
+                       else f"is {abs(float(given[1]) - cad[1]) * 1000:.0f} mm to one side")
+                added.append(f"tool_offset {[round(float(v), 4) for v in given]} {why} "
+                             f"-> CAD {cad} (the measurement is discarded)")
             elif given is not None and float(given[2]) < cad[2]:
                 # pick_up's z is a lower bound: the underside of the bowl is
                 # occluded, so the cloud stops short of it. Too shallow a z
@@ -244,6 +339,16 @@ class SkillsExecutor:
                 filled["tool_offset"] = [float(given[0]), float(given[1]), cad[2]]
                 added.append(f"tool_offset z {float(given[2]) * 1000:.1f} -> "
                              f"{cad[2] * 1000:.1f}mm (CAD depth; measured is a lower bound)")
+        cad_length = tool.get("tool_length")
+        given_length = filled.get("tool_length")
+        if ("tool_length" in known and cad_length and given_length is not None
+                and float(given_length) < 0.8 * float(cad_length)):
+            # A measured length is a lower bound for the same reason z is; a
+            # planning model passed pick_up's 0.017 for the stirrer, which
+            # would have driven the rod 64 mm deeper than intended.
+            filled["tool_length"] = float(cad_length)
+            added.append(f"tool_length {float(given_length) * 1000:.1f} -> "
+                         f"{float(cad_length) * 1000:.1f}mm (CAD; measured is a lower bound)")
         if added:
             print(f"[Skills] '{tool['name']}' is in the gripper; for {skill_name} "
                   f"using its CAD geometry: " + ", ".join(added))
@@ -256,15 +361,50 @@ class SkillsExecutor:
         target = params.get("target_location")
         if not isinstance(target, str):
             return params
-        site = self.pick_sites.get(target.strip().lower())
+        key = target.strip().lower()
+        put_back = {}
+        held_key = str(self.held).strip().lower() if self.held else None
+        if held_key:
+            from .tool_geometry import lookup, names_for, _norm
+            tool = lookup(self.held)
+            own = {_norm(self.held)}
+            if tool is not None:
+                # A planning model names the tool its own way ("stirring rod"
+                # for what was picked as "stirrer"), or names the tool's home
+                # ("stirrer holder"). Either means "put it back", and the home
+                # is not a spot to set something BESIDE: on 2026-10-02 that
+                # dropped the stirrer on the bench and drove the hand into the
+                # beaker.
+                own |= names_for(tool) | {_norm(h) for h in tool.get("home", ())}
+            if _norm(target) in own:
+                key = held_key
+            elif held_key in self.pick_sites and not params.get("on_top"):
+                # Asked to set it down beside another object. On a full bench
+                # that spot -- 10 cm from the other object toward the base --
+                # is on a neighbour, and another object's remembered pick site
+                # is where that object stands now. The Magic Beaker run (sim,
+                # 2026-10-02) put the water cup on the beaker's spot and the
+                # beaker onto cup B, then into cup A, which went over and
+                # spilled. Put it back where it came from instead.
+                print(f"[Skills] '{self.held}' goes back where it was picked up, "
+                      f"not beside {target!r}: the spot beside another object is "
+                      f"not known to be clear")
+                key = held_key
+        site = self.pick_sites.get(key)
         if site is None:
             return params           # a real scene object: let vision find it
-        resolved = dict(params)
+        from .tool_geometry import lookup
+        tool = lookup(self.held) if self.held else None
+        if tool is not None:
+            put_back = tool.get("put_back", {})
+        resolved = {**put_back, **dict(params)}
         resolved["target_location"] = list(site)
-        grasp = self.pick_grasps.get(target.strip().lower())
+        grasp = self.pick_grasps.get(key)
         if grasp is not None and resolved.get("pick_grasp_tcp") is None:
             resolved["pick_grasp_tcp"] = list(grasp)
-        print(f"[Skills] '{target}' is the tool in the gripper, so it cannot be "
-              f"seen on the bench; placing it back at the site it was picked "
+        if put_back:
+            print(f"[Skills] putting '{self.held}' back the way it came out: "
+                  + ", ".join(f"{k}={v}" for k, v in put_back.items()))
+        print(f"[Skills] placing '{self.held}' back at the site it was picked "
               f"from: [{site[0]:.4f}, {site[1]:.4f}, {site[2]:.4f}]")
         return resolved

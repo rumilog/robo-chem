@@ -40,7 +40,7 @@ def test_perception(cell) -> bool:
     """Every prop reconstructs, from more than one view, near where it really is."""
     print("\nperception")
     ok = True
-    for name in ("plastic beaker", "white paper cup", "citric acid", "larger spoon"):
+    for name in ("plastic beaker", "clear cup c", "citric acid", "larger spoon"):
         located = cell.vision.locate(name, force_refresh=True)
         if located is None:
             ok &= check(f"locate {name!r}", False, "not found")
@@ -72,7 +72,7 @@ def test_reach(cell) -> bool:
 
 def test_pick_and_pour(cell) -> bool:
     """The README's validated beaker commands, start to finish."""
-    print("\npick_up + pour (plastic beaker -> white paper cup)")
+    print("\npick_up + pour (plastic beaker -> clear cup c)")
     cell.reset()
     ok = True
 
@@ -88,7 +88,7 @@ def test_pick_and_pour(cell) -> bool:
 
     cell.vision.clear_cache()
     poured, result = cell.skills.execute(
-        "pour", {"target_container": "white paper cup", "pour_angle": 90,
+        "pour", {"target_container": "clear cup c", "pour_angle": 90,
                  "hold_duration": 1, "forward_offset": -0.08}
     )
     ok &= check("pour reports success", poured)
@@ -147,7 +147,7 @@ def test_spoon_and_scoop(cell) -> bool:
 
 def test_scoop_and_dump(cell) -> bool:
     """Scoop, then empty it into the paper cup from just above the rim."""
-    print("\npick_up + scoop + dump (larger spoon, citric acid -> white paper cup)")
+    print("\npick_up + scoop + dump (larger spoon, citric acid -> clear cup c)")
     cell.reset()
     ok = True
 
@@ -171,7 +171,7 @@ def test_scoop_and_dump(cell) -> bool:
         return ok
 
     dumped, result = cell.skills.execute(
-        "dump", {"target_container": "white paper cup", **tool})
+        "dump", {"target_container": "clear cup c", **tool})
     ok &= check("dump reports success", dumped, str(result.get("error", ""))[:70])
     if dumped:
         # Straight ahead the arm's reach caps the tip over this cup (~69 deg
@@ -239,7 +239,7 @@ def test_scoop_then_stir(cell) -> bool:
         return ok
 
     dumped, _ = cell.skills.execute(
-        "dump", {"target_container": "white paper cup", **tool})
+        "dump", {"target_container": "clear cup c", **tool})
     ok &= check("dump reports success", dumped)
 
     # ---- the handover: the spoon goes back in its slot --------------------
@@ -419,6 +419,59 @@ def test_force_guard_refuses_to_drop_into_nothing(cell) -> bool:
     return ok
 
 
+def test_kit_contents(cell) -> bool:
+    """
+    The Magic Beaker kit's books: powder into a water cup, liquid into a cup.
+
+    What lands where is robochem.sim.lab's geometric estimate -- the point is
+    that a scoop, a dump and a pour each move material where they were aimed,
+    and that the chemistry on top of it reads the right way round.
+    """
+    from robochem.sim import Bench, layout_violations
+
+    print("\nkit contents (citric acid -> clear cup a; beaker -> clear cup c)")
+    cell.reset()
+    ok = True
+    broken = layout_violations(Bench())
+    ok &= check("the default bench keeps every layout rule", not broken,
+                "; ".join(broken)[:120])
+    lab = cell.lab
+    ok &= check("the water starts measured out",
+                abs(lab.contents["clear cup a"].water_ml - 10.0) < 1e-6
+                and abs(lab.contents["plastic beaker"].water_ml - 50.0) < 1e-6)
+
+    picked, _ = cell.skills.execute(
+        "pick_up", {"object_name": "larger spoon", "z_offset": 0.0, "grasp_force": 1.0})
+    ok &= check("spoon picked up", picked)
+    cell.vision.clear_cache()
+    # No floor hint: the cell's table_z sets the dish floor, as in a planner run.
+    scooped, _ = cell.skills.execute("scoop", {"powder_source": "citric acid"})
+    carried = lab.tallies["larger spoon"].load.get("citric acid", 0.0) * 1e6
+    ok &= check("the scoop carries citric acid", scooped and carried > 0.5,
+                f"{carried:.2f} ml")
+    dumped, _ = cell.skills.execute("dump", {"target_container": "clear cup a"})
+    a = lab.contents["clear cup a"]
+    got = a.solid_g.get("citric acid", 0.0) + a.dissolved_g.get("citric acid", 0.0)
+    ok &= check("most of it landed in clear cup a", dumped and got > 0.5 * carried * 0.9,
+                f"{got:.2f} g of {carried * 0.9:.2f} g carried")
+    ph = a.ph()
+    ok &= check("the cup reads acidic", ph is not None and ph < 3.0, f"pH {ph}")
+    cell.skills.execute("place", {"target_location": "larger spoon"})
+
+    picked, _ = cell.skills.execute(
+        "pick_up", {"object_name": "plastic beaker", "z_offset": 0.02, "squeeze": 0.013})
+    ok &= check("beaker picked up", picked and cell.arm.holding == "plastic beaker",
+                str(cell.arm.holding))
+    poured, _ = cell.skills.execute("pour", {"target_container": "clear cup c"})
+    c = lab.contents["clear cup c"].water_ml
+    ok &= check("the pour landed in clear cup c", poured and c > 45.0, f"{c:.1f} ml")
+    ok &= check("nothing ran onto the table", lab.spilled_ml < 1.0,
+                f"{lab.spilled_ml:.1f} ml")
+    placed, _ = cell.skills.execute("place", {"target_location": "plastic beaker"})
+    ok &= check("beaker put back", placed)
+    return ok
+
+
 def test_empty_gripper_refuses_to_scoop(cell) -> bool:
     """Scooping with nothing in the jaws must fail, not mime the motion."""
     print("\nfailure handling")
@@ -463,6 +516,7 @@ def main() -> int:
         "force guard": test_force_guard_refuses_to_drop_into_nothing,
         "pick + scoop + dump": test_scoop_and_dump,
         "scoop then stir": test_scoop_then_stir,
+        "kit contents": test_kit_contents,
         "failure handling": test_empty_gripper_refuses_to_scoop,
     }
     if args.only:

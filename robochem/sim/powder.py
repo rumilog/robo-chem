@@ -43,15 +43,15 @@ Usage (as film_sim_skill does)::
     tally.stop()
     print(tally.report())
     tally.start()                 # keep the load, now track where it goes
-    cell.skills.execute("dump", {"target_container": "white paper cup"})
+    cell.skills.execute("dump", {"target_container": "clear cup a"})
     tally.stop()
     print(tally.report())
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Sequence, Union
 
 import mujoco
 import numpy as np
@@ -65,6 +65,8 @@ class PowderBed:
     inner_radius: float       # inside radius of the dish, metres
     floor_z: float            # inside floor, world z
     surface_z: float          # powder surface, world z
+    name: str = ""            # the dish's prop name
+    reagent: Optional[str] = None   # what the bed is made of
 
     def contains(self, points: np.ndarray) -> np.ndarray:
         """Which of ``points`` (N x 3, world) lie inside the powder."""
@@ -81,7 +83,15 @@ def bed_from_prop(scene, prop) -> PowderBed:
     return PowderBed(centre=np.asarray(pos[:2], float).copy(),
                      inner_radius=prop.inner_radius,
                      floor_z=float(floor),
-                     surface_z=float(floor + prop.powder_level))
+                     surface_z=float(floor + prop.powder_level),
+                     name=prop.name,
+                     reagent=prop.reagent)
+
+
+def beds_from_bench(scene) -> List[PowderBed]:
+    """Every powder bed on the bench, each carrying its reagent's name."""
+    return [bed_from_prop(scene, p) for p in scene.bench.props
+            if p.kind == "container" and p.powder_level > 0]
 
 
 @dataclass
@@ -125,14 +135,18 @@ class ScoopTally:
     sees the motion as it actually ran rather than as it was commanded.
     """
 
-    def __init__(self, cell, spoon_prop, bed: PowderBed, grid=(10, 6),
+    def __init__(self, cell, spoon_prop, bed: Union[PowderBed, Sequence[PowderBed]],
+                 grid=(10, 6),
                  bulk_density: float = 0.9, repose_deg: float = 35.0,
-                 receivers: Optional[List[Opening]] = None):
+                 receivers: Optional[List[Opening]] = None,
+                 on_land: Optional[Callable[[Optional[str], Dict[str, float]], None]] = None,
+                 colors: Optional[Dict[str, Sequence[float]]] = None):
         """
         Args:
             cell: A SimCell (build_cell)
             spoon_prop: The scoop's Prop; needs bowl_size / bowl_offset / wall
-            bed: The powder bed being scooped
+            bed: The powder bed being scooped, or several -- a scoop that goes
+                from one dish to the next carries both, kept apart by reagent
             grid: Patches along x (length) and y (width) of the mouth
             bulk_density: g/ml, to express the volume as a mass. ~0.9 suits
                 citric acid and baking soda powders.
@@ -140,10 +154,20 @@ class ScoopTally:
                 tipped further than this starts to lose its load.
             receivers: Where falling powder can land. Default: every container
                 on the bench, the source included.
+            on_land: Called as on_land(container or None, {reagent: m^3})
+                whenever powder leaves the bowl; None for the table.
+            colors: reagent -> rgba, to draw the load in its powder's colour.
         """
         self.cell = cell
         self.model, self.data = cell.scene.model, cell.scene.data
-        self.bed = bed
+        self.beds = [bed] if isinstance(bed, PowderBed) else list(bed)
+        self.bed = self.beds[0] if self.beds else None
+        self.on_land = on_land
+        # Called as on_take(dish name, reagent, m^3) for what the mouth takes
+        # out of a bed, so a caller keeping the dish's books can debit it.
+        self.on_take: Optional[Callable[[str, str, float], None]] = None
+        self.colors = dict(colors or {})
+        self.load: Dict[str, float] = {}     # reagent -> m^3 in the bowl
         self.body = cell.scene.prop_bodies[spoon_prop.name]
         self.bulk_density = float(bulk_density)
         self.repose_deg = float(repose_deg)
@@ -220,16 +244,42 @@ class ScoopTally:
         pos, mat = self._pose()
         return pos[None, :] + self.patches @ mat.T
 
+    def update(self):
+        """Advance the tally by whatever the scoop did since the last call."""
+        self._update()
+
+    def clear(self):
+        """Empty the bowl, as a reset does."""
+        self.collected = 0.0
+        self.load = {}
+        self._left_bed = False
+        self._prev = self._patch_world()
+        self._show()
+
     def _update(self):
         pts = self._patch_world()
         _, mat = self._pose()
         n = mat @ self.normal
         mid = 0.5 * (pts + self._prev)
-        inside = self.bed.contains(mid)
-        if inside.any():
-            advance = np.clip((pts - self._prev) @ n, 0.0, None)
-            dv = float((advance * inside).sum() * self.patch_area)
-            self.swept += dv
+        advance = None
+        dv = 0.0
+        for bed in self.beds:
+            inside = bed.contains(mid)
+            if not inside.any():
+                continue
+            if advance is None:
+                advance = np.clip((pts - self._prev) @ n, 0.0, None)
+            got = float((advance * inside).sum() * self.patch_area)
+            room = max(0.0, self.capacity - self.collected - dv)
+            got_kept = min(got, room)
+            if got_kept > 0:
+                key = bed.reagent or bed.name or "powder"
+                self.load[key] = self.load.get(key, 0.0) + got_kept
+                if self.on_take is not None:
+                    self.on_take(bed.name, key, got_kept)
+            self.swept += got
+            dv += got_kept
+        if advance is not None:
             self.collected = min(self.capacity, self.collected + dv)
             self.submerged_steps += 1
             if self._left_bed:
@@ -263,8 +313,19 @@ class ScoopTally:
         lip = float((self.corners @ lean_body).min())
         return float((self.cells @ lean_body <= lip).sum() * self.cell_volume)
 
+    def _take(self, dv: float) -> Dict[str, float]:
+        """Remove ``dv`` from the load, from each reagent in proportion."""
+        total = sum(self.load.values())
+        if total <= 0:
+            return {}
+        share = min(1.0, dv / total)
+        out = {k: v * share for k, v in self.load.items()}
+        self.load = {k: v - out[k] for k, v in self.load.items() if v - out[k] > 1e-15}
+        return out
+
     def _land(self, dv: float):
         """Drop ``dv`` straight down from the lowest point of the rim."""
+        parts = self._take(dv)
         pos, mat = self._pose()
         rim = pos[None, :] + self.corners @ mat.T
         low = rim[:, 2] <= rim[:, 2].min() + 1e-3     # an edge, or a corner
@@ -276,10 +337,15 @@ class ScoopTally:
                 self._heap_xy[r.name] = (self._heap_xy[r.name] * self.landed[r.name]
                                          + (xy - r.centre) * dv) / total
                 self.landed[r.name] = total
-                self._show_heap(r)
+                if self.on_land is None:
+                    self._show_heap(r)
+                else:
+                    self.on_land(r.name, parts)
                 self._log_pour(r.name, xy, dv, mat)
                 return
         self.lost += dv
+        if self.on_land is not None:
+            self.on_land(None, parts)
         self._log_pour(None, xy, dv, mat)
 
     def _log_pour(self, into, xy, dv, mat):
@@ -324,6 +390,11 @@ class ScoopTally:
         m.geom_size[self.load_geom] = [self.half_len, self.half_wid, h / 2]
         m.geom_pos[self.load_geom] = [self.centre[0], 0.0, self.floor_z + h / 2]
         m.geom_rbound[self.load_geom] = float(np.linalg.norm(m.geom_size[self.load_geom]))
+        if self.colors and self.load:
+            total = sum(self.load.values())
+            rgb = sum(np.asarray(self.colors.get(k, (0.97, 0.96, 0.90, 1.0))[:3], float) * v
+                      for k, v in self.load.items()) / total
+            m.geom_rgba[self.load_geom, :3] = rgb
         m.geom_rgba[self.load_geom, 3] = 1.0 if self.collected > 1e-9 else 0.0
 
     # ------------------------------------------------------------ results
@@ -340,6 +411,7 @@ class ScoopTally:
             "max_tilt_after_exit_deg": self.max_tilt_after,
             "spill_risk": self.max_tilt_after > self.repose_deg,
             "landed_ml": {k: v * 1e6 for k, v in self.landed.items() if v > 0},
+            "load_ml": {k: v * 1e6 for k, v in self.load.items()},
             "lost_ml": self.lost * 1e6,         # fell outside every container
             "pours": self.pours,
             "bulk_density_g_per_ml": self.bulk_density,

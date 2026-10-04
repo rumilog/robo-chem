@@ -475,6 +475,60 @@ def test_happy_path():
           len(outcome.record["steps"]) == len(SCOOP_SUBTASKS))
 
 
+def test_a_malformed_value_is_dropped_not_passed_on():
+    """An optional number the model mangled falls back to the default."""
+    print("\n[skill call: malformed values]")
+    from robochem.agents.skill_catalog import coerce_params, InfeasibleSkill
+    params = coerce_params("pour", [{"name": "target_container", "value": '"clear cup b"'},
+                                    {"name": "pour_angle", "value": ","},
+                                    {"name": "hold_duration", "value": "2"}])
+    check("a pour_angle of ',' is dropped", "pour_angle" not in params, f"{params}")
+    check("a number written as a string is read as a number",
+          params.get("hold_duration") == 2.0 and not isinstance(params["hold_duration"], str),
+          f"{params}")
+    try:
+        coerce_params("stir", [{"name": "target_container", "value": '"cup"'},
+                               {"name": "revolutions", "value": "two"}])
+        dropped = True
+    except InfeasibleSkill:
+        dropped = False
+    check("an optional integer that is not one is dropped, not fatal", dropped)
+
+
+def test_a_pour_that_is_not_the_last_keeps_some():
+    """A container that pours again before it is put down is not emptied."""
+    print("\n[loop: pour some, then the rest]")
+    subtasks = [subtask("pick up the plastic beaker"),
+                subtask("pour some indicator into clear cup a", "clear cup a"),
+                subtask("pour the rest of the indicator into clear cup b", "clear cup b"),
+                subtask("place the plastic beaker back"),
+                subtask("pick up clear cup a"),
+                subtask("pour clear cup a into clear cup c", "clear cup c"),
+                subtask("place clear cup a back")]
+    calls = [("pick_up", {"object_name": "plastic beaker"}),
+             ("pour", {"target_container": "clear cup a", "pour_angle": 90}),
+             ("pour", {"target_container": "clear cup b", "pour_angle": 90}),
+             ("place", {"target_location": "plastic beaker"}),
+             ("pick_up", {"object_name": "clear cup a"}),
+             ("pour", {"target_container": "clear cup c", "pour_angle": 90}),
+             ("place", {"target_location": "clear cup a"})]
+    responses = scoop_responses(
+        subtask_plan=plan_response(subtasks),
+        skill_call=lambda i, r: call_response(*calls[i % len(calls)]))
+    orchestrator, llm, skills = build(responses)
+    outcome = orchestrator.run("make the magic beaker")
+    pours = [p for n, p in skills.calls if n == "pour"]
+    check("the run succeeds", outcome.success, outcome.reason)
+    check("the first pour from the beaker is capped so some stays",
+          pours[0]["pour_angle"] == 80.0, f"{pours}")
+    check("the beaker's last pour still empties it", pours[1]["pour_angle"] == 90,
+          f"{pours}")
+    check("cup a, poured once, is emptied", pours[2]["pour_angle"] == 90, f"{pours}")
+    check("the record says what was changed and why",
+          "must not empty" in outcome.record["steps"][1]["adjusted"],
+          f"{outcome.record['steps'][1].get('adjusted')}")
+
+
 def test_dry_run_moves_nothing():
     print("\n[loop: dry run]")
     orchestrator, llm, skills = build(scoop_responses(), dry_run=True)
@@ -623,6 +677,8 @@ def main():
     test_skill_agent_is_told_the_real_gripper_state()
     test_infeasible_is_reported_not_approximated()
     test_happy_path()
+    test_a_pour_that_is_not_the_last_keeps_some()
+    test_a_malformed_value_is_dropped_not_passed_on()
     test_dry_run_moves_nothing()
     test_a_failed_skill_replans_rather_than_retrying()
     test_an_infeasible_plan_stops_without_moving()

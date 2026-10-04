@@ -125,12 +125,17 @@ CATALOG: Dict[str, SkillSpec] = {
         effect="the gripper is empty again",
         params=[
             Param("target_location", "string",
-                  "Either the name of an object to set this down BESIDE (on the side "
-                  "nearer the robot base), or explicit coordinates as [x, y] or "
-                  "[x, y, z] in metres. There is no name for bare bench: 'table' is "
-                  "not special and perception will fail to find it. To clear the tool "
-                  "out of the way, name something near where it should go, or give "
-                  "coordinates.", required=True),
+                  "To put ANYTHING back -- a tool, or a cup or beaker picked up to pour "
+                  "from -- give its own name (the one it was picked up by, e.g. 'larger "
+                  "spoon', 'stirrer', 'plastic beaker'): it goes back exactly where it was "
+                  "picked up, into its holder if it came out of one. That is the right "
+                  "choice almost every time: the bench is full, and 'beside' another "
+                  "object lands 10 cm from it toward the base, onto whatever stands "
+                  "there. While something picked from the bench is held, naming a "
+                  "different object puts it back where it came from anyway. Explicit "
+                  "coordinates as [x, y] or [x, y, z] in metres are used as given. "
+                  "There is no name for bare bench: 'table' is not special.",
+                  required=True),
             Param("on_top", "boolean",
                   "Stack it on top of the target instead of beside it.", default=False),
         ],
@@ -140,11 +145,23 @@ CATALOG: Dict[str, SkillSpec] = {
         summary="Tip the held container so its contents run into a target container.",
         requires=f"{_HELD} the source container",
         effect="the source's contents are in the target; the source is still held",
+        note="Liquid leaves only once the tilt brings its level up to the rim, so how "
+             "much pours depends on how full the source is, not on the angle alone. "
+             "A container a fifth full pours NOTHING below about 70 degrees. Pouring "
+             "a container out -- all of it, or whatever is left in it -- is 90. Tip "
+             "less, about 80, only when the step says to pour SOME and keep the rest "
+             "for later. If the plan pours from the same container again before "
+             "putting it down, this pour is capped at 80 so it is not emptied.",
         params=[
             Param("target_container", "string",
                   "Container to pour into.", required=True),
             Param("pour_angle", "number",
-                  "How far to tip, degrees. 90 empties it.", default=90.0),
+                  "How far to tip, degrees. 90 empties it. Less pours only what lies "
+                  "above the rim at that tilt, so a part-full container pours NOTHING "
+                  "until tipped well past level -- a beaker holding 50 ml keeps it all "
+                  "to about 70 and half of it at 80. 90 for any pour that should "
+                  "empty the source; about 80 only to pour part of it and keep the rest.",
+                  default=90.0),
             Param("hold_duration", "number",
                   "Seconds held at the pour angle before righting.", default=2.0),
             Param("forward_offset", "number",
@@ -237,11 +254,21 @@ CATALOG: Dict[str, SkillSpec] = {
                 "pointing straight down (the pick_up orientation).",
         requires=f"{_HELD} the stirrer, picked from above by its head",
         effect="the container's contents are mixed; the implement is still held",
+        note="stir_depth is measured down from the rim, so it only reaches a liquid "
+             "at least that deep. A few to a few tens of ml in a cup lie far below "
+             "it: pass to_floor true there, and wherever powder has to be dissolved "
+             "off the floor.",
         params=[
             Param("target_container", "string", "Container to stir.", required=True),
             Param("revolutions", "integer", "How many circles to trace.", default=3),
             Param("stir_depth", "number",
                   "How far below the rim to immerse the implement, metres.", default=0.03),
+            Param("to_floor", "boolean",
+                  "Feel down to the container's floor and stir just above it, instead "
+                  "of stir_depth below the rim. Use it for a shallow liquid -- a few to "
+                  "a few tens of ml in a cup -- which a rim-relative depth stirs above "
+                  "without touching, and to stir up powder settled on the floor.",
+                  default=False),
             Param("tool_length", "number",
                   "How far the implement's tip hangs below the grasp point, metres. "
                   "Omit it for the stirrer: its CAD length (0.081) is used. Do not "
@@ -477,6 +504,31 @@ def parse_skill(raw: str, *, subtask: str = "<unknown>") -> str:
     )
 
 
+_BAD = object()
+
+
+def _as_kind(value, kind):
+    """``value`` as a ``kind`` from the catalogue, or _BAD if it cannot be."""
+    if kind in ("number", "integer"):
+        if isinstance(value, bool):
+            return _BAD
+        if isinstance(value, (int, float)):
+            return int(value) if kind == "integer" and float(value).is_integer() else value
+        try:
+            number = float(str(value).strip())
+        except ValueError:
+            return _BAD
+        return int(number) if kind == "integer" and number.is_integer() else number
+    if kind == "boolean":
+        if isinstance(value, bool):
+            return value
+        text = str(value).strip().lower()
+        if text in ("true", "false"):
+            return text == "true"
+        return _BAD
+    return value
+
+
 def coerce_params(skill_name: str, pairs, *, subtask: str = "<unknown>") -> dict:
     """
     Turn the model's ``[{name, value}]`` list into a parameter dict.
@@ -510,6 +562,26 @@ def coerce_params(skill_name: str, pairs, *, subtask: str = "<unknown>") -> dict
         ):
             continue
         params[name] = value
+
+    # Values of the wrong kind. The model has written "," for pour_angle
+    # (twice, 2026-10-03); passed through, the skill died converting it. An
+    # optional one is dropped, so the skill's own default stands; a required
+    # one is a planning failure to replan around.
+    spec = {p.name: p for p in CATALOG[skill_name].params} if skill_name in CATALOG else {}
+    for name in list(params):
+        kind = spec[name].kind if name in spec else None
+        value = params[name]
+        fixed = _as_kind(value, kind)
+        if fixed is _BAD:
+            if name in required:
+                raise InfeasibleSkill(
+                    subtask, f"'{skill_name}' parameter {name!r} must be a {kind}, "
+                             f"got {value!r}")
+            print(f"[SkillCallAgent] dropping {skill_name} {name}={value!r}: not a "
+                  f"{kind}; the skill's default applies")
+            del params[name]
+        else:
+            params[name] = fixed
 
     unknown = sorted(set(params) - known)
     if unknown:

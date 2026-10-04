@@ -126,7 +126,18 @@ class SimVision(VisionSystem):
         vis.offwidth = max(int(vis.offwidth), self.width)
         vis.offheight = max(int(vis.offheight), self.height)
 
-        self._renderer = mujoco.Renderer(scene.model, self.height, self.width)
+        # Depth and segmentation render WITHOUT multisampling. With it, the
+        # resolve averages neighbouring id colours at every edge, and the
+        # average spells some other geom's id: a clear cup's mask picked up a
+        # pixel 0.37 m away and was rejected as "includes the table"
+        # (2026-10-03). RGB keeps its antialiasing on a renderer of its own.
+        samples = int(scene.model.vis.quality.offsamples)
+        scene.model.vis.quality.offsamples = 0
+        try:
+            self._renderer = mujoco.Renderer(scene.model, self.height, self.width)
+        finally:
+            scene.model.vis.quality.offsamples = samples
+        self._rgb_renderer = mujoco.Renderer(scene.model, self.height, self.width)
 
         # Render the depth and segmentation passes with EVERY geom group on.
         #
@@ -167,9 +178,9 @@ class SimVision(VisionSystem):
         self._renderer.enable_segmentation_rendering()
         self._renderer.update_scene(self.scene.data, camera=name,
                                     scene_option=self._all_groups)
-        seg = np.array(self._renderer.render())
+        geom_id = self._segment_geoms()
+        self._renderer.disable_segmentation_rendering()
 
-        geom_id = seg[..., 0]
         body = np.full(geom_id.shape, -1, dtype=int)
         valid = geom_id >= 0
         body[valid] = self.scene.model.geom_bodyid[geom_id[valid]]
@@ -179,12 +190,53 @@ class SimVision(VisionSystem):
         body[hidden] = -1
         return depth, body
 
+    def _segment_geoms(self) -> np.ndarray:
+        """
+        Per-pixel model geom id (-1 for none) of the scene just updated.
+
+        MuJoCo's own decode (Renderer.render with segmentation on) builds its
+        lookup table from the scene's geom count and indexes it with whatever
+        id each pixel's colour spells. Geoms with alpha 0 never enter the
+        scene, and a few edge pixels come back as colours that are no id at
+        all (seen beside the stirrer holder, ~100 px a frame). With the
+        bench's drawn liquids, heaps and loads hidden at alpha 0, such a pixel
+        spelled 355 against a 316-entry table and the render raised
+        IndexError (2026-10-03); with a larger table it would have been
+        mapped, silently, to some unrelated geom. Here an id that names no
+        geom in the scene is simply nothing.
+        """
+        r = self._renderer
+        scn = r._scene
+        flags = scn.flags.copy()
+        scn.flags[mujoco.mjtRndFlag.mjRND_SEGMENT] = True
+        scn.flags[mujoco.mjtRndFlag.mjRND_IDCOLOR] = True
+        if r._gl_context:
+            r._gl_context.make_current()
+        out = np.empty((self.height, self.width, 3), dtype=np.uint8)
+        try:
+            mujoco.mjr_render(r._rect, scn, r._mjr_context)
+            mujoco.mjr_readPixels(out, None, r._rect, r._mjr_context)
+        finally:
+            np.copyto(scn.flags, flags)
+        ids = (out[..., 0].astype(np.int64)
+               | (out[..., 1].astype(np.int64) << 8)
+               | (out[..., 2].astype(np.int64) << 16))
+        n = scn.ngeom
+        table = np.full(n + 2, -1, dtype=np.int64)
+        for i in range(n):
+            g = scn.geoms[i]
+            if g.segid >= 0 and g.objtype == int(mujoco.mjtObj.mjOBJ_GEOM):
+                table[g.segid + 1] = g.objid
+        ids[(ids < 0) | (ids > n + 1)] = 0          # 0 is background
+        geoms = table[ids]
+        # OpenGL reads bottom row first; Renderer.render flips it the same way
+        # under EGL, OSMesa and GLFW (not Filament, which has no GL context).
+        return np.flipud(geoms) if r._gl_context else geoms
+
     def render_rgb(self, cam_id: int) -> np.ndarray:
         """One RGB frame from a cage camera, for saving alongside a run."""
-        self._renderer.disable_depth_rendering()
-        self._renderer.disable_segmentation_rendering()
-        self._renderer.update_scene(self.scene.data, camera=f"cam{cam_id}")
-        return np.array(self._renderer.render())
+        self._rgb_renderer.update_scene(self.scene.data, camera=f"cam{cam_id}")
+        return np.array(self._rgb_renderer.render())
 
     # -------------------------------------------------------------- locating
 
@@ -209,6 +261,27 @@ class SimVision(VisionSystem):
             if prop.label:
                 names.append(prop.label)
         return sorted(set(names))
+
+    def inventory_notes(self):
+        """
+        What a person at the bench would know about each prop beyond its name:
+        the label it stands on, and the other names it goes by.
+
+        Keyed by prop name, one entry per physical object. The label names in
+        :meth:`known_object_names` are the same objects again, which a flat
+        list cannot say -- and the scene agent, given "clear cup a" and
+        "a 10 ml water" as two names, reported the cup empty (2026-10-02).
+        """
+        out = {}
+        for prop in self.scene.bench.props:
+            bits = []
+            if prop.label:
+                bits.append(f'stands on a handwritten label reading "{prop.label}", '
+                            f'and "{prop.label}" names it too')
+            if prop.aliases:
+                bits.append("also called " + ", ".join(f'"{a}"' for a in prop.aliases))
+            out[prop.name] = "; ".join(bits)
+        return out
 
     def _masks_for(self, prop: Prop):
         """Per-camera (mask, depth_mm) for one prop, as SAM would have returned."""
@@ -294,9 +367,11 @@ class SimVision(VisionSystem):
 
     def close(self):
         """Release the offscreen render context."""
-        if self._renderer is not None:
-            self._renderer.close()
-            self._renderer = None
+        for attr in ("_renderer", "_rgb_renderer"):
+            renderer = getattr(self, attr, None)
+            if renderer is not None:
+                renderer.close()
+                setattr(self, attr, None)
 
     def ground_truth(self, object_name: str) -> Optional[np.ndarray]:
         """The prop's true world position -- for checking what perception did."""

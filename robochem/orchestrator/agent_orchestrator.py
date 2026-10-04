@@ -40,6 +40,7 @@ Differences from upstream worth knowing about:
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -60,8 +61,20 @@ from robochem.agents.skill_planner import SkillCall, StepOutcome
 #: Default cap on corrective replanning attempts.
 MAX_REPLANS = 2
 
-#: Guard against a planner that emits an unbounded list of sub-tasks.
-MAX_SUBTASKS = 24
+#: How far a pour may tip when the container it pours from still has another
+#: pour to make before it is put down. A tilted container keeps what lies below
+#: its rim at that angle, whatever it held before -- the beaker ~24 ml at 80
+#: deg (robochem.sim.lab's geometry) -- so the later pour has something left.
+#: "Pour some indicator into A ... then some into B" was planned as 90 into A
+#: in 2 of 3 runs on 2026-10-03, which emptied the beaker into A and left B
+#: without indicator. The angle is the model's to choose; emptying a container
+#: that still has work to do is not.
+POUR_KEEP_SOME_DEG = 80.0
+
+#: Guard against a planner that emits an unbounded list of sub-tasks. The
+#: booklet's Magic Beaker is 28 skill calls start to finish (two scoops, three
+#: stirs, five pours and every tool put back), so 24 refused it.
+MAX_SUBTASKS = 40
 
 
 @dataclass
@@ -78,6 +91,8 @@ class StepRecord:
     reason: str = ""
     result: Dict[str, Any] = field(default_factory=dict)
     seconds: float = 0.0
+    #: What the orchestrator changed in the model's call before running it.
+    adjusted: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -86,6 +101,7 @@ class StepRecord:
             "subtask": self.subtask,
             "skill": self.skill,
             "params": self.params,
+            "adjusted": self.adjusted,
             "success": self.success,
             "failure_kind": self.failure_kind,
             "reason": self.reason,
@@ -191,6 +207,7 @@ class AgentOrchestrator:
         *,
         instruction_image: Optional[str] = None,
         experiment_name: Optional[str] = None,
+        follow_steps: bool = False,
     ) -> TaskOutcome:
         """
         Run one task from a description (or an instruction photo) to a verdict.
@@ -224,6 +241,17 @@ class AgentOrchestrator:
                 return self._blocked(record, "instruction_parse", str(exc), None, started)
             record["instruction"] = parsed
             task = parsed.get("goal") or task
+            steps = [str(x).strip() for x in (parsed.get("steps") or []) if str(x).strip()]
+            if follow_steps and task and steps:
+                # Off by default: the research design hands the planner the goal
+                # alone and lets it decompose. To EXECUTE a written procedure,
+                # the planner needs the procedure -- given only "prepare a citric
+                # acid mixture", it dumped into the beaker instead of the cup the
+                # sheet named and never stirred (sim, 2026-10-02).
+                task = (f"{task} Follow the instruction sheet's steps in order, "
+                        f"as far as this bench allows: "
+                        + " ".join(f"({i}) {t}" for i, t in enumerate(steps, 1)))
+            record["follow_steps"] = bool(follow_steps)
         if not task:
             return self._blocked(
                 record, "goal", "no task description and no instruction image", None, started
@@ -405,6 +433,7 @@ class AgentOrchestrator:
                         f"sub-task {subtask.index} ({subtask.description!r}) could not be "
                         f"expressed as a skill call: {exc.reason}", None)
 
+            record.adjusted = self._keep_some_for_later(plan, subtask, call)
             record.skill = call.skill
             record.params = dict(call.params)
             self._say(f"\n[step {subtask.index}] {subtask.description}")
@@ -445,6 +474,40 @@ class AgentOrchestrator:
             completed.append(subtask)
 
         return True, None, "", None
+
+    @staticmethod
+    def _pours_again(plan: Plan, subtask: SubTask) -> bool:
+        """
+        Whether the container held for this pour pours again before it is put
+        down: the next later sub-task that pours, sets something down or picks
+        something up decides it.
+        """
+        for later in plan.subtasks:
+            if later.index <= subtask.index:
+                continue
+            text = later.description.lower()
+            if re.search(r"\bpour(s|ing)?\b", text):
+                return True
+            if re.search(r"\b(place|put|return|set|pick|pick_up|grasp)\b", text):
+                return False
+        return False
+
+    def _keep_some_for_later(self, plan: Plan, subtask: SubTask, call: SkillCall) -> str:
+        """Cap a pour that is not its container's last; say so, or return ''."""
+        if call.skill != "pour" or not self._pours_again(plan, subtask):
+            return ""
+        try:
+            angle = float(call.params.get("pour_angle", 90.0))
+        except (TypeError, ValueError):
+            angle = 90.0
+        if angle <= POUR_KEEP_SOME_DEG:
+            return ""
+        call.params["pour_angle"] = POUR_KEEP_SOME_DEG
+        note = (f"pour_angle {angle:g} -> {POUR_KEEP_SOME_DEG:g}: the container "
+                f"still pours again before it is put down, so this pour must not "
+                f"empty it")
+        self._say(f"   [adjusted] {note}")
+        return note
 
     def _apply_effect(self, call: SkillCall, success: bool, result=None) -> None:
         """Update what we believe the gripper holds, from the call's declared effect."""
@@ -494,7 +557,9 @@ class AgentOrchestrator:
             f"{description}. Its working end was measured at "
             f"tool_offset = [{x:.4f}, {y:.4f}, {z:.4f}] metres from the grasp point, "
             f"in the tool frame. Pass this verbatim to any skill that takes "
-            f"tool_offset, and its z ({z:.4f}) to any that takes tool_length. The z "
+            f"tool_offset. Do not use it as a tool_length: for the stirrer that "
+            f"measurement is far too short (the rod is hidden in its holder at the "
+            f"pick), so leave tool_length out and the CAD length is used. The z "
             f"is a lower bound -- the cage looks down, so the underside of a bowl is "
             f"occluded and the cloud stops at its rim"
         )

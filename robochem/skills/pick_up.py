@@ -98,6 +98,26 @@ def measure_tool_offset(points, grasp_pose, min_span=0.015):
     ])
 
 
+def tool_extent_x(points, grasp_pose):
+    """
+    Where a held tool's two ends lie along the tool x axis, from the grasp.
+
+    [1st, 99th] percentile of the cloud's x in the TOOL frame. For a spoon
+    picked across its handle, x runs along it. The middle of the two ends,
+    with the CAD distance from there to the bowl, says where along the handle
+    the jaws closed to a millimetre or two -- which the scoop's depth depends
+    on steeply (sim, 2026-10-03: x off by 2 mm took a scoop from 1.24 ml to
+    0.68). Both ends, not the bowl's alone: the bowl's far edge is thinly
+    sampled, and its 98th percentile fell 5 mm short of the real edge, while
+    the span's middle was within 1.5 mm.
+    """
+    points = np.asarray(points, dtype=float)
+    if len(points) < 20:
+        return None
+    local = (points - grasp_pose[:3, 3]) @ grasp_pose[:3, :3]
+    return [float(np.percentile(local[:, 0], 1)), float(np.percentile(local[:, 0], 99))]
+
+
 def upright_from_pitched(pose: np.ndarray) -> np.ndarray:
     """
     Same XY/closing as a pitched cup grasp, but tool Z straight down.
@@ -506,6 +526,14 @@ class PickUpSkill(BaseSkill):
             "grasp_force": grasp_force,
             "suggested_tool_offset": (None if suggested is None
                                       else [float(v) for v in suggested]),
+            "tool_extent_x": tool_extent_x(object_pc, grasp_pose),
+            # The held object's own shape, from the cloud it was picked by:
+            # pour needs where a held cup's rim and bottom are relative to the
+            # jaws to keep its lip over the target (SkillsExecutor fills it in).
+            "object_top_z": float(np.percentile(np.asarray(object_pc)[:, 2], 99)),
+            "object_bottom_z": float(np.percentile(np.asarray(object_pc)[:, 2], 1)),
+            "object_radius": float(np.percentile(np.linalg.norm(
+                np.asarray(object_pc)[:, :2] - np.asarray(centroid)[:2], axis=1), 97)),
             "centroid": centroid.tolist(),
             "dimensions": dimensions.tolist() if dimensions is not None else None,
         }

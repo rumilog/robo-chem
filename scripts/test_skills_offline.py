@@ -1432,6 +1432,156 @@ def test_stir_stops_descending_on_contact():
     check("an arm with no force reading falls back to position",
           ok and result["force_guarded"] is False, f"{result}")
 
+    # to_floor: feel past the measured bottom and stop on the floor itself,
+    # in a cup shallow enough for the rod (a 52 mm clear cup, say).
+    shallow = cylinder_cloud([0.50, 0.0], base_z=0.0, height=0.05, radius=0.033)
+    s_rim = make(StirSkill, FakeVision({"cup": shallow}), FakeArm()) \
+        .locate_container("cup")["top_z"]
+    floor_tip = 0.003                           # a 3 mm base
+    arm = PressArm(floor_tip + tool)
+    ok, result = make(StirSkill, FakeVision({"cup": shallow}), arm).execute(
+        dict(opts, to_floor=True))
+    check("to_floor stops on the floor and stirs just above it",
+          ok and result["stopped_by_force"] is True and result["to_floor"] is True
+          and not result["hand_limited"]
+          and abs(result["stir_z"] - result["contact_z"] - 0.004) < 1e-6
+          and result["contact_z"] - tool < floor_tip + 0.002,
+          f"{ {k: result.get(k) for k in ('stopped_by_force', 'contact_z', 'stir_z', 'hand_limited')} }")
+    check("to_floor went deeper than the default stir_depth would",
+          ok and result["stir_z"] < s_rim - 0.03 + tool - 0.01,
+          f"stir_z={result.get('stir_z')}")
+    # In the 80 mm cup the rod cannot reach the floor with the hand clear of
+    # the rim: it stirs as deep as that allows, and says so.
+    arm = PressArm(0.0)
+    ok, result = make(StirSkill, FakeVision({"cup": cup}), arm).execute(
+        dict(opts, to_floor=True))
+    lowest = min(c[0][2] for c in arm.commands)
+    check("a cup taller than the rod is stirred with the hand above the rim",
+          ok and result["hand_limited"] is True and lowest >= rim_z + 0.030 - 1e-6,
+          f"lowest TCP z {lowest:.4f}, rim {rim_z:.4f}, {result.get('hand_limited')}")
+    ok, result = make(StirSkill, FakeVision({"cup": cup}), FakeArm(
+        tracking=1.0, gripper_width=0.03)).execute(dict(opts, to_floor=True))
+    check("to_floor is refused without a force reading",
+          not ok and "force" in result.get("error", ""), f"{result}")
+
+
+def test_executor_discards_a_tool_offset_from_the_wrong_end():
+    """A measured offset whose x points back along the handle is not used."""
+    print("\n[executor: tool_offset sanity against the CAD]")
+    from robochem.skills import SkillsExecutor
+    from robochem.skills.scoop import ScoopSkill
+    ex = SkillsExecutor(None, None, {})
+    ex.held = "larger spoon"
+    skill = ScoopSkill.__new__(ScoopSkill)
+    cad = [0.0257, 0.0, 0.0294]
+    # 2026-10-02, sim: pick_up measured the handle end as the bowl.
+    out = ex._fill_tool_geometry("scoop", skill, {"tool_offset": [-0.0304, 0.0007, 0.0023]})
+    check("a sign-flipped x is replaced by the CAD offset",
+          out["tool_offset"] == cad, f"{out['tool_offset']}")
+    # The bench-validated measurement: x 25 mm past the CAD (the grasp sat
+    # back along the handle), y 9 mm off. It must survive, z raised to CAD.
+    out = ex._fill_tool_geometry("scoop", skill, {"tool_offset": [0.051, 0.009, 0.028]})
+    check("a plausible measured x/y is kept, z raised to the CAD depth",
+          out["tool_offset"] == [0.051, 0.009, 0.0294], f"{out['tool_offset']}")
+    out = ex._fill_tool_geometry("scoop", skill, {"tool_offset": [0.03, 0.035, 0.03]})
+    check("an offset 35 mm to one side is replaced",
+          out["tool_offset"] == cad, f"{out['tool_offset']}")
+    out = ex._fill_tool_geometry("scoop", skill, {})
+    check("no offset at all gets the CAD one", out["tool_offset"] == cad,
+          f"{out.get('tool_offset')}")
+    ex.held = "smaller spoon"
+    out = ex._fill_tool_geometry("scoop", skill, {})
+    check("the smaller spoon has its own geometry",
+          out["tool_offset"] == [0.0208, 0.0, 0.0235] and abs(out["bowl_length"] - 0.0206) < 1e-9,
+          f"{out}")
+
+    # Where the pick saw the larger spoon's two ends (sim, 2026-10-03: the
+    # bowl's centre was truly 21.5 mm out; pick_up suggested 29.2).
+    ex.held = "larger spoon"
+    suggested = [0.0292, 0.0087, 0.0236]
+    ex.held_measure = {"suggested": suggested, "extent_x": [-0.0333, 0.0315]}
+    expect = (-0.0333 + 0.0315) / 2 + 0.02105
+    out = ex._fill_tool_geometry("scoop", skill, {"tool_offset": list(suggested)})
+    check("pick_up's offset copied by a planner -> x from the tool's ends, y/z CAD",
+          abs(out["tool_offset"][0] - expect) < 1e-9 and out["tool_offset"][1:] == [0.0, 0.0294],
+          f"{out['tool_offset']} vs x {expect:.4f}")
+    out = ex._fill_tool_geometry("scoop", skill, {})
+    check("no offset at all -> x from the tool's ends too",
+          abs(out["tool_offset"][0] - expect) < 1e-9, f"{out['tool_offset']}")
+    out = ex._fill_tool_geometry("scoop", skill, {"tool_offset": [0.051, 0.009, 0.028]})
+    check("an offset passed on purpose is still kept (z raised)",
+          out["tool_offset"] == [0.051, 0.009, 0.0294], f"{out['tool_offset']}")
+    ex.held_measure = {"suggested": suggested, "extent_x": [-0.09, -0.06]}
+    out = ex._fill_tool_geometry("scoop", skill, {})
+    check("ends that do not fit the part fall back to the CAD",
+          out["tool_offset"] == cad, f"{out['tool_offset']}")
+    ex.held_measure = {}
+
+
+def test_executor_puts_things_back_where_they_came_from():
+    """place 'beside' another object sends a picked object back to its own spot."""
+    print("\n[executor: put back where picked]")
+    from robochem.skills import SkillsExecutor
+    ex = SkillsExecutor(None, None, {})
+    ex.pick_sites = {"water cup": [0.49, -0.07, 0.03], "plastic beaker": [0.38, -0.07, 0.05],
+                     "stirrer": [0.62, 0.14, 0.10]}
+    ex.held = "water cup"
+    out = ex._resolve_pick_site("place", {"target_location": "plastic beaker"})
+    check("beside another picked object -> the held cup's own site",
+          out["target_location"] == [0.49, -0.07, 0.03], f"{out}")
+    out = ex._resolve_pick_site("place", {"target_location": "clear cup b"})
+    check("beside an object never picked -> the held cup's own site",
+          out["target_location"] == [0.49, -0.07, 0.03], f"{out}")
+    out = ex._resolve_pick_site("place", {"target_location": "clear cup b", "on_top": True})
+    check("on_top is left alone", out["target_location"] == "clear cup b", f"{out}")
+    out = ex._resolve_pick_site("place", {"target_location": [0.4, 0.1]})
+    check("explicit coordinates are left alone", out["target_location"] == [0.4, 0.1], f"{out}")
+    ex.held = "stirrer"
+    out = ex._resolve_pick_site("place", {"target_location": "stirrer holder"})
+    check("the stirrer named by its holder goes back in, inserted vertically",
+          out["target_location"] == [0.62, 0.14, 0.10] and out.get("vertical_insert") is True,
+          f"{out}")
+    ex.held = None
+    out = ex._resolve_pick_site("place", {"target_location": "plastic beaker"})
+    check("with nothing tracked in the jaws a name is left for vision",
+          out["target_location"] == [0.38, -0.07, 0.05] or out["target_location"] == "plastic beaker",
+          f"{out}")
+
+
+def test_pour_keeps_the_lip_just_over_the_target():
+    """With the held cup's shape known, the lip ends just over the rim."""
+    print("\n[pour: lip over the target]")
+    from robochem.skills.pour import PourSkill
+    target = cylinder_cloud([0.35, -0.15], base_z=0.0, height=0.047, radius=0.0275)
+    arm = FakeArm(gripper_width=0.05)
+    skill = make(PourSkill, FakeVision({"cup": target}), arm)
+    rim = skill.locate_container("cup")
+    src = {"source_top_above_tcp": 0.014, "source_height": 0.049, "source_radius": 0.03}
+    ok, result = skill.execute({"target_container": "cup", "pour_angle": 90,
+                                "hold_duration": 0.0, "duration_per_step": 0.0, **src})
+    check("pour succeeds", ok, f"{result}")
+    check("it took the lip path", result.get("mode") == "lip_over_target", f"{result}")
+    lips = result.get("lip_over_rim_mm") or []
+    check("the lip ends 15 mm over the rim", lips and abs(lips[-1] - 15.0) < 0.5, f"{lips}")
+    check("and never below it on the way", lips and min(lips) >= 14.5, f"{lips}")
+    lip_xy = np.asarray(result["lip_xy"])
+    want = np.asarray(rim["rim_center"])[:2] + np.array([-0.4 * rim["rim_radius"], 0.0])
+    check("the lip is over the target, a little toward the base",
+          np.linalg.norm(lip_xy - want) < 1e-6, f"{lip_xy} vs {want}")
+    # Every commanded TCP during the tip keeps the whole cup 10 mm over the rim.
+    cup = PourSkill._cup_points(0.014, 0.049, 0.03)
+    tips = [c for c in arm.commands]
+    check("the cup came down as it tipped (TCP lower at the end than the start)",
+          len(tips) > 3 and tips[-2][0][2] < tips[2][0][2],
+          f"{[round(float(c[0][2]), 3) for c in tips]}")
+    # Without the shape it is the old fixed site, 15 cm up.
+    arm2 = FakeArm(gripper_width=0.05)
+    ok2, result2 = make(PourSkill, FakeVision({"cup": target}), arm2).execute(
+        {"target_container": "cup", "pour_angle": 90, "hold_duration": 0.0,
+         "duration_per_step": 0.0})
+    check("without the held cup's shape it falls back to the fixed site",
+          ok2 and result2.get("mode") is None, f"{result2}")
+
 
 def test_depth_gate_drops_edge_streaks_not_containers():
     """
@@ -1837,6 +1987,9 @@ def main():
     test_stir_offsets_shift_the_circle_centre()
     test_depth_gate_drops_edge_streaks_not_containers()
     test_stir_stops_descending_on_contact()
+    test_executor_discards_a_tool_offset_from_the_wrong_end()
+    test_executor_puts_things_back_where_they_came_from()
+    test_pour_keeps_the_lip_just_over_the_target()
     test_scoop_requires_a_real_tilt()
     test_scoop_site_offsets_and_unknown_params()
     test_dispense_never_drops_the_pipette()

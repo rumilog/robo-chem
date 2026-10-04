@@ -1,6 +1,6 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-09-25
+Last updated: 2026-10-03
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
@@ -412,6 +412,476 @@ above) — this chain does not need them, so it is unaffected.
 
 ---
 
+## Instruction → VLM → sim: how to run it (2026-10-02)
+
+The whole loop runs in sim with a live model. An instruction comes in as a
+text task or as a photographed sheet; the model plans skill calls; the sim
+executes them. Needs `openai_api_key=` in the repo's `.env`. Verification stays
+off in sim, because there is no chemistry.
+
+```bash
+source scripts/env_dev.sh
+# a typed instruction: the whole text goes to the planner
+python scripts/run_experiment.py --sim --workspace-min 0.25 -0.40 -0.13 \
+  --task "Add one scoop of citric acid to the white paper cup, then stir the cup with the stirring rod. Put the scoop and the stirring rod back where you found them."
+# a photographed instruction sheet; --follow-steps passes its steps on too
+python scripts/run_experiment.py --sim --workspace-min 0.25 -0.40 -0.13 \
+  --instruction-image instructions/citric_acid_stir.png --follow-steps
+```
+
+`instructions/citric_acid_stir.png` is a card written for the sim bench. The
+booklet's Magic Beaker (pages 12-13) used to be refused in sim for want of red
+cabbage powder, water, clear cups and liquids. Since 2026-10-02 the bench has
+them, see "The Magic Beaker kit in sim" below:
+`--instruction-image instructions/magic_beaker.png --follow-steps`.
+
+**Measured on 2026-10-02 (live gpt-4.1, layout seed 829181).** Both commands
+above ran all 7 planned steps:
+1. spoon, scoop citric acid, dump into the paper cup, spoon back;
+2. stirrer, stir the paper cup, stirrer back into its holder.
+
+Neither run touched anything but the grasps, and nothing moved more than 3 mm.
+Another seed (31337) was clean on the text task too. Getting there took these
+fixes:
+
+- **Image instructions lost their steps.** The orchestrator hands the planner
+  the parsed goal alone, which is the research design. Given only "prepare a
+  citric acid mixture", the planner dumped into the beaker and never stirred.
+  `--follow-steps` (opt-in) appends the sheet's steps.
+- **`InstructionParser` was pinned to `gpt-4o`** (API shutdown 2026-10-23). It
+  now uses `agents.config.strong_model()`. **Still pinned, still to do before
+  10-23:** `vision/label_resolver.py` (the real cell's labelled-cup reads),
+  `vision/scene_analyzer.py`, and the legacy `task_planner` / `vlm_orchestrator`.
+- **The scene agent called the citric acid dish "empty"** in about 1 run in
+  4, and the planner then refused the task. The sim labels are blank paper,
+  now mostly hidden under the 102 mm dish. The prompt now says a
+  reagent-named inventory entry is that container's label. After the change,
+  3 of 3 scene calls on the failing layout reported "citric acid".
+- **Putting tools back.**
+  - The model put the spoon "beside the citric acid", landed it on the dish
+    and pushed the dish 11 cm.
+  - It put the stirrer "beside the stirrer holder", which dropped it on the
+    bench, and the hand hit the beaker.
+  - Now the catalog tells it to name the tool itself. The executor also maps
+    a tool's alias or its home ("stirrer holder") to the tool's pick site and
+    fills its put-back params from `skills/tool_geometry.py` (the stirrer:
+    `vertical_insert`, force-probed seat).
+- **Stir got pick_up's measured z (0.017) as `tool_length`,** because the
+  orchestrator's note said to pass it to "any that takes tool_length". That
+  is 64 mm short for the stirrer. The note no longer says so, and the executor
+  raises a `tool_length` under 80% of the tool's CAD length (0.081) to CAD.
+- **Twice the stir skill call came back as broken JSON,** despite strict
+  schema, and the second time blocked the task. `structured_completion` now
+  re-asks once, slightly warm.
+
+**Random layouts: tall containers now keep 18 cm from the powder dishes.**
+The scooping hand is about 200 mm across its jaws, and the wrist reaches
+toward the base. Centre distances measured in sim: 144 mm hit, 145 mm hit,
+161 mm hit (link7), 172 mm clear. **The fixed default layout breaks this
+rule:** scooping BAKING SODA there drives the hand into the plastic beaker
+(144 mm, 1699 contact steps). Every validated chain scooped citric acid, which
+is clear. `randomize_layout` also now checks each draw against every other
+prop's current spot. 200 of 200 seeds give a clean layout.
+
+**Where Aliyah's repo lives.** `robomail/` is the rumilog submodule (b7b83a0).
+Do not clone over it. Aliyah's repo (aliyahreddingdidit/robomail) belongs in
+`robomail_Aliyah/`. That path is a committed gitlink to her 4bee1ac with no
+`.gitmodules` entry, so `git submodule update` does not fill it, and a fresh
+checkout leaves it empty. Clone her repo there by hand. When it is missing, the
+offline tests skip the vocabulary bridge group.
+
+On 2026-10-02 her clone was found over `robomail/`. It was moved to
+`robomail_Aliyah/` and the submodule was restored. Results after the move:
+- `test_skills_offline.py`: 201 passed, plus the 2 old scoop failures. The
+  bridge group passes.
+- `smoke_test_sim.py`: all 9 groups pass.
+
+## The Magic Beaker kit in sim: props, liquid, chemistry (2026-10-02)
+
+The sim bench (`sim/bench.py default_bench`) holds what the booklet's Magic
+Beaker (pages 12-13, `instructions/magic_beaker.png`) needs and nothing else,
+laid out the way the real bench is. **Since 2026-10-03 that means seven
+containers.** The user asked to keep only what the experiment needs, so the
+white paper cup (a leftover distractor) and the separate 50 ml water cup went.
+The beaker now starts with the 50 ml.
+
+| Prop | What it is | Measured? |
+| --- | --- | --- |
+| citric acid / baking soda / red cabbage powder cup | the same 91/102/29/8 mm dish (`_powder_dish`), 18 mm bed | dish yes; red cabbage colour no |
+| clear cup a / b, labels `a 10 ml water` / `b 10 ml water` | 10 ml water each, as on the real bench | **47.3 mm tall, 55.5 mm across the outside, measured by the user 2026-10-03.** Wall 1 mm and base 3 mm are not measured. A straight cylinder (53.5 mm inside, 100 ml), so 10 ml stands 4.4 mm deep, a bit more in the real tapered cup. Until 2026-10-03 the sim had 52 x 66 mm cups read off depth (`scene_captures/b10_water_20260925_153459`), where 10 ml was 3.0 mm deep. |
+| clear cup c | empty, for the final mix | the same cup |
+| plastic beaker, label `50 ml water` | the indicator's 50 ml, there from the start | beaker as before |
+| smaller spoon (`small scoop`) | **placeholder**: spoon.stl at 75%, CAD in `tool_geometry.py` from sim | no part exists |
+| larger spoon, now also `big scoop` | unchanged | yes |
+
+Water comes pre-measured because `pour` cannot meter: it tips until the level
+reaches the rim. That is what the real bench does too.
+`instructions/citric_acid_stir.png` now names clear cup A; it used to name the
+white paper cup.
+
+**`robochem/sim/lab.py` keeps the books on contents**. It is on by default in
+`build_cell`; `film_sim_skill.py` turns it off and keeps its own tally.
+- Every scoop's load is tracked by reagent (`powder.ScoopTally`, now multi-bed).
+- Powder lands in whatever opening is under the bowl's lowest rim point.
+- Liquid runs over a tilted container's lowest rim point once the level surface
+  reaches it, and lands in whatever opening is below. A lattice gives the volume
+  kept at each tilt.
+- Powders dissolve: tau 45 s still, 2 s while a stirrer's tip moves in the liquid.
+  Baking soda is capped at 0.13 g/ml of warm water.
+- Citric acid (3 eq) and bicarbonate neutralise each other and foam.
+- A rough pH (triprotic titration, flattened) colours the red cabbage indicator.
+- None of these constants is measured on the kit.
+
+After every skill it prints `[lab]` lines and adds them to the result as
+`sim_lab`, for the log only; the planner never sees them. `run_experiment
+--sim` prints the end state.
+
+**The scripted Magic Beaker** (`scripts/sim_magic_beaker.py`, default layout; it prints the contact audit and contents). It was 28 steps on 2026-10-02; with the water already in the beaker it is 25:
+- Steps: big scoop citric acid into A, baking soda into B; small scoop red
+  cabbage into the beaker (water cup into the beaker, 2026-10-02 only); stir A, B, the beaker
+  with `to_floor`; beaker 80 deg into A, 90 into B; A and B into C; everything
+  put back.
+- Outcome: A pH ~1.7-2.0, **red**; B pH 8.3, **blue**; C fizzes 9.7 meq, pH
+  5.8-6.2, **purple/magenta**. The booklet says purple.
+- Every pour landed in its target; nothing ran onto the table.
+- Leftover citric acid in the big scoop fizzed B a little when the same scoop
+  took baking soda. That is real.
+
+*The runs below, through seed 4242, were on the 9-container bench of
+2026-10-02, which had a water cup and the paper cup.*
+
+**Live, planner-driven (gpt-4.1), fixed layout, 2026-10-02.** Run with
+`--instruction-image instructions/magic_beaker.png --follow-steps` (record
+`experiments/agent_run_20261002_*`).
+- The plan was 36 sub-tasks. All executed with no replan, and every tool and
+  cup went back by its own name.
+- Contents: A got 0.96 g citric acid, B 1.20 g baking soda (+0.26 g of the
+  scoop's leftover citric acid), the beaker 0.28 g red cabbage + 50 ml.
+- Pours: beaker into A 26.1 ml, into B 23.9 ml; A into C 30.9 ml, B into C
+  33.9 ml.
+- C fizzed 10.2 meq and ended at **pH 6.4, purple**. A kept 5 ml, red.
+- The only contacts were the stirrer meeting the floor of A and B while
+  `to_floor` felt for it. Nothing on the bench moved more than 5 mm.
+
+**Same, random layout seed 4242** (the dishes and clear cups swapped round):
+- 34 sub-tasks, all executed, and again only the `to_floor` floor touches.
+- The big scoop took only 0.49 g of baking soda here, against 1.20 g on the
+  fixed bench. C fizzed 2.5 meq, the acid was left over, and C ended **pH 4.1,
+  pink** instead of purple. How much a scoop collects is the outcome's main
+  lever.
+- The first try of this seed stopped dead after step 30's pour, with no
+  traceback and no OOM line visible. Two sims were rendering with EGL at the
+  time. The rerun, alone, went through. Watch for it.
+
+```bash
+python scripts/run_experiment.py --sim --workspace-min 0.25 -0.40 -0.13 \
+  --instruction-image instructions/magic_beaker.png --follow-steps
+```
+
+### 2026-10-03: seven containers, and three things trimming them uncovered
+
+- **The layout was redone for seven containers.** Annealed with 2 cm of slack
+  on every rule, then centred: each container has 16-27 mm of slack (it was
+  4-26).
+  - Acid on the left (dish behind cup A), base on the right (dish behind
+    cup B), the beaker in the middle, red cabbage behind it on the left, cup C
+    at the front left.
+  - 200 of 200 random seeds break no rule, keep every container in 3+
+    cameras, and move every container (median 133 mm); before, some could not
+    move at all.
+- **Segmentation was rendered through multisampling.** The IDs at every edge
+  were the average of two IDs, which spells a third geom.
+  - Usually such a pixel just landed on some unrelated geom. On this bench one
+    spelled 355 against a 316-entry table, and MuJoCo's decode raised
+    `IndexError` on the first locate.
+  - With more geoms the stray pixels had been assigned silently: a clear cup's
+    mask picked up a pixel 0.37 m away and was rejected as "includes the table".
+  - `SimVision` now renders depth and segmentation with `offsamples=0` and
+    decodes the IDs itself, dropping any ID that names no geom. RGB for the VLM
+    keeps antialiasing on a second renderer. The decode matched MuJoCo's own
+    pixel for pixel wherever MuJoCo's did not crash.
+  - 0 stray pixels per camera now.
+- **The scoop's yield hangs on the tool offset's x.**
+  - The crisper depth moved the spoon grasp 2.8 mm toward the bowl, and the
+    big scoop fell from 1.42 to 0.41 ml at every dish position tried.
+  - Passing x by hand at the default dish: 25.7 mm (CAD) gave 0.40 ml; 23.5
+    gave 0.68; 21.5 (the truth) 1.24; 19.5 1.83. **2 mm is a factor of 2-3.**
+  - pick_up's own x (median of the bowl end) was 29.2, 7.7 mm off, so the
+    planner, copying it, scooped 0.05-0.07 g into A.
+  - pick_up now also reports `tool_extent_x`, the cloud's [1st, 99th]
+    percentile along the tool x.
+  - For a known tool the executor sets x = the span's middle +
+    `span_mid_to_bowl` (spoon.stl: 21.05 mm; smaller spoon 15.8). y and z
+    come from CAD. This is used when no offset is given, or when the given one
+    is pick_up's own suggestion copied over; a value passed on purpose (the
+    bench's [0.051, ...]) is kept.
+  - The far edge alone did not work: the bowl's tip is thinly sampled, and its
+    98th percentile fell 5 mm short.
+  - Measured: 19.6 vs 21.5 mm (larger), 15.3-16.5 vs 16.4-16.5 (smaller). Every
+    scoop filled: 1.83 ml big, 0.77 small. The error is on the deep side, about
+    1.5 mm closer to the floor than the 3 mm gap.
+  - **On the robot this changes planner-driven scoops whenever pick_up ran in
+    the same session.** Check the first one.
+- **Dump can't hold the bowl still close in.**
+  - A cup at x <= 0.257 m failed or drifted 16-18 mm (cup C's spot at x 0.268:
+    6.1 mm). From x 0.276 it held within 0.4 mm, left or right, at every angle
+    from -50 to +50.
+  - New rule: `LAYOUT_MIN_X` 0.28 for every container.
+- **The planner tipped cup A only 80 deg into C**, taking "80 for the first of
+  two" from the pour note. That wording was about splitting one container. Now
+  the note says: 90 for any pour that should empty the source, about 80 only to
+  pour part and keep the rest.
+
+**Validated on the seven-container bench (2026-10-03), final code:**
+- `smoke_test_sim.py`: 10/10.
+- `test_skills_offline.py`: 220 passed, plus the 2 old scoop failures.
+- `test_agents_offline.py`: 61/61.
+- `scripts/sim_magic_beaker.py` (25 steps, no floor or offset hints):
+  - A got 1.33 g citric acid, B 1.19 g baking soda, the beaker 0.28 g red
+    cabbage.
+  - C ended at pH 5.1, magenta.
+  - The only contacts were the `to_floor` floor touches.
+- Scoop into and dump out of every container: every big scoop full
+  (1.47-1.83 ml), no contact.
+- Live, seed 777: 31 sub-tasks, no replan.
+  - Beaker 80 into A, 90 into B; A and B into C.
+  - C fizzed 8.5 meq and ended at pH 5.1, magenta.
+- Live, fixed layout: everything executed, but **the planner tipped the
+  beaker 90 into A for "pour some indicator"**. All 50 ml went to A and B got
+  none.
+  - The reworded pour note did not settle it. The same sheet gave 80 in the
+    seed-777 run and 90 here. `pour` cannot meter, and the model's choice of
+    angle varies run to run.
+  - **Fixed in the orchestrator, deterministically** (`POUR_KEEP_SOME_DEG`).
+    Before a pour runs, it looks down the plan. If the held container pours
+    again before any later sub-task puts something down or picks something up,
+    `pour_angle` is capped at 80. The change is noted as `[adjusted]` and in the
+    step record's `adjusted`.
+  - Why 80: at a given tilt a container keeps what lies below its rim whatever
+    it held before, ~24 ml for the beaker at 80 (the sim's geometry). The
+    sheet gives no amounts ("pour some"), so any split works as long as B gets
+    some.
+  - A container that pours only once (A or B into C) still goes to 90.
+  - On the robot, liquid clinging to the wall leaves a little more behind,
+    which is the safe side.
+  - `test_agents_offline.py`: 66/66, including this case.
+  - First live check, fixed layout, 2 runs:
+    - one planned 80 then 90 itself (A 26.1 ml, B 23.9 ml; C pH 5.4), so the
+      guard had nothing to do;
+    - the other died on a different fault (below).
+- **The skill-call agent wrote `","` for `pour_angle`** (twice that day). The
+  value went through as a string, and pour died converting it.
+  - `coerce_params` now checks every value against the catalog's kind.
+    "90" becomes 90.0. An optional value that is not its kind is dropped (the
+    skill's default applies) and printed; a required one is a planning failure.
+  - On the same run, the replan's pour call came back as cut-off JSON twice
+    and blocked the task. `structured_completion` now re-asks twice (at
+    temperature 0.3, then 0.6) instead of once.
+  - `test_agents_offline.py`: 69/69.
+  - With both fixes, two live runs (fixed layout, and seed 4242) went
+    through: 31 sub-tasks each, no replan.
+    - Beaker 80 into A (26.1 ml), 90 into B (23.9 ml).
+    - A at 80 into C (32.4 ml; 3.7 ml left in A, red). B at 90 into C (33.9 ml).
+    - C ended at pH 5.4, magenta.
+    - The only contacts were the `to_floor` floor touches.
+    - The planner chose 80 itself both times, so the guard did not have to
+      act. The offline test covers the case where it must.
+  - The same run also passed `tool_offset` to pour. It was rejected and the
+    replan carried on to the end (9 sub-tasks), as the new replan rule asks.
+- **With the measured 47.3 x 55.5 mm cups** (same day):
+  - Smoke 10/10. The scripted chain was clean: beaker into A 26.1 ml, into B
+    23.9; A into C 36.1, B into C 33.9; C at pH 5.1.
+  - The dump drift stayed at 0.1-0.2 mm at the x = 0.28 boundary (5 spots), so
+    the rule holds for the shorter cup.
+  - The live fixed-layout run **again tipped the beaker 90 into A** ("pour
+    some" read as all). A malformed pour parameter (`','` for a number) was
+    replanned around. That makes 2 of 3 fixed-layout runs on this sheet; the
+    pour-amount question is open.
+- **Grasp slip is not tested by the sim.** The default magnet grasp cannot
+  slip.
+  - With `--sim-grasp-mode physics`, the fingers passed through a clear cup's
+    0.8 mm wall: closed to 36 mm on a 66 mm cup and lifted nothing.
+  - The beaker, which the robot pours fine, slid out during the tip.
+  - That mode is not calibrated. Whether a clear cup can be picked and tipped
+    to 90 deg without crushing or slipping is a bench question, still to
+    answer.
+
+### Pour keeps the held cup's lip just over the target (2026-10-03)
+
+The user saw cup-to-cup pours as far too high and too far forward. Measured
+during the old pour (A into C, the beaker into A):
+- the lip (the held cup's lowest rim point, where the liquid leaves) was
+  **155-185 mm above the target's rim**, over its centre;
+- the cup's body hung out beyond the target, away from the base.
+
+The old site is the fixed one tuned on the robot for beaker into paper cup:
+target centroid, +0.05 lean shift, -0.08 forward offset, TCP 0.15 m over the
+target's top, +2.5 mm per 10 deg.
+
+**New path** (`PourSkill._pour_over_lip`). It is used whenever the held cup's
+shape is known; otherwise pour falls back to the fixed site.
+- **Where the shape comes from.** `pick_up` now reports the object's top and
+  bottom z (1st/99th percentile) and radius. The executor turns them into
+  `source_top_above_tcp`, `source_height` and `source_radius` and fills them
+  into pour; the bottom is the table when `table_z` is set.
+- **Where the lip goes.** Pour models the held cup as rings in the tool frame.
+  At each 10 deg tip step it puts the lip `lip_clearance` (15 mm) over the
+  target's measured rim, `lip_inset` (0.4) of the inside radius toward the
+  base from its centre.
+- **How high the cup rides.** The TCP is raised wherever needed so that every
+  point of the cup stays `body_clearance` (10 mm) over the rim height. An
+  upright cup's bottom is lower than its lip, so the cup starts higher and
+  comes down as it tips.
+- **Approach and finish.** The cup arrives 6 cm over the start, goes down,
+  tips step by step, holds, then is righted in place 4 cm up before going home.
+
+Measured in sim, after:
+
+| Pour | Lip over the rim | Lip from the target centre | Lowest point of the held cup over the rim |
+| --- | --- | --- | --- |
+| A into C, to 90 | 57 mm at the start, 19 mm at 87 deg | 11-13 mm toward the base | 11-17 mm |
+| beaker into A, to 80 | 104 mm at the start, 35 mm at 77 deg | 11-14 mm toward the base | 11-14 mm |
+
+The beaker's lip stays higher because its bottom edge, 97 mm away, swings
+lower than the lip until late in the tip. The same liquid went in as before:
+10.0 ml and 26.1 ml.
+
+**The grasp height mattered too.** The bench-validated `z_offset` 0.02 for the
+beaker puts the TCP 7 mm ABOVE a 47 mm cup's rim, so the pads, which reach
+8.9 mm past the TCP, held its top 2 mm. With pick_up's default (z_offset 0)
+the rim is 13 mm above the TCP. `sim_magic_beaker.py` now picks cups on the
+defaults, as the planner does.
+
+**On the robot:** after a pick_up in the same session, pour now takes the new
+path. It has not run on the robot; the fixed site it replaces was validated
+there for beaker into paper cup.
+
+`test_skills_offline.py`: 227 passed, plus the 2 old scoop failures. The new
+`pour: lip over the target` group covers the final lip at 15 mm, never under
+it, the lip's spot, the descent, and the fallback.
+
+### What the arm actually sweeps, and the layout rules made from it
+
+Measured from the links' collision geometry in sim, in the target's radial
+frame. The scratch scripts that did this were not kept. They sampled every arm
+link's collision vertices below 0.13 m every 25 steps of a dump, pour or scoop
+into each target.
+
+| Motion | Arm below 0.10 m | Arm below 0.13 m |
+| --- | --- | --- |
+| dump into a 52 mm cup | ahead -0.05..+0.17, aside -0.06..+0.12 | -0.09..+0.27, -0.13..+0.15 (link6/7 reach out) |
+| dump into the 95 mm beaker | none | -0.04..+0.14, +-0.03 |
+| scoop a dish | -0.08..+0.14, +-0.13 | -0.08..+0.14, +-0.13 |
+| pour (any) | none | none |
+
+Nothing comes lower than ~26 mm above the target's rim. The rules in
+`bench._conflicts` (`layout_violations`) come from this table:
+- `DUMP_SWEEP` keep-out boxes by obstacle height above the target rim; nothing
+  within 15 mm of the rim height is constrained.
+- Tall things are kept 0.18 m from dishes (the old rule, now confirmed by the
+  scoop sweep).
+- Bodies are 3 cm apart, labels must not overlap, nothing within 12 cm of the
+  holder.
+- A tall container is at least 0.38 m from the base. The paper cup at 0.358 m
+  could not be reached by dump after a scoop on the far side (stopped 22 mm
+  short); at 0.38 m it worked.
+
+The layout was annealed under these rules, then each container was moved to
+the middle of the spot it may occupy, with at least 3 cameras seeing it. That
+left 4-26 mm of slack per container. The rest of this note does not need the
+scratch scripts: `layout_violations` and the shuffle are in `bench.py`.
+
+`randomize_layout` now first **swaps containers of the same body** (the three
+dishes, the four clear cups), then jitters each within 6 cm under the same
+rules plus a 3-camera check. Jitter alone barely moved anything with the full
+kit on the bench.
+- 200 of 200 seeds break no rule and keep every container in 3+ cameras.
+- Median move is 142 mm.
+
+### Failures that cost time, and what was changed
+
+- **My contact audit was silently off.** `kit_chain.py` wrapped
+  `cell.arm._step` and then restarted the lab, which put the class method back.
+  That gave "0 contacts" for runs that had them. The audit must patch
+  `SimFrankaArm._step` on the class before `build_cell`.
+- **Corridor too short.** With the first layout, dumping into cup B drove
+  link6 into the seated stirrer, 0.20 m ahead and 0.096 aside. That is outside
+  the 0.22 x 0.09 corridor I had guessed, so the sweep was measured instead.
+- **A measured tool_offset pointing at the wrong end.** pick_up's
+  `measure_tool_offset` took the handle end as the bowl: x was -30 mm against
+  CAD +25.7. The grasp sat 16 mm toward the bowl, after the spoon moved to
+  (0.62, -0.03). The live VLM run passed it to scoop and dump. The hand flung
+  two dishes 2.3 m and hit the beaker and the water cup. `_fill_tool_geometry`
+  now discards a measured offset whose x points the other way from the CAD, or
+  that is more than 20 mm to one side. The bench-validated [0.051, 0.009, ...]
+  is still kept, z raised.
+- **`to_floor` stir.** A rim-relative `stir_depth` (0.03) never reaches 10 ml
+  in a 52 mm cup: the tip stopped 18 mm above the water. On the real robot,
+  `stir_depth` 0.02 in `b 10 ml water` probably did not reach it either.
+  `stir(to_floor=true)` feels down to the floor (1 mm steps, 4 mm back-off) and
+  is refused without a force reading. Getting it clean took three fixes:
+  - the rod went **through** the 3 mm base, because default soft contact let it
+    sink past half the thickness; container bases and the rod now use the
+    printed parts' stiff `solref`;
+  - the fingers (8.9 mm past the TCP) and the stirrer head brushed the rim:
+    pick_up holds the head 6.8 mm low, so it hangs ~22 mm under the TCP. Stir
+    now keeps the TCP `hand_clearance` 30 mm above the rim, whatever depth was
+    asked;
+  - the rod (66 mm) cannot reach the floor of the 95 mm beaker with the hand
+    clear, so the beaker is stirred above its 50 ml (`hand_limited`). The
+    indicator still dissolves unstirred in the sim. Expect the same on the
+    robot.
+- **The planner set things down "beside" others.** The water cup went onto the
+  beaker's spot, and the beaker onto cup B and then into cup A. Cup A went
+  over and 34 ml ran onto the table. Fixes:
+  - `place` now puts a held object that was picked from the bench back where
+    it came from whenever it is asked to go beside something else;
+    coordinates and `on_top` pass;
+  - the catalog says to name the object itself.
+- **A replan ended the run early.** After that failed place, the corrective
+  plan was the place alone, and the orchestrator reported success with the
+  final pours never run. The replan prompt now says the plan replaces
+  everything that has not run, so it must carry on to the goal.
+- **The scene agent called water cups empty and dropped objects.** It got the
+  inventory as a flat list, with "clear cup a" and "a 10 ml water" as two
+  names. `SimVision.inventory_notes` now gives one line per object, with its
+  label and other names ("larger spoon -- also called big scoop"). The scene
+  agent also now gets two opposing views (cams 2 and 4), not 2 and 3 from the
+  same side. Next dry run: "clear cup a | a 10 ml water", and the big scoop was
+  used for citric acid and baking soda.
+- **The planner tipped the beaker 40 deg to "pour some".** That pours nothing.
+  The pour note now says liquid leaves only once the level reaches the rim:
+  about 80 for "some", 90 for the rest. The next plan used 80 then 90.
+- **InstructionParser misread step 7** as "into the beaker" in 2 of 3 reads.
+  At temperature 0, with a line asking to keep each step's containers, it read
+  "the empty clear cup" in 3 of 3.
+- `MAX_SUBTASKS` 24 -> 40: the plan is 28-34 sub-tasks.
+- **The big scoop came up empty in every planner-driven run.** The cause was
+  the old open item, the floor estimate. `base_z` (3rd percentile of the cloud)
+  reads 3.0 mm for a dish standing on z=0, even with no depth noise. The
+  beaker reads 6.1 mm and the cups 2.3-5.3. The bottom edge is only seen at a
+  grazing angle, so that percentile lands on the wall; `top_z` is within 1 mm.
+  The floor came out 3 mm high, and the larger spoon's mouth stayed above the
+  bed: 0.00 ml. The scripted chains never hit this because they pass
+  `container_floor_z`.
+  - Fix: the executor config takes `table_z`. When it is set and the container
+    stands on it (base_z - table_z within -5..+12 mm), scoop takes the inside
+    floor as `table_z + floor_thickness`. `build_cell` sets 0.0.
+  - Planner-style scoops (no floor hint, a bad measured offset) then carried
+    1.42 ml citric acid, 1.43 ml baking soda and a full 0.77 ml small scoop.
+  - **On the robot nothing changes until `table_z` is configured.** The cage's
+    table sits at about z = -0.013 to -0.017: the ring around the dish and the
+    B cup in `scene_captures/b10_water_20260925_153459`, cams 2-5.
+- **A DNS hiccup killed two runs**: `openai.APIConnectionError` escaped every
+  handler. `llm_client._create` now retries transient errors after 3, 10, 30
+  and 60 s, then raises `LLMResponseError`, so the stage reports blocked
+  instead of crashing.
+- **On random layout seed 4242 the scene agent described 6 of 13 objects.**
+  The planner took the citric acid dish and the beaker to be missing and
+  refused the task. `comprehend_scene` now appends every inventory object the
+  agent left out, with its label as contents, marked as such. The re-run listed
+  13 and planned 34 sub-tasks.
+
 ## LLM agent pipeline (added 2026-09-24)
 
 robomail_Aliyah's multi-agent planner now drives the real skills, in
@@ -542,9 +1012,15 @@ python scripts/run_experiment.py --sim --workspace-min 0.25 -0.40 -0.13 \
   --skill dump    --params '{"target_container":"white paper cup"}' \
   --skill place   --params '{"target_location":"larger spoon"}' \
   --skill pick_up --params '{"object_name":"stirring rod"}' \
-  --skill stir    --params '{"target_container":"white paper cup","tool_axis":"z","tool_length":0.081,"revolutions":2}' \
-  --skill place   --params '{"target_location":"stirrer holder","on_top":true,"release_clearance":0.015,"stop_force_n":1.0}'
+  --skill stir    --params '{"target_container":"white paper cup","revolutions":2}' \
+  --skill place   --params '{"target_location":"stirring rod","vertical_insert":true,"release_clearance":0.0,"stop_force_n":1.0}'
 ```
+
+Re-run on 2026-09-27 after merging `5c56826`: stir now uses its own
+defaults (`tool_axis` "z", `tool_length` 0.081), and the stirrer goes back
+through `place`'s `vertical_insert` to its remembered pick site. All 7 steps
+succeed. The stirrer seated at z=0.1043 (5.85 N) and nothing moved more than
+3 mm. The dump tipped to 69° and came back to within 9°.
 
 Measured headless (`--no-viewer --sim-fast`, with every arm and held-tool
 contact counted per skill): all 7 steps succeed, and nothing on the bench moves
@@ -634,6 +1110,63 @@ perception_env/bin/python scripts/run_experiment.py --sim --no-viewer --dry-run 
 ```
 
 ---
+
+### Random container layouts in sim (2026-09-27)
+
+*Superseded on 2026-10-02 for the full-kit bench (shuffle within a size class,
+then jitter, under measured sweep rules); see "The Magic Beaker kit in sim".
+The flags below are unchanged.*
+
+`run_experiment.py --sim` now places the cups and dishes at random on every
+run. The seed is printed, so a run can be repeated.
+- `--sim-layout-seed N` repeats a layout.
+- `--sim-fixed-layout` gives back the default bench.
+- `smoke_test_sim.py` and `film_sim_skill.py` keep the fixed layout, as does
+  `build_cell(layout_seed=None)`.
+
+What `bench.randomize_layout` moves and why:
+- **Only containers move:** the beaker, the paper cup and the two powder
+  dishes. The spoon, the stirrer and its holder stay put, because the skills
+  pick those up and seat them by memory.
+- **Each container is drawn from a 6 cm disc around its usual spot**, not
+  anywhere on the table. That keeps the camera coverage and the reach the
+  default bench was validated with.
+- **Draws are rejected unless** the container is 0.35-0.56 m from the base
+  (past about 0.56 m a straight-ahead dump cannot reach its 60° minimum), is
+  3 cm clear of every other footprint (labels included), and is 12 cm clear of
+  the stirrer holder, which dump's wrist swept into from 16 cm.
+
+Validated with the 7-step sim chain above on seeds 1, 2, 3, 42, 777 and 2024:
+7/7 steps on every seed, no contact other than the grasps and the stirrer in
+its bore, and nothing moved except the spoon nudged 13.6 mm on release
+(seed 1). The dump tipped to 65-79°, depending on how far out the paper cup
+landed.
+
+### Sim gripper: jaws clipping through held parts (2026-09-27)
+
+This showed on screen as the jaws passing into the stirrer's cube, and it
+affected every magnet grasp. It was two bugs in `SimFrankaArm`, both
+sim-only:
+
+- **The force-limited hold command was off by a factor of 2.** The actuator
+  drives the `split` tendon, whose length is half the jaw width (0.5 per
+  finger). The hold was `(kb*w - limit)/kg` where it should be
+  `(kb*w/2 - limit)/kg`, which made it `2w - limit/kg`.
+- **Once a part is attached it no longer collides with the hand**
+  (`_exclude_from_hand`), so nothing stopped that command:
+
+  | Part | Width | Jaws ended at |
+  | --- | --- | --- |
+  | stirrer cube | 30 mm | 42.4 mm with `grasp_force` 1.0 (open, not touching); 31.5 mm with 1.5 |
+  | spoon handle | 8 mm | **0.0 mm, straight through it** |
+
+  `_try_grasp` also snapped the fingers to `grasp_width`, which put the pads
+  about 1 mm into the cube, because the pad faces sit inside the joint gap.
+
+Both are fixed. The hold formula is corrected. At attach, the jaws stay where
+the part stopped them, and `ctrl` is set to hold them there. Measured after
+the fix: the stirrer at 30.0 mm and the spoon at 7.8 mm, both steady after
+1 s. The smoke test passes 9/9 and the 7-step sim chain above runs clean.
 
 ## Skills inventory (registered)
 

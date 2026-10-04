@@ -479,9 +479,21 @@ class ScoopSkill(BaseSkill):
         # about the floor is not to touch it. base_z cannot stand in for it:
         # under a powder bed the cameras never see the inside floor, so the
         # lowest points of the container's cloud are its outer bottom.
+        table_z = self.config.get("table_z")
         if params.get("container_floor_z") is not None:
             floor_z = float(params["container_floor_z"])
             floor_source = "container_floor_z"
+        elif table_z is not None and -0.005 <= base_z - float(table_z) <= 0.012:
+            # The container stands on the table, and the cell knows where the
+            # table is. base_z itself reads 3-6 mm high: it is the 3rd
+            # percentile of the cloud, and the bottom edge is seen only at a
+            # grazing angle, so that percentile lands on the wall (sim,
+            # 2026-10-02: 3.0 mm for a dish on z=0). 3 mm too high a floor is
+            # what left the big scoop empty in every planner-driven run.
+            floor_z = float(table_z) + float(params["floor_thickness"])
+            floor_source = (f"table z {float(table_z):.4f} (cell config; base_z read "
+                            f"{base_z:.4f}) + floor_thickness "
+                            f"{float(params['floor_thickness']) * 1000:.1f}mm")
         else:
             floor_z = base_z + float(params["floor_thickness"])
             floor_source = (f"base_z {base_z:.4f} + floor_thickness "

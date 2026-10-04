@@ -112,6 +112,12 @@ Rules:
     Steps that already succeeded have already happened -- do not blindly repeat
     them unless repeating is genuinely part of the correction. Adding a further
     measure of reagent is a legitimate correction.
+  * Your plan REPLACES everything that has not run yet: when it finishes, the
+    run ends. So after the fix, carry on to the goal -- include every sub-task
+    of the executed plan that comes after the failed one, adjusted as needed.
+    A plan that only repairs the failed step and stops leaves the goal undone
+    (2026-10-02: a re-placed beaker ended the Magic Beaker before the final
+    pours).
   * Account for what the gripper is holding right now. It is stated below. If a
     tool is still held and the correction needs a different one, plan the
     'place' yourself.

@@ -234,8 +234,31 @@ def comprehend_scene(
         )
     order = getattr(vision, "frame_color_order", "bgr")
     inventory = list(getattr(vision, "known_object_names", list)() or [])
+    notes = dict(getattr(vision, "inventory_notes", dict)() or {})
 
-    if inventory:
+    if inventory and notes:
+        # One line per physical object, with its label and other names. The
+        # flat list names a labelled cup twice ("clear cup a", "a 10 ml
+        # water"), and the agent then reported the cup empty and dropped
+        # objects altogether (2026-10-02).
+        name_rule = (
+            "the object's name, chosen VERBATIM from the quoted names below (the "
+            "first one on its line). These are the only names the robot's "
+            "perception can find."
+        )
+        vocabulary_block = (
+            "What is on this bench -- every one of these objects is there, so "
+            "report each exactly once, under the first name on its line:\n"
+            + "\n".join(f'  - "{n}"' + (f" -- {notes[n]}" if notes.get(n) else "")
+                        for n in notes)
+            + "\nA handwritten label tells you what its container holds: report "
+              "the reagent or the amount of water it names as that container's "
+              "contents (\"10 ml water\", \"citric acid powder\"), exactly as for a "
+              "label you can read, unless you can clearly see it is empty. Little "
+              "water in a clear cup is hard to see; trust the label. A tool's other "
+              "names are what instructions may call it."
+        )
+    elif inventory:
         name_rule = (
             "the object's name, chosen VERBATIM from the resolvable-names list "
             "below. These are the only names the robot's perception can find. If a "
@@ -246,6 +269,15 @@ def comprehend_scene(
             "Resolvable names (this bench holds these and only these; pick the one "
             "that matches what you see):\n"
             + "\n".join(f"  - {n}" for n in inventory)
+            # The names are read off the bench's handwritten labels, so a name
+            # that names a reagent IS that label. A white powder in a white
+            # dish can read as an empty dish from the cage, and on 2026-10-02
+            # the planner refused a scoop twice over "the citric acid cup is
+            # empty" while the dish held 18 mm of powder.
+            + "\nA name that names a reagent (\"citric acid cup\") comes from the "
+              "handwritten label under that container: report that reagent as its "
+              "contents, exactly as for a label you can read, unless you can clearly "
+              "see its bare floor."
         )
     else:
         name_rule = (
@@ -265,7 +297,13 @@ def comprehend_scene(
             f"agents must achieve here is: <{goal}>"
         )
     ]
-    for frame in frames[:max_views]:
+    # The cage's frames come in camera order, 2-3-4-5 around the bench, so the
+    # first two are both from the near side. Opposite corners see round what
+    # the other one cannot.
+    views = list(frames)
+    if max_views == 2 and len(views) >= 4:
+        views = [views[0], views[2]]
+    for frame in views[:max_views]:
         content.append(llm_client.image_block_from_array(frame, color_order=order))
 
     response = llm_client.structured_completion(
@@ -299,6 +337,28 @@ def comprehend_scene(
                 resolvable=(not known) or name.lower() in known,
             )
         )
+    if notes:
+        # The bench inventory is the list of what IS there. An object the agent
+        # left out is still there: with a random layout (seed 4242) the agent
+        # described 6 of 13, the planner took the missing citric acid dish and
+        # beaker to be absent, and refused the whole task (sim, 2026-10-02).
+        seen = {o.name.lower() for o in objects}
+        for name, note in notes.items():
+            if name.lower() in seen:
+                continue
+            low = name.lower()
+            category = ("tool" if any(w in low for w in ("spoon", "stirrer", "scoop"))
+                        and "holder" not in low else "container")
+            label = None
+            if 'reading "' in note:
+                label = note.split('reading "', 1)[1].split('"', 1)[0]
+            objects.append(SceneObject(
+                name=name, category=category, has_handle=False,
+                contents=(f"{label} (from its label; listed from the bench "
+                          f"inventory, not described by the scene agent)" if label else
+                          "not described by the scene agent (listed from the bench "
+                          "inventory)"),
+                relevant_to_goal=True, resolvable=True))
     objects.sort(key=lambda o: o.name.lower())
     return Scene(
         objects=objects,

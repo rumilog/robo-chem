@@ -88,6 +88,22 @@ def load_camera_extrinsics(
     return out
 
 
+def cameras_seeing(extrinsics: Dict[int, np.ndarray], point, fovy: float = DEFAULT_FOVY,
+                   width: int = 848, height: int = 480, margin: int = 40) -> int:
+    """How many cage cameras have ``point`` (world xyz) in frame, ``margin`` px in."""
+    fy = (height / 2) / math.tan(math.radians(fovy) / 2)
+    p = np.append(np.asarray(point, float), 1.0)
+    n = 0
+    for T in extrinsics.values():
+        c = np.linalg.inv(T) @ p
+        if c[2] <= 0:
+            continue
+        u = fy * c[0] / c[2] + width / 2
+        v = fy * c[1] / c[2] + height / 2
+        n += (margin <= u <= width - margin and margin <= v <= height - margin)
+    return n
+
+
 def synthetic_cage(camera_ids=DEFAULT_CAMERA_IDS, centre=(0.5, 0.0, 0.05),
                    radius=0.45, height=0.45) -> Dict[int, np.ndarray]:
     """Four cameras on a ring looking at ``centre``, for when no calibration exists."""
@@ -147,13 +163,18 @@ def _add_container(spec, prop: Prop, table_z: float):
     half_h = prop.height / 2
     inner = prop.inner_radius
     # The base: the container's full outside footprint, floor_height thick, so
-    # the inside floor sits exactly floor_height above the table.
+    # the inside floor sits exactly floor_height above the table. Stiff, like
+    # the printed parts: with the default soft contact a stirrer feeling for
+    # the floor of a clear cup sank 2 mm into its 3 mm base before the force
+    # reached 1 N, the contact normal flipped, and the rod went through onto
+    # the table (2026-10-02).
     body.add_geom(
         type=mujoco.mjtGeom.mjGEOM_CYLINDER,
         size=[prop.outer_radius, prop.floor_height / 2, 0],
         pos=[0, 0, -half_h + prop.floor_height / 2],
         rgba=list(prop.rgba),
         density=500,
+        solref=[0.005, 1.0], solimp=[0.95, 0.99, 0.0005, 0.5, 2.0],
     )
     # A ring of boxes stands in for a cylindrical shell, which MuJoCo has no
     # primitive for. 16 panels is enough that granules do not squeeze out.
@@ -326,6 +347,8 @@ def _add_mesh_stirrer(spec, prop: Prop, table_z: float, bench=None):
         condim=4, friction=[1.2, 0.01, 0.001], group=3,
         solref=[0.005, 1.0], solimp=[0.95, 0.99, 0.0005, 0.5, 2.0],
     )
+    # Stiff like the cube: with the default soft contact the rod's tip sank
+    # through a cup's 3 mm base before the descent felt 1 N.
     body.add_geom(
         type=mujoco.mjtGeom.mjGEOM_CYLINDER,
         name=prop.body + "_rod",
@@ -334,6 +357,7 @@ def _add_mesh_stirrer(spec, prop: Prop, table_z: float, bench=None):
         rgba=list(prop.rgba),
         density=1250,
         condim=4, friction=[1.2, 0.01, 0.001], group=3,
+        solref=[0.005, 1.0], solimp=[0.95, 0.99, 0.0005, 0.5, 2.0],
     )
     return body
 
@@ -472,6 +496,29 @@ def _add_heap(cup_body, prop: Prop):
     return heap
 
 
+def _add_liquid(cup_body, prop: Prop):
+    """
+    Where a container's liquid is drawn: a disc of water on the inside floor
+    and a layer of foam that rides on it, both invisible until
+    robochem.sim.lab gives them a volume. Child bodies, like the bed, so the
+    cup's segmentation -- what perception locates it by -- is the cup alone.
+    Drawn only: the physics is that of an empty cup.
+    """
+    floor = -prop.height / 2 + prop.floor_height
+    for part, rgba in (("liquid", [0.80, 0.90, 0.98, 0.0]),
+                       ("foam", [0.92, 0.88, 0.95, 0.0])):
+        body = cup_body.add_body(name=f"{prop.body}_{part}", pos=[0, 0, floor])
+        body.add_geom(
+            type=mujoco.mjtGeom.mjGEOM_CYLINDER,
+            name=f"{prop.body}_{part}",
+            size=[max(prop.inner_radius - 0.0005, 0.001), 1e-4, 0],
+            pos=[0, 0, 1e-4],
+            rgba=rgba,
+            contype=0, conaffinity=0, density=0,
+            group=2,
+        )
+
+
 def _add_label(spec, prop: Prop, table_z: float):
     """The handwritten paper a reagent cup stands on."""
     body = spec.worldbody.add_body(
@@ -479,7 +526,7 @@ def _add_label(spec, prop: Prop, table_z: float):
     )
     body.add_geom(
         type=mujoco.mjtGeom.mjGEOM_BOX,
-        size=[0.055, 0.04, 0.0005],
+        size=[prop.label_half[0], prop.label_half[1], 0.0005],
         rgba=[0.96, 0.93, 0.82, 1.0],
         contype=0, conaffinity=0,
     )
@@ -682,6 +729,7 @@ def build_scene(
             if not granules and prop.powder_level > 0:
                 _add_powder_bed(spec, cup, prop)
             _add_heap(cup, prop)
+            _add_liquid(cup, prop)
         if granules and prop.fill:
             grain_names[prop.name] = _add_grains(spec, prop, bench.table_z)
 

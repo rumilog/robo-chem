@@ -67,6 +67,12 @@ class StirSkill(BaseSkill):
             "forward_offset": 0.0,
             "lateral_offset": 0.0,
             "stir_depth": 0.03,        # Immersion below the rim (metres)
+            # Feel all the way down to the container's floor instead, and stir
+            # contact_backoff above it. For a shallow liquid -- 10 ml in a
+            # 52 mm cup stands ~3-5 mm deep, which a rim-relative stir_depth
+            # never reaches. Needs the force-guarded descent; refused without
+            # a force reading, since then nothing would stop it at the floor.
+            "to_floor": False,
             # A circle cannot be one min-jerk move (those interpolate straight
             # lines), so unlike scoop's push this genuinely needs subdividing.
             # More, shorter waypoints read as smoother.
@@ -160,6 +166,15 @@ class StirSkill(BaseSkill):
             # After contact, rise this much before stirring, so the circle is
             # not dragged along whatever the rod touched.
             "contact_backoff": 0.003,
+            # The TCP must stay this far above the rim. The rod is shorter
+            # than a beaker is tall, and reaching for its floor drove the
+            # fingers into the beaker's wall in sim (2026-10-02). Below the
+            # TCP hang the finger pads (8.9 mm in the sim's Franka Hand) and
+            # the stirrer's 30 mm head, which pick_up took 6.8 mm low, so its
+            # bottom is ~22 mm under the TCP: at 20 mm its corners caught the
+            # rim on every circle. 30 mm clears both. A depth that would take
+            # the TCP lower is shortened to this, and said so.
+            "hand_clearance": 0.030,
             "hover_tol": 0.05,
             "descend_tol": 0.03,
             # Circle waypoints are allowed to run loose: the stirrer is in
@@ -193,6 +208,7 @@ class StirSkill(BaseSkill):
         dwell = float(params["seconds_per_waypoint"])
         wall_clearance = float(params["wall_clearance"])
         in_air = bool(params["in_air"])
+        hand_limited = False           # depth shortened to keep the hand above the rim
         verticalize = bool(params["verticalize"])
         tool_axis = str(params["tool_axis"]).lower()
         if tool_axis not in ("x", "z"):
@@ -343,6 +359,25 @@ class StirSkill(BaseSkill):
             print(f"[Stir] '{target}' rim centre {np.round(center, 4)}, "
                   f"z={rim_z:.4f}, radius {rim_radius * 1000:.0f}mm")
 
+            if bool(params.get("to_floor")):
+                if params.get("stop_force_n") is None or self.ee_wrench() is None:
+                    return False, {"error": ("to_floor needs the force-guarded descent "
+                                             "(stop_force_n and a force reading): "
+                                             "nothing else would stop the rod at the "
+                                             "floor")}
+                # Aim 5 mm past the bottom of what the cameras saw, so the
+                # guard, not the arithmetic, decides where the floor is.
+                stir_depth = float(rim_z - located["base_z"]) + 0.005
+                # 1 mm at a time: a thin cup floor is less than one 2 mm step.
+                params["probe_step"] = min(float(params["probe_step"]), 0.001)
+                # The contact reads only once the rod has pressed in a little,
+                # so 3 mm back left the tip 0.2 mm over the floor, scraping it
+                # through every circle (sim, 2026-10-02). 4 mm clears it and
+                # still leaves the tip in a 3 mm-deep 10 ml.
+                params["contact_backoff"] = max(float(params["contact_backoff"]), 0.004)
+                print(f"[Stir] to_floor: feeling down up to {stir_depth * 1000:.0f}mm "
+                      f"below the rim, to the floor")
+
             # Correct a measured centre the bench shows to be off, the same
             # convention as pour / scoop / dump: +X away from the base, +Y the
             # world's +Y (the robot's LEFT, looking out from the base). The
@@ -379,6 +414,18 @@ class StirSkill(BaseSkill):
                               f"below the workspace floor "
                               f"{self.workspace_min[2]:.3f}"),
                 }
+            # The TCP is the fingertips' plane, so it is the hand's lowest
+            # point: keep it above the rim.
+            deepest = tool_length - float(params["hand_clearance"])
+            if stir_depth > deepest:
+                print(f"[Stir] {stir_depth * 1000:.0f}mm below the rim would take the "
+                      f"hand into '{target}'; the rod reaches {deepest * 1000:.0f}mm "
+                      f"below the rim with the hand "
+                      f"{float(params['hand_clearance']) * 1000:.0f}mm above it -- "
+                      f"stirring there")
+                stir_depth = max(deepest, 0.0)
+                hand_limited = True
+                stir_z = rim_z - stir_depth + tool_length
 
         force_info = {"force_guarded": False, "stopped_by_force": False}
 
@@ -574,6 +621,11 @@ class StirSkill(BaseSkill):
             "requested_radius": requested_radius,
             "rim_radius": rim_radius,
             "stir_depth": stir_depth,
+            "to_floor": bool(params.get("to_floor")),
+            # Shortened AND it showed: the rod stopped on nothing, short of
+            # where it was asked to go. A shortened descent that still met
+            # the floor stirred where it was meant to.
+            "hand_limited": hand_limited and not force_info.get("stopped_by_force", False),
             "smooth": streamed,
             "seconds_per_revolution": rev_seconds if streamed else None,
             "stir_z": float(stir_z),

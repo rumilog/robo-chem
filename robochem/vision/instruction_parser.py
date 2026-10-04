@@ -13,6 +13,17 @@ import cv2
 import numpy as np
 
 
+def _model() -> str:
+    """
+    The model to read instructions with, from the agents' config like every
+    other call in the pipeline. It was pinned to "gpt-4o", whose API shuts
+    down 2026-10-23. Imported here because robochem.agents imports
+    robochem.vision.
+    """
+    from robochem.agents import config as agent_config
+    return agent_config.strong_model()
+
+
 class InstructionParser:
     """
     Parses chemistry instructions from images.
@@ -116,11 +127,14 @@ Return as JSON with these exact keys:
 goal, steps, reagents, equipment, safety_notes, expected_outcome, quantities
 
 If any information is not present in the image, use null for that field.
-For steps, try to infer a logical order even if not explicitly numbered."""
+For steps, try to infer a logical order even if not explicitly numbered.
+Keep each step's own wording for WHICH container and HOW MUCH: if a step
+says "the empty clear cup", do not write "the beaker". Read small print
+carefully rather than guessing it from the pictures."""
 
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4o",
+                model=_model(),
                 messages=[
                     {
                         "role": "system", 
@@ -140,7 +154,9 @@ For steps, try to infer a logical order even if not explicitly numbered."""
                         ]
                     }
                 ],
-                response_format={"type": "json_object"}
+                response_format={"type": "json_object"},
+                # Reading, not writing: the same sheet should give the same steps.
+                temperature=0,
             )
             
             result = json.loads(response.choices[0].message.content)
@@ -232,12 +248,14 @@ Return as JSON with keys: goal, steps, reagents, equipment, expected_outcome"""
 
         try:
             response = self.client.chat.completions.create(
-                model="gpt-4o",
+                model=_model(),
                 messages=[
                     {"role": "system", "content": "Parse chemistry tasks into structured format."},
                     {"role": "user", "content": prompt}
                 ],
-                response_format={"type": "json_object"}
+                response_format={"type": "json_object"},
+                # Reading, not writing: the same sheet should give the same steps.
+                temperature=0,
             )
             
             result = json.loads(response.choices[0].message.content)

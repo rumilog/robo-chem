@@ -12,7 +12,7 @@ objective number available for a scoop.
     sim_env/bin/python scripts/film_sim_skill.py --skill arc_scoop \
         --params "{'exit_angle_deg': 70, 'cup_tilt_deg': 25}"
     sim_env/bin/python scripts/film_sim_skill.py --skill scoop --then dump \
-        --target "white paper cup"
+        --target "clear cup c"
 
 Frames are captured off the physics loop, so the filmstrip is the motion as it
 actually ran, not a re-enactment of the commanded poses.
@@ -558,7 +558,7 @@ def main() -> int:
                              "same tool and its load, e.g. --skill scoop --then dump")
     parser.add_argument("--then-params", default=None,
                         help="Params for the --then skill, same format as --params")
-    parser.add_argument("--target", default="white paper cup",
+    parser.add_argument("--target", default="clear cup c",
                         help="Container --then dump empties the scoop into")
     args = parser.parse_args()
 
@@ -577,9 +577,11 @@ def main() -> int:
         bench.props = [replace(p, powder_level=args.powder_level)
                        if is_source(p) else p for p in bench.props]
 
+    # lab=False: this script keeps its own ScoopTally on the scoop, and two
+    # tallies on one bowl would both draw its load.
     cell = build_cell(bench=bench, viewer=args.viewer, realtime=args.viewer,
                       speed=args.speed, granules=args.granules, verbose=False,
-                      workspace_min=[0.25, -0.40, -0.13])
+                      workspace_min=[0.25, -0.40, -0.13], lab=False)
     film = None if args.no_film else Film(cell, args.view, every=args.every)
     try:
         measured_offset = None

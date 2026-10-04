@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 import mimetypes
 from pathlib import Path
 from typing import Any, List
@@ -133,6 +134,37 @@ def get_client(agent: str):
     return OpenAI(**kwargs)
 
 
+#: Errors that say nothing about the request, only about getting it there.
+_TRANSIENT = ("APIConnectionError", "APITimeoutError", "RateLimitError",
+              "InternalServerError", "ServiceUnavailableError")
+#: Seconds to wait before each retry of a transient failure.
+_BACKOFF = (3, 10, 30, 60)
+
+
+def _create(agent: str, client, request: dict):
+    """
+    One chat completion, retried through transient transport failures.
+
+    A DNS hiccup on 2026-10-02 killed two sim runs outright: the openai
+    client's own two quick retries were spent within a second, and the
+    APIConnectionError escaped every stage's handler. Now it waits it out
+    for about two minutes, then reports a blocked stage rather than a crash.
+    """
+    for attempt, wait in enumerate((0,) + _BACKOFF):
+        if wait:
+            print(f"[llm] {agent}: model unreachable, retrying in {wait}s "
+                  f"({attempt}/{len(_BACKOFF)})")
+            time.sleep(wait)
+        try:
+            return client.chat.completions.create(**request)
+        except Exception as exc:
+            if type(exc).__name__ not in _TRANSIENT:
+                raise
+            last = exc
+    raise LLMResponseError(f"{agent}: could not reach the model after "
+                           f"{len(_BACKOFF)} retries: {last}") from last
+
+
 def structured_completion(
     *,
     agent: str,
@@ -173,13 +205,15 @@ def structured_completion(
         request["temperature"] = temperature
 
     try:
-        completion = client.chat.completions.create(**request)
+        completion = _create(agent, client, request)
+    except LLMResponseError:
+        raise
     except Exception as exc:
         if _mentions(exc, "temperature"):
             # Reasoning models reject a temperature override. Drop it and retry
             # rather than making the whole tier unusable.
             request.pop("temperature", None)
-            completion = client.chat.completions.create(**request)
+            completion = _create(agent, client, request)
         elif _looks_like_schema_unsupported(exc):
             request["response_format"] = {"type": "json_object"}
             request["messages"] = [
@@ -194,11 +228,23 @@ def structured_completion(
                 },
                 messages[1],
             ]
-            completion = client.chat.completions.create(**request)
+            completion = _create(agent, client, request)
         else:
             raise
 
     raw = completion.choices[0].message.content
+    for warmth in (0.3, 0.6):
+        if raw and _parses(raw):
+            break
+        # Ask again before giving up. Strict schema output still comes back
+        # broken now and then -- twice in one sim run on 2026-10-02 the skill
+        # call for stir did, and on 2026-10-03 a pour call came back cut off
+        # twice running and blocked the task. At temperature 0 the same prompt
+        # tends to repeat the same output, so the retries run warmer.
+        if "temperature" in request:
+            request["temperature"] = warmth
+        completion = _create(agent, client, request)
+        raw = completion.choices[0].message.content
     if not raw:
         raise LLMResponseError(f"{agent}: model returned an empty response")
     try:
@@ -212,6 +258,14 @@ def structured_completion(
             f"{agent}: expected a JSON object, got {type(parsed).__name__}"
         )
     return parsed
+
+
+def _parses(raw: str) -> bool:
+    try:
+        json.loads(raw)
+        return True
+    except (json.JSONDecodeError, TypeError):
+        return False
 
 
 def _mentions(exc: Exception, word: str) -> bool:
