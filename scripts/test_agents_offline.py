@@ -394,6 +394,46 @@ def test_scene_agent_without_an_inventory():
           "perception can resolve" not in scene.as_prompt_block())
 
 
+def test_scene_agent_on_the_real_bench():
+    """
+    The real cell with a bench manifest gets the sim's inventory prompt.
+
+    Replays the first real dry run (2026-10-07): the agent described the three
+    dishes and three "clear cup"s, and nothing else.
+    """
+    print("\n[scene: real bench manifest]")
+    from robochem.agents import scene as scene_agent
+    from robochem.vision.bench_manifest import MAGIC_BEAKER
+
+    class RealBench(FakeVision):
+        frame_color_order = "bgr"
+
+        def known_object_names(self):
+            return MAGIC_BEAKER.known_object_names()
+
+        def inventory_notes(self):
+            return MAGIC_BEAKER.inventory_notes()
+
+    llm = FakeLLM({"scene_description": scene_response(
+        obj("citric acid cup"), obj("baking soda cup"), obj("red cabbage powder cup"),
+        obj("clear cup a"), obj("clear cup b"), obj("clear cup c"),
+    )})
+    scene = scene_agent.comprehend_scene(RealBench(), "make a magic beaker", client=llm)
+    system = llm.calls[0]["system"]
+    check("the prompt carries the inventory, not the kit vocabulary",
+          "What is on this bench" in system and "Kit vocabulary" not in system)
+    check("the prompt says the scoop stands in for the small one",
+          "ONLY scoop" in system)
+    names = sorted(o.name for o in scene.objects)
+    check("objects the agent left out are listed from the bench",
+          names == sorted(o.name for o in MAGIC_BEAKER.objects), f"{names}")
+    beaker = next(o for o in scene.objects if o.name == "plastic beaker")
+    check("a listed container carries its label as contents",
+          "50 ml water" in beaker.contents, beaker.contents)
+    check("nothing on the bench is unresolvable", not scene.unresolvable,
+          f"{scene.unresolvable}")
+
+
 def test_skill_agent_is_told_the_real_gripper_state():
     print("\n[skill call: closed loop, not assumed]")
     from robochem.agents import skill_planner
@@ -494,6 +534,22 @@ def test_a_malformed_value_is_dropped_not_passed_on():
         dropped = False
     check("an optional integer that is not one is dropped, not fatal", dropped)
 
+    # The real dry run of 2026-10-07: a note where a measurement belongs.
+    params = coerce_params("dump", [
+        {"name": "target_container", "value": '"clear cup b"'},
+        {"name": "tool_offset", "value": '"[measured offset from pick_up of larger spoon]"'}])
+    check("a tool_offset that is prose is dropped", "tool_offset" not in params, f"{params}")
+    params = coerce_params("dump", [
+        {"name": "target_container", "value": '"clear cup b"'},
+        {"name": "tool_offset", "value": "[0.029, 0.009, 0.024]"}])
+    check("a tool_offset of three numbers is kept as floats",
+          params.get("tool_offset") == [0.029, 0.009, 0.024], f"{params}")
+    params = coerce_params("dump", [
+        {"name": "target_container", "value": '"clear cup b"'},
+        {"name": "tool_offset", "value": "[0.029, 0.009]"}])
+    check("a tool_offset that is not [x, y, z] is dropped", "tool_offset" not in params,
+          f"{params}")
+
 
 def test_a_pour_that_is_not_the_last_keeps_some():
     """A container that pours again before it is put down is not emptied."""
@@ -519,8 +575,8 @@ def test_a_pour_that_is_not_the_last_keeps_some():
     outcome = orchestrator.run("make the magic beaker")
     pours = [p for n, p in skills.calls if n == "pour"]
     check("the run succeeds", outcome.success, outcome.reason)
-    check("the first pour from the beaker is capped so some stays",
-          pours[0]["pour_angle"] == 80.0, f"{pours}")
+    check("the first pour from the beaker is capped at 60 so some stays",
+          pours[0]["pour_angle"] == 60.0, f"{pours}")
     check("the beaker's last pour still empties it", pours[1]["pour_angle"] == 90,
           f"{pours}")
     check("cup a, poured once, is emptied", pours[2]["pour_angle"] == 90, f"{pours}")
@@ -539,6 +595,88 @@ def test_dry_run_moves_nothing():
     check("the model still planned every sub-task",
           len(llm.calls_for("skill_call")) == len(SCOOP_SUBTASKS))
     check("the record says nothing was executed", outcome.record["dry_run"] is True)
+
+
+def test_step_mode_stops_where_the_operator_says():
+    """--step: nothing runs without a yes, and a no stops without a replan."""
+    print("\n[loop: one step at a time]")
+    asked = []
+
+    def confirm(subtask, call):
+        asked.append(call.skill)
+        return len(asked) < 2          # run the first sub-task, stop at the second
+
+    orchestrator, llm, skills = build(scoop_responses(), confirm=confirm, max_replans=2)
+    outcome = orchestrator.run("scoop citric acid into the white paper cup")
+    check("the operator was asked before each skill ran", asked[:2] == [c[0] for c in
+          skills.calls] + [asked[1]], f"asked {asked}, ran {[c[0] for c in skills.calls]}")
+    check("only the confirmed sub-task ran", len(skills.calls) == 1, f"{skills.calls}")
+    check("a stop is not a failure to replan around",
+          not outcome.success and len(llm.calls_for("corrective_plan")) == 0,
+          f"{outcome.outcome}: {outcome.reason}")
+    check("the record says the operator stopped it", "operator" in outcome.reason,
+          outcome.reason)
+
+
+def test_a_run_resumes_from_its_record():
+    """--resume: same goal and plan, earlier steps not redone, their state restored."""
+    print("\n[loop: resume from a record]")
+    first_skills = RecordingSkills(fail={"dump"})
+    orch1, _, _ = build(scoop_responses(), skills=first_skills, max_replans=0)
+    first = orch1.run("scoop citric acid into the white paper cup")
+    record = json.loads(json.dumps(first.record, default=str))
+    check("the first run stopped at the dump", not first.success
+          and [st["skill"] for st in record["steps"]] == ["pick_up", "scoop", "dump"],
+          f"{[st['skill'] for st in record['steps']]}")
+
+    class Bookkeeping(RecordingSkills):
+        def __init__(self):
+            super().__init__()
+            self.replayed = []
+
+        def _remember_pick_site(self, skill, params, result):
+            self.replayed.append(("site", skill))
+
+        def _track_held(self, skill, params, result):
+            self.replayed.append(("held", skill))
+
+    skills = Bookkeeping()
+    # Skill calls for sub-tasks 3 and 4, in that order.
+    responses = scoop_responses(
+        skill_call=lambda i, r: call_response(*SCOOP_CALLS[(i + 2) % len(SCOOP_CALLS)]))
+    orch2, llm2, _ = build(responses, skills=skills, max_replans=0)
+    out = orch2.run(resume=record)
+    check("no new plan was made", len(llm2.calls_for("subtask_plan")) == 0)
+    check("it starts at the failed step and runs the rest",
+          [c[0] for c in skills.calls] == ["dump", "place"], f"{skills.calls}")
+    check("the earlier picks and scoop were replayed, not executed",
+          ("site", "pick_up") in skills.replayed and ("held", "scoop") in skills.replayed,
+          f"{skills.replayed}")
+    check("the record says where it resumed",
+          out.record.get("resumed_from", {}).get("from_step") == 3, f"{out.record.get('resumed_from')}")
+    check("and it finished", out.success, out.reason)
+
+    skills3 = Bookkeeping()
+    orch3, _, _ = build(scoop_responses(
+        skill_call=lambda i, r: call_response(*SCOOP_CALLS[(i + 3) % len(SCOOP_CALLS)])),
+        skills=skills3, max_replans=0)
+    orch3.run(resume=record, from_step=4)
+    check("--from-step picks the starting sub-task", [c[0] for c in skills3.calls] == ["place"],
+          f"{skills3.calls}")
+
+    # A resume of a resume still knows the steps of the first run.
+    second = json.loads(json.dumps(out.record, default=str))
+    check("a resumed run's record carries the steps before it",
+          [st["skill"] for st in second.get("resumed_steps", [])] == ["pick_up", "scoop"],
+          f"{[st['skill'] for st in second.get('resumed_steps', [])]}")
+    skills4 = Bookkeeping()
+    orch4, _, _ = build(scoop_responses(
+        skill_call=lambda i, r: call_response(*SCOOP_CALLS[(i + 3) % len(SCOOP_CALLS)])),
+        skills=skills4, max_replans=0)
+    orch4.run(resume=second, from_step=4)
+    check("and resuming it replays all three earlier steps",
+          [k for k in skills4.replayed if k[0] == "held"] ==
+          [("held", "pick_up"), ("held", "scoop"), ("held", "dump")], f"{skills4.replayed}")
 
 
 def test_a_failed_skill_replans_rather_than_retrying():
@@ -674,12 +812,15 @@ def main():
     test_parameters_are_checked()
     test_scene_agent_grounds_to_the_inventory()
     test_scene_agent_without_an_inventory()
+    test_scene_agent_on_the_real_bench()
     test_skill_agent_is_told_the_real_gripper_state()
     test_infeasible_is_reported_not_approximated()
     test_happy_path()
     test_a_pour_that_is_not_the_last_keeps_some()
     test_a_malformed_value_is_dropped_not_passed_on()
     test_dry_run_moves_nothing()
+    test_step_mode_stops_where_the_operator_says()
+    test_a_run_resumes_from_its_record()
     test_a_failed_skill_replans_rather_than_retrying()
     test_an_infeasible_plan_stops_without_moving()
     test_a_missing_key_is_blocked_not_failed()

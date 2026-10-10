@@ -43,7 +43,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from robochem.skills import SkillsExecutor
+from robochem.skills.pacing import paced
 from robochem.vision import VisionSystem
+from robochem.vision.bench_manifest import BENCHES
 from robochem.verification.chemistry_verifier import ChemistryVerifier
 from robochem.utils.logging_utils import ExperimentLogger
 from robochem.agents import config as agent_config
@@ -51,6 +53,9 @@ from robochem.orchestrator.agent_orchestrator import AgentOrchestrator
 from robochem.orchestrator.vlm_orchestrator import VLMOrchestrator
 
 DEFAULT_CAMERAS = [2, 3, 4, 5]
+
+#: Table height in the arm's base frame, metres. The sim's is 0.0 too.
+REAL_TABLE_Z = 0.0
 
 
 def parse_params(raw: str) -> dict:
@@ -85,6 +90,15 @@ def parse_params(raw: str) -> dict:
     if not isinstance(params, dict):
         raise SystemExit(f"--params must be a mapping, got {type(params).__name__}")
     return params
+
+
+def confirm_step(subtask, call) -> bool:
+    """``--step``: run this skill only on Enter. q, n or end of input stop."""
+    try:
+        answer = input(f"   [step {subtask.index}] Enter to run it, q to stop here: ")
+    except EOFError:
+        return False
+    return answer.strip().lower() not in ("q", "quit", "n", "no", "stop")
 
 
 def build_sim_stack(args):
@@ -123,6 +137,9 @@ def build_sim_stack(args):
     )
     if args.reset:
         cell.reset()
+    # The same pace as the robot (robochem.skills.pacing). Skills are built on
+    # first use, so none holds the bare arm yet.
+    cell.skills.robot = paced(cell.skills.robot)
     return {}, cell.vision, cell.skills, cell.arm
 
 
@@ -142,8 +159,12 @@ def build_stack(args):
         grounding_url=args.grounding_url,
         consensus_tolerance=args.consensus_tolerance,
         max_object_extent=args.max_object_extent,
+        bench=BENCHES.get(args.bench),
     )
     vision.object_localizer.camera_ids = list(args.cameras)
+    if vision.bench is not None:
+        print(f"Bench '{vision.bench.name}': "
+              + ", ".join(o.name for o in vision.bench.objects))
 
     robot = None
     if not args.dry_run:
@@ -157,9 +178,15 @@ def build_stack(args):
     print(f"Workspace Z floor: {args.workspace_min[2]:.3f} m "
           f"(min={args.workspace_min}, max={args.workspace_max})")
     skills = SkillsExecutor(
-        robot_interface=robot,
+        robot_interface=paced(robot),
         vision_system=vision,
-        config={"workspace_min": args.workspace_min, "workspace_max": args.workspace_max},
+        config={"workspace_min": args.workspace_min, "workspace_max": args.workspace_max,
+                # Where the table is, as the sim's cell config says it
+                # (robochem.sim.build_cell), so scoop's floor and a held cup's
+                # bottom come from the same code path on both. The arm stands
+                # on the bench: the dishes' base_z read -0.1 to -1.5 mm
+                # (2026-10-07/08). Without it scoop fell back to base_z.
+                "table_z": REAL_TABLE_Z},
     )
 
     return cameras, vision, skills, robot
@@ -206,6 +233,30 @@ def main() -> int:
         action="store_true",
         help="Plan and perceive but never command the arm",
     )
+    parser.add_argument(
+        "--resume", metavar="RECORD",
+        help="Continue an earlier --task / --instruction-image run from its record "
+             "(experiments/agent_run_*.json): same goal and plan, the steps before "
+             "--from-step not run again, what they held and where they picked "
+             "things restored. The bench must be as that run left it",
+    )
+    parser.add_argument(
+        "--from-step", type=int, default=None,
+        help="With --resume: the sub-task to start at (default: the one that failed)",
+    )
+    parser.add_argument(
+        "--step", action="store_true",
+        help="For --task / --instruction-image: before every skill runs, print it "
+             "and wait for Enter; q stops the run there (no replan)",
+    )
+    parser.add_argument(
+        "--bench", choices=sorted(BENCHES) + ["none"], default="magic_beaker",
+        help="What is on the real bench (robochem/vision/bench_manifest.py): "
+             "its object names and how each is found. The scene agent gets "
+             "it as its inventory, as in sim. 'none' is open-vocabulary "
+             "grounding with no inventory. Ignored with --sim, whose bench "
+             "is built in",
+    )
     parser.add_argument("--consensus-tolerance", type=float, default=0.05)
     parser.add_argument("--max-object-extent", type=float, default=0.35)
     parser.add_argument("--workspace-min", nargs=3, type=float, default=[0.25, -0.40, 0.015])
@@ -242,8 +293,8 @@ def main() -> int:
                           "(default: until you close the window)")
     args = parser.parse_args()
 
-    if not (args.task or args.instruction_image or args.skill):
-        parser.error("one of --task, --instruction-image or --skill is required")
+    if not (args.task or args.instruction_image or args.skill or args.resume):
+        parser.error("one of --task, --instruction-image, --skill or --resume is required")
 
     # Validate the skill/params pairing here, not once the cell is up: on the
     # simulated path parser.error() past that point still runs the viewer
@@ -331,12 +382,18 @@ def main() -> int:
             verify=verify,
             dry_run=args.dry_run,
             log_dir=args.log_dir,
+            confirm=confirm_step if args.step else None,
         )
 
+        resume = None
+        if args.resume:
+            resume = json.loads(Path(args.resume).read_text(encoding="utf-8"))
         outcome = orchestrator.run(
             task=args.task,
             instruction_image=args.instruction_image,
             follow_steps=args.follow_steps,
+            resume=resume,
+            from_step=args.from_step,
         )
 
         print("\n" + "=" * 60)

@@ -87,6 +87,17 @@ class PlaceSkill(BaseSkill):
             # centroid: putting the TCP back where it was holding the seated
             # tool re-seats the tool.
             "pick_grasp_tcp": None,
+            # The tool's z axis when the held object was picked (base frame).
+            # The executor fills it in; place refuses to start more than 20 deg
+            # from it, i.e. with the object still tipped from a pour.
+            "pick_tool_z": None,
+            # Leave the way pick_up came in, metres; 0 rises straight up. An
+            # object picked with slide_in is set down where it was held (the
+            # TCP back where the jaws closed, set_down_clearance higher), the
+            # jaws open, slide this far back (-X) and only then rise. The
+            # executor fills it from the pick.
+            "slide_out": 0.0,
+            "set_down_clearance": 0.003,
         }
 
     def check_preconditions(self, params: Dict[str, Any]) -> Tuple[bool, str]:
@@ -132,6 +143,21 @@ class PlaceSkill(BaseSkill):
             # the wrist here would twist a held beaker against the table on
             # the way down; pick_up already left us in a sane top-down pose.
             hold_rotation = np.asarray(self.get_current_pose().rotation, dtype=float)
+            # A place that starts tipped would carry and set the object down at
+            # that tilt. It can: on 2026-10-08 the robot faulted at the end of
+            # a 90 deg pour and the arm was still there when this step began.
+            # Measured against the pick's tool axis (straight down if unknown),
+            # so an object picked from the side is not mistaken for tipped.
+            picked = params.get("pick_tool_z")
+            ref = (np.asarray(picked, dtype=float) if picked is not None
+                   else np.array([0.0, 0.0, -1.0]))
+            ref = ref / (np.linalg.norm(ref) + 1e-9)
+            tilt = float(np.degrees(np.arccos(np.clip(hold_rotation[:, 2] @ ref, -1.0, 1.0))))
+            if tilt > 20.0:
+                return False, {"error": (f"The held object is tipped {tilt:.0f} deg from how "
+                                         f"it was picked; not placing it like that. Bring the "
+                                         f"arm home (reset_joints) first"),
+                               "still_holding": True}
 
         target_pos, surface_z, located = self._resolve_target(params, target)
         if target_pos is None:
@@ -145,6 +171,29 @@ class PlaceSkill(BaseSkill):
                   f"{np.round(target_pos, 4)})")
             target_pos = grasp_tcp.copy()
             surface_z = float(grasp_tcp[2])
+
+        slide = float(params.get("slide_out") or 0.0)
+        if slide > 0 and not insert and grasp_tcp is not None:
+            # It was taken by sliding in from behind: put it down where it was
+            # held, and leave the same way, backwards.
+            grasp_tcp = np.asarray(grasp_tcp, dtype=float)
+            print(f"[Place] Setting it down where it was held: TCP back to "
+                  f"{np.round(grasp_tcp, 4)}, {float(params['set_down_clearance']) * 1000:.0f}mm up")
+            target_pos = grasp_tcp.copy()
+            surface_z = float(grasp_tcp[2])
+            release_clearance = float(params["set_down_clearance"])
+        elif grasp_tcp is not None and not insert:
+            # Back where it was picked means the TCP back where the jaws
+            # closed, not over the object's centroid. The scoop is taken 10 mm
+            # behind its centroid and the arm stops ~5 mm short, so each
+            # put-back over the centroid moved it ~15 mm forward: 0.6319 ->
+            # released 0.6473, and the next pick found it 27 mm on
+            # (2026-10-08, 20:40 run).
+            g = np.asarray(grasp_tcp, dtype=float)
+            print(f"[Place] Back where it was picked: TCP to "
+                  f"{np.round(g[:2], 4)}, where the jaws closed (centroid was "
+                  f"{np.round(target_pos[:2], 4)})")
+            target_pos = np.array([g[0], g[1], float(target_pos[2])])
 
         # After the scan we are at home; confirm the object survived the trip.
         ok, msg = self.check_still_holding(start_width, tag="Place")
@@ -210,7 +259,7 @@ class PlaceSkill(BaseSkill):
                   f"{stop_force:.1f}N")
 
             probe = target_pos.copy()
-            # Contact is a CHANGE from a reading at rest above the seat: the
+            # Contact is a CHANGE (either sign) from a reading at rest above the seat: the
             # raw estimate on the real arm carries a pose-dependent bias of
             # its own, which an absolute threshold would read as contact (a
             # release in mid-air) or mask (no release at all).
@@ -232,7 +281,11 @@ class PlaceSkill(BaseSkill):
                                    "still_holding": True}
                 push = self.mean_push_up_n() - baseline
                 print(f"[Place]   z={z:.4f}  push={push:+.2f}N")
-                if push is not None and push > stop_force:
+                # The SIZE of the change, never its sign. On the robot a press
+                # reads NEGATIVE: on 2026-10-05 this test was "push > stop",
+                # it never fired, and the arm stepped on to -96N with the
+                # stirrer already seated, then refused to let go.
+                if abs(push) > stop_force:
                     seated_by_force, contact_force, contact_z = True, push, z
                     print(f"[Place] Contact at z={z:.4f} ({push:.2f}N > "
                           f"{stop_force:.1f}N) — seated, releasing here")
@@ -294,9 +347,15 @@ class PlaceSkill(BaseSkill):
                     "still_holding": True,
                 }
 
-        # Step 4: retract straight up, clear of whatever we just set down.
-        print(f"[Place] Retracting...")
+        # Step 4: retract straight up, clear of whatever we just set down --
+        # after sliding the open jaws back out, if that is how they came in.
         retract = target_pos.copy()
+        if slide > 0:
+            retract[0] -= slide
+            print(f"[Place] Sliding the open jaws {slide * 1000:.0f}mm back out...")
+            if not self.goto_pose_rigid(retract, hold_rotation, duration=3.0):
+                print("[Place] Warning: slide-out command failed; object was released")
+        print(f"[Place] Retracting...")
         retract[2] = release_z + approach_height
         if not self.goto_pose_rigid(retract, hold_rotation, duration=3.0):
             print("[Place] Warning: retract command failed; object was released")

@@ -151,7 +151,7 @@ CATALOG: Dict[str, SkillSpec] = {
              "a container out -- all of it, or whatever is left in it -- is 90. Tip "
              "less, about 80, only when the step says to pour SOME and keep the rest "
              "for later. If the plan pours from the same container again before "
-             "putting it down, this pour is capped at 80 so it is not emptied.",
+             "putting it down, this pour is capped at 60 so it is not emptied.",
         params=[
             Param("target_container", "string",
                   "Container to pour into.", required=True),
@@ -525,6 +525,22 @@ def _as_kind(value, kind):
         text = str(value).strip().lower()
         if text in ("true", "false"):
             return text == "true"
+        return _BAD
+    if kind == "list":
+        # Every list in the catalogue is an [x, y, z] in metres. On the first
+        # real dry run with a bench (2026-10-07) the model passed dump the
+        # tool_offset "[measured offset from pick_up of larger spoon]", a note
+        # to itself; passed on, the executor's float() on it raised outside
+        # the skill's own error handling.
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                return _BAD
+        if (isinstance(value, (list, tuple)) and len(value) == 3
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                        for v in value)):
+            return [float(v) for v in value]
         return _BAD
     return value
 

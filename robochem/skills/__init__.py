@@ -119,7 +119,10 @@ class SkillsExecutor:
         # the TCP back there re-seats a tool exactly as it sat (the stirrer in
         # its holder); the centroid alone is only the mean of what was visible.
         self.pick_grasps = {}
-    
+        # The z_offset each remembered pick used. A grasp moved down holds the
+        # object higher in the jaws, so its put-back must release lower.
+        self.pick_z_offsets = {}
+
     def list_skills(self) -> list:
         """
         Names the orchestrator may dispatch.
@@ -159,9 +162,17 @@ class SkillsExecutor:
         skill = self._skill_instances[skill_name]
         
         params = {**self.SKILL_ALIASES.get(skill_name, {}), **(params or {})}
+        params = self._bench_names(params)
+        params = self._bench_defaults(skill_name, params)
         params = self._resolve_pick_site(skill_name, params)
         params = self._fill_tool_geometry(skill_name, skill, params)
-        
+        if skill_name == "place":
+            held = getattr(self, "held_measure", None) or {}
+            if params.get("pick_tool_z") is None and held.get("tool_z") is not None:
+                params = {**params, "pick_tool_z": list(held["tool_z"])}
+            if params.get("slide_out") is None and held.get("slide_in"):
+                params = {**params, "slide_out": float(held["slide_in"])}
+
         # Check preconditions
         can_execute, message = skill.check_preconditions(params)
         if not can_execute:
@@ -176,6 +187,60 @@ class SkillsExecutor:
             return success, result
         except Exception as e:
             return False, {"error": str(e), "phase": "execution"}
+
+    #: Params whose value names an object on the bench.
+    _OBJECT_PARAMS = ("object_name", "target_location", "target_container",
+                      "powder_source", "source_container", "target")
+
+    def _bench_names(self, params: dict) -> dict:
+        """
+        Rename any alias or label of a bench object to the bench's own name.
+
+        Only a vision system with a bench manifest renames anything. Two things
+        depend on it. Tool geometry is looked up by the name a tool was picked
+        by: on the 2026-10-07 bench "smaller spoon" is the big scoop, and its
+        own CAD entry is a placeholder at 75%. And a pick and its put-back have
+        to agree on the key ("scoop" picked, "larger spoon" put back).
+        """
+        canonical = getattr(self.vision, "canonical_name", None)
+        if canonical is None:
+            return params
+        out = dict(params)
+        for key in self._OBJECT_PARAMS:
+            value = out.get(key)
+            if not isinstance(value, str):
+                continue
+            name = canonical(value)
+            if isinstance(name, str) and name != value:
+                print(f"[Skills] {key} {value!r} is {name!r} on this bench")
+                out[key] = name
+        return out
+
+    def _bench_defaults(self, skill_name: str, params: dict) -> dict:
+        """
+        Fill in the parameters the bench manifest validated for this object.
+
+        A planner names the object and nothing else. The scoop's grasp was
+        made to work on the robot with forward_offset -0.010 and 1 N; the
+        defaults (0, 1.5 N) put the jaws on its crank. A dish's inside radius
+        is measured, and the scoop's stroke is sized to it. A value the call
+        does pass is kept.
+        """
+        defaults_for = getattr(self.vision, "bench_defaults", None)
+        if defaults_for is None:
+            return params
+        key = {"pick_up": "object_name", "scoop": "powder_source",
+               "dump": "target_container", "stir": "target_container"}.get(skill_name)
+        name = params.get(key) if key else None
+        name = name if isinstance(name, str) else ""
+        found = defaults_for(skill_name, name)
+        added = {k: v for k, v in (found if isinstance(found, dict) else {}).items()
+                 if k not in params}
+        if not added:
+            return params
+        print(f"[Skills] {skill_name} {name!r}: bench-validated "
+              + ", ".join(f"{k}={v}" for k, v in added.items()))
+        return {**params, **added}
 
     # ---------------------------------------------------------- pick sites
     #
@@ -197,8 +262,14 @@ class SkillsExecutor:
         site = list(centroid)
         key = str(name).strip().lower()
         self.pick_sites[key] = site
+        # Where the TCP actually closed, not where it was sent: the grasp
+        # move is accepted within 30mm. Older results only have the command.
+        self.pick_z_offsets[key] = float(result.get("z_offset") or 0.0)
+        reached = result.get("grasp_tcp_reached")
         grasp = result.get("grasp_pose")
-        if grasp is not None:
+        if reached is not None:
+            self.pick_grasps[key] = [float(v) for v in reached]
+        elif grasp is not None:
             self.pick_grasps[key] = [float(v) for v in
                                      np.asarray(grasp, dtype=float)[:3, 3]]
         print(f"[Skills] Noted where '{name}' was picked from: "
@@ -220,8 +291,16 @@ class SkillsExecutor:
             result = result if isinstance(result, dict) else {}
             # What the pick measured of the tool, for _fill_tool_geometry.
             self.held_measure = {"suggested": result.get("suggested_tool_offset"),
-                                 "extent_x": result.get("tool_extent_x")}
+                                 "extent_x": result.get("tool_extent_x"),
+                                 # Picked by sliding in from behind: place
+                                 # leaves the same way (slide_out).
+                                 "slide_in": result.get("slide_in")}
             grasp = result.get("grasp_pose")
+            if grasp is not None:
+                # The tool's axis as picked: place checks the object is not
+                # still tipped (from a pour the robot faulted out of).
+                self.held_measure["tool_z"] = [
+                    float(v) for v in np.asarray(grasp, dtype=float)[:3, 2]]
             top, bottom = result.get("object_top_z"), result.get("object_bottom_z")
             if grasp is not None and top is not None and bottom is not None:
                 tcp_z = float(np.asarray(grasp, dtype=float)[2, 3])
@@ -239,6 +318,13 @@ class SkillsExecutor:
         elif skill_name in ("place", "open_gripper") or params.get("action") == "open":
             self.held = None
             self.held_measure = {}
+        # A container in the jaws is not on the bench, and must not be voted
+        # for there: on 2026-10-08, with the beaker held, its label paper
+        # still lay by cup A, one camera read A as "50 ML WATER", and A tied
+        # with B and was refused.
+        tell = getattr(self.vision, "set_held", None)
+        if callable(tell):
+            tell(self.held)
 
     def _offset_from_tip(self, tool: dict, cad: list):
         """
@@ -256,9 +342,36 @@ class SkillsExecutor:
         to_bowl = tool.get("span_mid_to_bowl")
         if not extent or to_bowl is None or abs(cad[0]) < 0.005:
             return None
+        length = tool.get("length")
+        seen = float(extent[1]) - float(extent[0])
+        if length and abs(seen - float(length)) > 0.015:
+            # The middle of the cloud is the part's middle only when the cloud
+            # is the part. On the robot (2026-10-07/08) the big scoop's cloud
+            # ran 111-113 mm against its 69.5 mm, 45 mm of it behind the
+            # handle; the middle then put the bowl 26-35 mm from the jaws
+            # where pick_up measured 51-55 (and 2026-09-25 validated 51), and
+            # the scoop dug 2-3 cm further forward than planned. The sim's
+            # cloud ran 64 mm.
+            print(f"[Skills] the cloud at the pick ran {seen * 1000:.0f} mm against "
+                  f"the part's {float(length) * 1000:.0f} mm: its middle is not the "
+                  f"part's, so not placing the bowl from it")
+            return None
         x = (extent[0] + extent[1]) / 2 + np.sign(cad[0]) * to_bowl
         if x * cad[0] <= 0 or abs(x - cad[0]) > 0.03:
             return None                 # not the part we know: keep the CAD
+        measured = (getattr(self, "held_measure", None) or {}).get("suggested")
+        if measured is not None and abs(float(measured[0]) - x) > 0.011:
+            # When the cloud is the part, the middle of its ends and pick_up's
+            # bowl-end median agree to within 8 mm (sim: 6.2, 8.1, 7.0). On
+            # the robot they were 14-29 mm apart every time, the ends always
+            # the nearer: 21.6 against 36 on 2026-10-08, with a cloud only
+            # 14.5 mm too long, and the scoop dug that much too far forward.
+            print(f"[Skills] the tool's ends put the bowl {x * 1000:.1f} mm out, the "
+                  f"bowl end of its cloud {float(measured[0]) * 1000:.1f} mm: "
+                  f"{abs(float(measured[0]) - x) * 1000:.0f} mm apart, so the ends "
+                  f"are not the part's; using the measured bowl")
+            self._ends_disagree = True
+            return None
         return [float(x), cad[1], cad[2]]
 
     def _fill_held_container(self, skill_name: str, params: dict) -> dict:
@@ -305,8 +418,20 @@ class SkillsExecutor:
             copied = (given is not None and measured is not None
                       and np.allclose(np.asarray(given, float), np.asarray(measured, float),
                                       atol=1e-4))
-            from_tip = self._offset_from_tip(tool, cad)
-            if (given is None or copied) and from_tip is not None and not filled.get("tool_length"):
+            self._ends_disagree = False
+            trust = getattr(self.vision, "trust_measured_tool_offset", None)
+            sane = (measured is not None and float(measured[0]) * cad[0] > 0
+                    and abs(float(measured[1]) - cad[1]) <= 0.02)
+            trusted = bool(callable(trust) and trust() and sane)
+            from_tip = None if trusted else self._offset_from_tip(tool, cad)
+            if (given is None or copied) and trusted and not filled.get("tool_length"):
+                # This bench's measurement is ruler-checked: 0.053 printed,
+                # 52.9 mm measured, scoop in the jaws (2026-10-08).
+                filled["tool_offset"] = [float(measured[0]), float(measured[1]), cad[2]]
+                added.append(f"tool_offset x/y {float(measured[0]) * 1000:.1f}/"
+                             f"{float(measured[1]) * 1000:.1f}mm as measured at the pick "
+                             f"(ruler-checked on this bench), z {cad[2] * 1000:.1f}mm from CAD")
+            elif (given is None or copied) and from_tip is not None and not filled.get("tool_length"):
                 # No offset, or pick_up's own copied over by a planner: the
                 # bowl's far edge says better where the jaws closed. A value
                 # anyone passed on purpose -- the bench-tuned [0.051, ...] --
@@ -316,6 +441,20 @@ class SkillsExecutor:
                              f"tool's ends were seen at the pick, y/z from CAD"
                              + (f" (instead of pick_up's {[round(float(v), 4) for v in given]})"
                                 if copied else ""))
+            elif (given is None and not filled.get("tool_length") and measured is not None
+                  and float(measured[0]) * cad[0] > 0
+                  and (self._ends_disagree or abs(float(measured[0]) - cad[0]) > 0.015)
+                  and abs(float(measured[1]) - cad[1]) <= 0.02):
+                # Nothing passed, the ends cannot be trusted, and pick_up's own
+                # x is further from the CAD than its error (7.7 mm in sim): the
+                # jaws are not where the CAD assumes. Its x and y off this grasp,
+                # with the CAD depth, is how the robot-validated chain ran
+                # (2026-09-25: [0.051, 0.009, 0.028]); the robot measured
+                # 51-55 mm against the CAD's 25.7 on 2026-10-07/08.
+                filled["tool_offset"] = [float(measured[0]), float(measured[1]), cad[2]]
+                added.append(f"tool_offset x/y {float(measured[0]) * 1000:.1f}/"
+                             f"{float(measured[1]) * 1000:.1f}mm as measured at the pick, "
+                             f"z {cad[2] * 1000:.1f}mm from CAD")
             elif given is None and not filled.get("tool_length"):
                 filled["tool_offset"] = cad
                 added.append(f"tool_offset={cad} (CAD)")
@@ -402,6 +541,13 @@ class SkillsExecutor:
         grasp = self.pick_grasps.get(key)
         if grasp is not None and resolved.get("pick_grasp_tcp") is None:
             resolved["pick_grasp_tcp"] = list(grasp)
+        drop = float(getattr(self, "pick_z_offsets", {}).get(key) or 0.0)
+        if drop < 0 and resolved.get("release_clearance") is None:
+            # Picked lower (the beaker, 2026-10-08: -12 mm): set it down as
+            # much lower, or it falls the difference.
+            from .place import PlaceSkill
+            usual = float(PlaceSkill.optional_params.fget(None)["release_clearance"])
+            resolved["release_clearance"] = max(0.0, usual + drop)
         if put_back:
             print(f"[Skills] putting '{self.held}' back the way it came out: "
                   + ", ".join(f"{k}={v}" for k, v in put_back.items()))

@@ -15,6 +15,9 @@ from .base_skill import (
     to_rigid_transform,
 )
 
+#: The Franka hand: flange to TCP along the tool's z axis, metres.
+FLANGE_BEHIND_TCP = 0.1034
+
 
 class PourSkill(BaseSkill):
     name = "pour"
@@ -66,6 +69,14 @@ class PourSkill(BaseSkill):
             "lip_clearance": 0.015,
             "body_clearance": 0.010,
             "lip_inset": 0.4,
+            # Lowest the flange may go, base-frame z. franka-interface has a
+            # virtual floor of its own (a plane at z = -0.015 that the flange,
+            # its "frame 7", must stay ~0.1 m from) and aborts any motion that
+            # crosses it -- then refuses every motion from there. On 2026-10-08
+            # the 90 deg tip over a 47 mm cup put the flange 82.5 mm up: aborted,
+            # and the arm had to be guided out by hand. The 80 deg pour (flange
+            # 105 mm) ran. Late tip steps are raised to keep the flange here.
+            "flange_min_z": 0.11,
         }
 
     def check_preconditions(self, params: Dict[str, Any]) -> Tuple[bool, str]:
@@ -175,8 +186,10 @@ class PourSkill(BaseSkill):
             print("[Pour] reset_joints (home, joint-space) after pour...")
             if not self.go_home():
                 return False, {
-                    "error": "Pour tip ok but reset_joints after hold failed",
+                    "error": ("Poured, but the arm did not come back home; the robot "
+                              "refused the motion (see [Safety] above)"),
                     "tip_after": tip_now,
+                    "still_holding": True,
                 }
         else:
             print("[Pour] Returning upright in place...")
@@ -209,11 +222,13 @@ class PourSkill(BaseSkill):
 
     def _lip_pose(self, R: np.ndarray, cup: np.ndarray, per_ring: int,
                   lip_xy: np.ndarray, rim_z: float, lip_clear: float,
-                  body_clear: float, lean_xy=(-1.0, 0.0)) -> Tuple[np.ndarray, float]:
+                  body_clear: float, lean_xy=(-1.0, 0.0),
+                  flange_min_z: float = None) -> Tuple[np.ndarray, float]:
         """
         TCP position putting the lip at ``lip_xy``, ``lip_clear`` over the
         target's rim, raised as far as needed for every point of the cup to
-        stay ``body_clear`` over it. Returns (xyz, lip height over the rim).
+        stay ``body_clear`` over it, and the flange ``flange_min_z`` or more
+        above the base. Returns (xyz, lip height over the rim).
         """
         world = cup @ R.T                                  # relative to the TCP
         rim = world[:per_ring]
@@ -224,6 +239,9 @@ class PourSkill(BaseSkill):
         xy = np.asarray(lip_xy, dtype=float) - lip[:2]
         z = max(rim_z + lip_clear - lip[2],
                 rim_z + body_clear - float(world[:, 2].min()))
+        if flange_min_z is not None:
+            # The flange is FLANGE_BEHIND_TCP back along the tool's z axis.
+            z = max(z, float(flange_min_z) + FLANGE_BEHIND_TCP * float(R[2, 2]))
         return np.array([xy[0], xy[1], z]), float(z + lip[2] - rim_z)
 
     def _pour_over_lip(self, params, target, pour_tip, hold_duration, step_deg,
@@ -259,12 +277,22 @@ class PourSkill(BaseSkill):
         angles = list(np.arange(0.0, pour_tip + 1e-6, step_deg))
         if abs(angles[-1] - pour_tip) > 0.5:
             angles.append(pour_tip)
+        flange_min = params.get("flange_min_z")
+        flange_min = None if flange_min is None else float(flange_min)
         plan = []
         for deg in angles:
             R = self._rotation_lean(closing, float(deg), lean_xy)
             xyz, lip_h = self._lip_pose(R, cup, per_ring, lip_xy, rim_z, lip_clear,
-                                        body_clear, lean_xy)
+                                        body_clear, lean_xy, flange_min_z=flange_min)
             plan.append((float(deg), R, self._clamp_position(xyz), lip_h))
+        if flange_min is not None:
+            raised = [(deg, lip_h) for deg, R, xyz, lip_h in plan
+                      if abs(xyz[2] - FLANGE_BEHIND_TCP * R[2, 2] - flange_min) < 1e-6]
+            if raised:
+                print(f"[Pour] From {raised[0][0]:.0f} deg the cup rides higher to keep the "
+                      f"flange {flange_min * 1000:.0f}mm up (franka-interface's virtual "
+                      f"floor): lip up to {max(h for _d, h in raised) * 1000:.0f}mm "
+                      f"over the rim")
 
         # Over the target, higher by a margin, upright; then down onto the plan.
         start = plan[0][2].copy()
@@ -318,8 +346,15 @@ class PourSkill(BaseSkill):
         if reset_after:
             print("[Pour] reset_joints (home, joint-space) after pour...")
             if not self.go_home():
-                return False, {"error": "Pour tip ok but reset_joints after hold failed",
-                               "tip_after": tip_now}
+                # 2026-10-08: the robot faulted at the end of the 90 deg step
+                # and refused the righting and this; pour said "success" and
+                # the next step failed 271 mm away instead.
+                tilt = self._tip_deg(np.asarray(self.get_current_pose().rotation))
+                return False, {"error": (f"Poured, but the arm did not come back: it is "
+                                         f"still tipped {tilt:.0f} deg over '{target}', "
+                                         f"holding the cup. The robot refused the motion; "
+                                         f"see [Safety] above"),
+                               "tip_after": tip_now, "still_holding": True}
 
         print(f"[Pour] Done pouring into '{target}'")
         return True, {

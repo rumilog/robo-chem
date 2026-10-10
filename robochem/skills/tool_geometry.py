@@ -41,6 +41,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         # at 40.8). With where pick_up saw the two ends, it gives x for the
         # grasp actually made (SkillsExecutor._offset_from_tip).
         "span_mid_to_bowl": 0.02105,
+        # End to end along the handle, spoon.stl: -15.0..54.5 mm.
+        "length": 0.0695,
         # Lies on the bench: it goes back on its pick site with a plain place.
         "home": (),
         "put_back": {},
@@ -60,6 +62,7 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "tool_offset": (0.0208, 0.0, 0.0235),
         # Span -11.3..40.9 mm, bowl centre 30.6 (the scaled spoon.stl).
         "span_mid_to_bowl": 0.0158,
+        "length": 0.0522,
         "home": (),
         "put_back": {},
     },

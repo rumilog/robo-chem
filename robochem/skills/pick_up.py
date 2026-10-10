@@ -193,6 +193,19 @@ class PickUpSkill(BaseSkill):
             # changing and the jaws cannot seat flat.
             "forward_offset": 0.0,
             "lateral_offset": 0.0,
+            # Take the object from behind instead of from above, metres; 0
+            # comes straight down. The jaws open fully with their closing axis
+            # across the slide (base Y), go down this far behind the grasp
+            # (toward the base, -X), then slide forward onto the object and
+            # close. The user's procedure for the clear cups (2026-10-08):
+            # straight down, the 55.5 mm rim leaves ~12 mm a side in the
+            # 80 mm opening and a finger could land on it.
+            "slide_in": 0.0,
+            # Close to this width and stop, metres (a position command; no
+            # squeezing on). None closes per force_limited. For an object whose
+            # width at the jaws is known and which a force-limited close
+            # crushes: the clear cups.
+            "grip_width": None,
             # Clear the cameras before scanning via frankapy reset_joints
             # (home), not a hardcoded XYZ park.
             "reset_before_scan": True,
@@ -303,9 +316,14 @@ class PickUpSkill(BaseSkill):
         z_offset = params["z_offset"]
         forward_offset = float(params["forward_offset"])
         lateral_offset = float(params["lateral_offset"])
+        slide = float(params.get("slide_in") or 0.0)
         grasp_pose = None
         for i, cand in enumerate(candidates):
             pose = cand.copy()
+            if slide > 0:
+                # Jaws across the slide: they close along base Y, so they
+                # pass either side of the object as the hand moves along X.
+                pose[:3, :3] = np.diag([1.0, -1.0, -1.0])
             if z_offset:
                 pose[2, 3] = float(np.clip(
                     pose[2, 3] + z_offset,
@@ -333,12 +351,18 @@ class PickUpSkill(BaseSkill):
                 hover_pose = upright_from_pitched(pose)
                 hover_pose[2, 3] = self.safe_height
 
-            approach_pose = pose.copy()
+            # Sliding in: everything before the grasp happens behind it.
+            behind = pose.copy()
+            behind[0, 3] -= slide
+            approach_pose = behind.copy()
             approach_pose[2, 3] += approach_height
+            if slide > 0:
+                hover_pose[:3, 3] = [behind[0, 3], behind[1, 3], self.safe_height]
 
             print(f"[PickUp] Candidate {i + 1}/{len(candidates)}: "
                   f"wrist tip {tip_from_vert:.0f} deg from vertical, "
-                  f"grasp {np.round(pose[:3, 3], 4)}")
+                  f"grasp {np.round(pose[:3, 3], 4)}"
+                  + (f", sliding in from {slide * 1000:.0f}mm behind" if slide > 0 else ""))
 
             print(f"[PickUp]   hover {np.round(hover_pose[:3, 3], 4)}...")
             if not self.move_to_pose(hover_pose, reach_tol=0.05):
@@ -348,7 +372,14 @@ class PickUpSkill(BaseSkill):
             if not self.move_to_pose(approach_pose, reach_tol=0.04):
                 print(f"[PickUp]   unreachable at approach — trying next")
                 continue
-            print(f"[PickUp]   grasp {np.round(pose[:3, 3], 4)}...")
+            if slide > 0:
+                print(f"[PickUp]   down behind it {np.round(behind[:3, 3], 4)}...")
+                if not self.move_to_pose(behind, reach_tol=0.03):
+                    print(f"[PickUp]   unreachable behind the grasp — trying next")
+                    continue
+                print(f"[PickUp]   slide forward onto it {np.round(pose[:3, 3], 4)}...")
+            else:
+                print(f"[PickUp]   grasp {np.round(pose[:3, 3], 4)}...")
             if not self.move_to_pose(pose, speed="slow", reach_tol=0.03):
                 print(f"[PickUp]   unreachable at grasp — trying next")
                 continue
@@ -364,12 +395,27 @@ class PickUpSkill(BaseSkill):
             }
 
         force_limited = bool(params["force_limited"])
+        grip_width = params.get("grip_width")
+        if grip_width is not None:
+            force_limited = False
         # Best-effort width for logging / width-close mode. Flat objects often
         # have no cloud at grasp height — that used to abort the whole pick.
         expected = width_along_closing_axis(object_pc, grasp_pose)
         target_width = None
 
-        if force_limited:
+        if grip_width is not None:
+            # A measured width to close to and stop at. The clear cups are
+            # tapered, so their cylinder model's width is the rim's, not the
+            # width where the jaws close, and the force-limited close kept
+            # squeezing them (2026-10-08: held at 37 mm on a 61 mm section).
+            target_width = float(grip_width)
+            print(f"[PickUp] Closing to {target_width * 1000:.1f}mm and stopping "
+                  f"(grip_width)...")
+            if not self.close_gripper(
+                force=grasp_force, target_width=target_width, force_limited=False
+            ):
+                return False, {"error": "Failed to close gripper"}
+        elif force_limited:
             print(f"[PickUp] Closing until contact "
                   f"(force_limited, max {grasp_force:.1f} N)"
                   + (f"; cloud width ~{expected * 1000:.1f}mm"
@@ -422,6 +468,18 @@ class PickUpSkill(BaseSkill):
                 return False, {"error": "Failed to close gripper"}
 
         self.wait(0.3)
+
+        # Where the TCP actually is with the jaws closed. move_to_pose accepts
+        # the grasp anywhere within 30mm, so the commanded pose is not this:
+        # on 2026-10-05 the stirrer's put-back, aimed at the commanded grasp,
+        # met the holder 13mm early. Putting a tool back aims at THIS.
+        grasp_tcp_reached = np.asarray(self.get_current_pose().translation,
+                                       dtype=float)
+        off = float(np.linalg.norm(grasp_tcp_reached - grasp_pose[:3, 3]))
+        if off > 0.005:
+            print(f"[PickUp] Closed at {np.round(grasp_tcp_reached, 4)}, "
+                  f"{off * 1000:.1f}mm from the commanded grasp "
+                  f"{np.round(grasp_pose[:3, 3], 4)}")
 
         gripper_width = self.get_gripper_width()
         grasped = self.gripper_is_grasped()
@@ -499,7 +557,15 @@ class PickUpSkill(BaseSkill):
                 "expected_width": expected,
             }
 
-        suggested = measure_tool_offset(object_pc, grasp_pose)
+        # Measure the tool from where the jaws closed, not where they were
+        # sent: the tool is held THERE. On the robot they close 5-6 mm short
+        # of the command along x every time (4.7, 6.3, 4.9 mm, 2026-10-07/08),
+        # and an offset taken from the command puts the bowl that much nearer
+        # the jaws than it is -- the scoop then digs that much further forward.
+        # The sim reaches its command, so there the two are the same.
+        held_frame = np.array(grasp_pose, dtype=float).copy()
+        held_frame[:3, 3] = grasp_tcp_reached
+        suggested = measure_tool_offset(object_pc, held_frame)
         if suggested is not None:
             print(f"[PickUp] Measured tool offset (TCP -> working end, tool "
                   f"frame): [{suggested[0]:.3f}, {suggested[1]:.3f}, "
@@ -519,14 +585,21 @@ class PickUpSkill(BaseSkill):
         result = {
             "grasped_object": object_name,
             "grasp_pose": grasp_pose.tolist(),
+            "grasp_tcp_reached": grasp_tcp_reached.tolist(),
             "grasp_type": grasp_type,
+            # How far behind it the jaws came down (0: from above). Place
+            # leaves the same way, sliding the open jaws back out.
+            "slide_in": slide,
+            # How far the grasp was moved down (-) from the computed one;
+            # a put-back sets the object down that much lower to match.
+            "z_offset": float(z_offset or 0.0),
             "gripper_width": lifted_width,
             "expected_width": expected,
             "target_width": target_width,
             "grasp_force": grasp_force,
             "suggested_tool_offset": (None if suggested is None
                                       else [float(v) for v in suggested]),
-            "tool_extent_x": tool_extent_x(object_pc, grasp_pose),
+            "tool_extent_x": tool_extent_x(object_pc, held_frame),
             # The held object's own shape, from the cloud it was picked by:
             # pour needs where a held cup's rim and bottom are relative to the
             # jaws to keep its lip over the target (SkillsExecutor fills it in).

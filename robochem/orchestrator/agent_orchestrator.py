@@ -42,7 +42,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -54,7 +54,8 @@ from robochem.agents import scene as scene_agent
 from robochem.agents import skill_planner
 from robochem.agents.llm_client import LLMResponseError, MissingAPIKeyError
 from robochem.agents.planner import Plan, SubTask
-from robochem.agents.robot_profile import DEFAULT_PROFILE, RobotProfile
+from robochem.agents.robot_profile import (DEFAULT_PROFILE, CapabilityWorkaround,
+                                           RobotProfile)
 from robochem.agents.skill_catalog import CATALOG, InfeasibleSkill
 from robochem.agents.skill_planner import SkillCall, StepOutcome
 
@@ -69,7 +70,11 @@ MAX_REPLANS = 2
 #: in 2 of 3 runs on 2026-10-03, which emptied the beaker into A and left B
 #: without indicator. The angle is the model's to choose; emptying a container
 #: that still has work to do is not.
-POUR_KEEP_SOME_DEG = 80.0
+#: 60 on the user's word (2026-10-08: step 23, the beaker's pour into A, "turn
+#: that 80 into 60"). The real beaker (r 22 mm, ~60 mm, both unmeasured) with
+#: 50 ml spills from ~51 deg and keeps ~33 ml at 60, for B. The sim's wider
+#: beaker keeps everything below ~70, so in sim this first pour gives little.
+POUR_KEEP_SOME_DEG = 60.0
 
 #: Guard against a planner that emits an unbounded list of sub-tasks. The
 #: booklet's Magic Beaker is 28 skill calls start to finish (two scoops, three
@@ -152,6 +157,7 @@ class AgentOrchestrator:
         log_dir: Optional[str] = "experiments",
         llm_client_override=None,
         verbose: bool = True,
+        confirm=None,
     ) -> None:
         """
         Args:
@@ -172,6 +178,9 @@ class AgentOrchestrator:
             log_dir: Where to write the trial record, or None for no file.
             llm_client_override: Transport double, for tests.
             verbose: Narrate to stdout.
+            confirm: ``confirm(subtask, call) -> bool``, asked before every
+                skill runs on the arm; False stops the run there, without a
+                replan. For a first run on hardware, one step at a time.
         """
         self.skills = skills_executor
         self.vision = vision_system
@@ -184,6 +193,7 @@ class AgentOrchestrator:
         self.log_dir = log_dir
         self.llm = llm_client_override
         self.verbose = verbose
+        self.confirm = confirm
 
         # What we believe is in the gripper. The arm is the authority on whether
         # anything is held; only the name is bookkeeping.
@@ -208,9 +218,18 @@ class AgentOrchestrator:
         instruction_image: Optional[str] = None,
         experiment_name: Optional[str] = None,
         follow_steps: bool = False,
+        resume: Optional[dict] = None,
+        from_step: Optional[int] = None,
     ) -> TaskOutcome:
         """
         Run one task from a description (or an instruction photo) to a verdict.
+
+        ``resume`` is an earlier run's record: its goal and its last plan are
+        taken as they were, the sub-tasks before ``from_step`` (default: the
+        one that failed) are not run again, and what they left behind -- what
+        is held, where each object was picked from, the held tool's measured
+        offset -- is restored from their recorded results. The bench must
+        still be as that run left it.
 
         Never raises for an ordinary failure: a missing API key, an infeasible
         plan, a skill that could not find its target and a spent retry budget all
@@ -231,6 +250,11 @@ class AgentOrchestrator:
         }
 
         # --- the goal ----------------------------------------------------
+        if resume is not None:
+            task = str(resume.get("goal") or "")
+            instruction_image = None
+            record["resumed_from"] = {"started": resume.get("started"),
+                                      "log_path": resume.get("log_path")}
         if instruction_image:
             self._say(f"[goal] reading instructions from {instruction_image}")
             try:
@@ -275,14 +299,17 @@ class AgentOrchestrator:
             self._say(f"[scene] WARNING: '{name}' is not a name this cell can locate")
 
         # --- the plan ----------------------------------------------------
-        try:
-            plan = planner_agent.plan_goal(
-                task, scene, profile=self.profile, client=self.llm
-            )
-        except MissingAPIKeyError as exc:
-            return self._blocked(record, "planning", str(exc), task, started)
-        except LLMResponseError as exc:
-            return self._blocked(record, "planning", str(exc), task, started)
+        if resume is not None:
+            plan = _plan_from_record(resume)
+        else:
+            try:
+                plan = planner_agent.plan_goal(
+                    task, scene, profile=self.profile, client=self.llm
+                )
+            except MissingAPIKeyError as exc:
+                return self._blocked(record, "planning", str(exc), task, started)
+            except LLMResponseError as exc:
+                return self._blocked(record, "planning", str(exc), task, started)
         record["plans"] = [plan.as_dict()]
         self._announce_plan(plan)
 
@@ -302,6 +329,16 @@ class AgentOrchestrator:
         replans = 0
         active = plan
         reason = ""
+        if resume is not None:
+            start = int(from_step) if from_step else _failed_step(resume)
+            completed = [s for s in plan.subtasks if s.index < start]
+            active = replace(plan, subtasks=[s for s in plan.subtasks if s.index >= start])
+            self._restore(resume, start)
+            record["resumed_from"]["from_step"] = start
+            # So a resume of this run knows what came before it too.
+            record["resumed_steps"] = self._resumed_steps
+            self._say(f"[resume] the plan of {resume.get('started')}: skipping sub-tasks "
+                      f"1-{start - 1}, running {start}-{plan.subtasks[-1].index if plan.subtasks else start}")
 
         while True:
             ok, failed_subtask, failure, blocker = self._execute_plan(
@@ -451,6 +488,14 @@ class AgentOrchestrator:
                 completed.append(subtask)
                 continue
 
+            if self.confirm is not None and not self.confirm(subtask, call):
+                record.reason = "stopped by the operator before it ran"
+                record.seconds = time.time() - started
+                steps.append(record)
+                return (False, subtask, record.reason,
+                        ("operator", f"stopped by the operator before sub-task "
+                                     f"{subtask.index} ({subtask.description!r})"))
+
             success, result = self.skills.execute(call.skill, call.params)
             record.success = bool(success)
             record.result = _jsonable(result)
@@ -522,6 +567,41 @@ class AgentOrchestrator:
         elif call.skill in ("place", "open_gripper"):
             self.held_object = None
             self.held_tool_offset = None
+
+    def _restore(self, resume: dict, start: int) -> None:
+        """
+        Replay the bookkeeping of an earlier run's steps before ``start``,
+        without moving: the executor's pick sites and held tool, and this
+        loop's held object and history.
+        """
+        replayed = 0
+        carried = []
+        # A record that was itself a resume carries the steps before it.
+        for st in list(resume.get("resumed_steps") or []) + list(resume.get("steps") or []):
+            if not st.get("success") or int(st.get("subtask_index") or 0) >= start:
+                continue
+            carried.append(st)
+            skill = str(st.get("skill") or "")
+            params = dict(st.get("params") or {})
+            result = st.get("result") or {}
+            names = getattr(self.skills, "_bench_names", None)
+            if callable(names):
+                params = names(params)
+            for hook in ("_remember_pick_site", "_track_held"):
+                fn = getattr(self.skills, hook, None)
+                if callable(fn):
+                    fn(skill, params, result)
+            call = SkillCall(skill=skill, params=params,
+                             subtask_index=int(st.get("subtask_index") or 0),
+                             subtask=str(st.get("subtask") or ""))
+            self.history.append(StepOutcome(call, True, "done in the earlier run"))
+            self._apply_effect(call, True, result)
+            replayed += 1
+        self._resumed_steps = carried
+        sites = sorted(getattr(self.skills, "pick_sites", {}) or {})
+        self._say(f"[resume] restored {replayed} earlier steps: holding "
+                  f"{self.held_object or 'nothing'}; pick sites known for "
+                  f"{', '.join(sites) or 'nothing'}")
 
     def _held_description(self) -> Optional[str]:
         """
@@ -624,6 +704,38 @@ class AgentOrchestrator:
         except OSError as exc:
             self._say(f"[log] could not write the trial record: {exc}")
             return None
+
+
+def _plan_from_record(record: dict) -> Plan:
+    """The last plan of a run record, rebuilt."""
+    p = (record.get("plans") or [{}])[-1]
+    workarounds = []
+    for w in p.get("capability_workarounds") or []:
+        try:
+            workarounds.append(CapabilityWorkaround(**w))
+        except TypeError:
+            pass
+    return Plan(
+        goal=str(p.get("goal") or record.get("goal") or ""),
+        subtasks=[SubTask(**s) for s in p.get("subtasks") or []],
+        observation_target=str(p.get("observation_target") or ""),
+        expected_observation=str(p.get("expected_observation") or ""),
+        capability_workarounds=workarounds,
+        feasible=bool(p.get("feasible", True)),
+        infeasible_reason=str(p.get("infeasible_reason") or ""),
+        diagnosis=str(p.get("diagnosis") or ""),
+        is_correction=bool(p.get("is_correction", False)),
+    )
+
+
+def _failed_step(record: dict) -> int:
+    """The sub-task a run record stopped at: its failed step, else the next one."""
+    steps = record.get("steps") or []
+    for st in steps:
+        if not st.get("success"):
+            return int(st.get("subtask_index") or 1)
+    done = [int(st.get("subtask_index") or 0) for st in steps]
+    return (max(done) + 1) if done else 1
 
 
 def _provenance() -> dict:

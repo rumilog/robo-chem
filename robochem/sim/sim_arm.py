@@ -40,6 +40,12 @@ install_rigid_transform()
 FRANKA_TOOL_FRAME = "franka_tool"
 WORLD_FRAME = "world"
 
+def _min_jerk(t: float) -> float:
+    """Fraction of a move done at fraction ``t`` of its time, min-jerk."""
+    t = min(max(float(t), 0.0), 1.0)
+    return t ** 3 * (10.0 - 15.0 * t + 6.0 * t ** 2)
+
+
 # Panda joint limits, from the vendor model.
 JOINT_LOW = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
 JOINT_HIGH = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
@@ -344,10 +350,14 @@ class SimFrankaArm:
         """
         One instantaneous sample of the external wrench, base frame.
 
-        Matches ``frankapy.FrankaArm.get_ee_force_torque()``: six floats, force
-        then torque, in world coordinates, and signed as the force the world
-        exerts ON the robot -- so pressing the tool down onto something reads a
-        positive Z.
+        Matches ``frankapy.FrankaArm.get_ee_force_torque()`` on THIS cell: six
+        floats, force then torque, in world coordinates, signed as the force
+        the robot exerts on the world -- so pressing the tool down onto
+        something reads a NEGATIVE Z. That is measured, not assumed: on
+        2026-10-05 the real arm pressing the stirrer into its holder read
+        -6N, -17N, ... -96N from a resting baseline. The sim used to report
+        the opposite sign, which is how place's positive-only contact test
+        passed here and never fired on the robot.
 
         A magnet grasp carries the held prop kinematically, so nothing it
         touches is transmitted through the finger joints and a wrist sensor
@@ -375,13 +385,14 @@ class SimFrankaArm:
             # mj_contactForce reports the contact force on geom2's body, so it
             # is already the force on us when the tool is geom2; flip it when
             # the tool is geom1. Verified by pressing the stirrer down onto the
-            # holder and requiring a positive Z.
+            # holder: the force ON us is +Z.
             if on1:
                 force = -force
             wrench[:3] += force
             wrench[3:] += np.cross(np.asarray(con.pos) - tcp, force)
 
-        return wrench
+        # Report the reaction, as the real arm does (see the docstring).
+        return -wrench
 
     def _solve_ik(self, target_pos, target_mat, q_seed,
                   iters: int = 40, tol: float = 5e-4) -> np.ndarray:
@@ -608,9 +619,11 @@ class SimFrankaArm:
 
         def ctrl(t):
             # Ramp between plan samples rather than holding each one; see
-            # _lerp_plan. No feed-forward here: a straight move starts and
-            # stops abruptly, and a lead term would overshoot the stop.
-            self.data.ctrl[:7] = _lerp_plan(q_start, plan, t)
+            # _lerp_plan. Min-jerk timing, as frankapy's goto_pose has: this
+            # was constant speed with a dead stop, which the robot cannot do,
+            # and over the same duration the robot then looked 1.875x faster
+            # mid-move (2026-10-08). See robochem.skills.pacing.
+            self.data.ctrl[:7] = _lerp_plan(q_start, plan, _min_jerk(t))
 
         self._run(duration, ctrl)
         self._settle()
@@ -708,7 +721,8 @@ class SimFrankaArm:
             print(f"[sim] goto_joints ({duration:.1f}s)")
 
         def ctrl(t):
-            self.data.ctrl[:7] = start + (target - start) * t
+            # Min-jerk, as frankapy's goto_joints and reset_joints are.
+            self.data.ctrl[:7] = start + (target - start) * _min_jerk(t)
 
         self._run(duration, ctrl)
         self._settle()

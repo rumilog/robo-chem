@@ -5,7 +5,9 @@ SAM only gives category masks ("white paper cup"). Scoop targets are cups
 sitting on labelled paper squares (CITRIC ACID, BAKING SODA, …). This module:
 
   1. Takes every cup instance from the grounding service
-  2. Asks GPT-4o which label sits under each numbered cup (one call per camera)
+  2. Asks the VLM which label sits under each cup (one cropped call per cup;
+     the agents' strong tier, gpt-4.1 unless configured). Given the bench's
+     labels, it chooses among them instead of transcribing
   3. Picks the instance whose label fuzzy-matches the requested reagent name
 
 Skills then fuse that cup's mask in 3D the same way as any other object.
@@ -111,6 +113,10 @@ def normalize_label(text: str) -> str:
         return ""
     t = text.lower().strip()
     t = re.sub(r"[^a-z0-9]+", " ", t)
+    # "10ML" and "10 ml" are the same label. The bench's handwritten labels
+    # spell it both ways, and a read of "A 10ML WATER" left "10" and "ml"
+    # unmatched against a request for "a 10 ml water".
+    t = re.sub(r"(?<=[0-9])(?=[a-z])|(?<=[a-z])(?=[0-9])", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
 
@@ -334,15 +340,35 @@ def _paper_sheet_box(image_bgr: np.ndarray, x1, y1, x2, y2):
     d = int(min(h, y2 + 3.0 * bh))
     if b - a < 4 or d - c < 4:
         return None
-    roi = image_bgr[c:d, a:b]
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    white = ((hsv[:, :, 1] < 70) & (hsv[:, :, 2] > 145)).astype(np.uint8) * 255
+    hsv = cv2.cvtColor(image_bgr[c:d, a:b], cv2.COLOR_BGR2HSV)
+    # Bright paper only, barely bridged, first. With the sheets laid close
+    # and powder spilt between them (2026-10-08), the loose pass below joined
+    # a cup's sheet to its neighbours' into one blob of 66-80% of the search,
+    # which is refused: no sheet was found for cup B on any camera, the crop
+    # stayed tight, cut the "B" off its label, and B's cup was read
+    # "A 10 ML WATER" or "10 ML WATER". On the same frames this pass found a
+    # sheet for all 16 containers, and the reads went from about 8 of 16
+    # right to 13 of 16, with B read as B twice and A read as A 4 times.
+    # The loose pass stays as the fallback for dimmer light.
+    for s_max, v_min, kernel, rounds in ((50, 190, 5, 1), (70, 145, 9, 2)):
+        found = _sheet_in(hsv, s_max, v_min, kernel, rounds, a, c,
+                          (x1 - a, y1 - c, x2 - a, y2 - c))
+        if found is not None:
+            return found
+    return None
+
+
+def _sheet_in(hsv, s_max, v_min, kernel, rounds, a, c, box):
+    """The largest white blob under or overlapping ``box`` in ``hsv``, image coords, or None."""
+    white = ((hsv[:, :, 1] < s_max) & (hsv[:, :, 2] > v_min)).astype(np.uint8) * 255
     # Handwriting splits one sheet into several blobs. Bridge those gaps
     # without bridging the brown table between two sheets.
-    white = cv2.dilate(white, np.ones((9, 9), np.uint8), iterations=2)
+    white = cv2.dilate(white, np.ones((kernel, kernel), np.uint8), iterations=rounds)
     n, _labels, stats, _ = cv2.connectedComponentsWithStats(white, 8)
+    b = a + hsv.shape[1]
+    d = c + hsv.shape[0]
     search = float((b - a) * (d - c))
-    fx1, fy1, fx2, fy2 = x1 - a, y1 - c, x2 - a, y2 - c
+    fx1, fy1, fx2, fy2 = box
     best = None
     for i in range(1, n):
         area = int(stats[i, cv2.CC_STAT_AREA])
@@ -433,16 +459,68 @@ def crop_around_instance(image_bgr: np.ndarray, inst: dict,
     return crop
 
 
+def snap_to_candidates(reply: Optional[str],
+                       candidates: List[str]) -> Optional[str]:
+    """
+    The bench label a closed-set reply names, or None.
+
+    An exact match (case and spacing aside) is that label. A partial reply
+    counts only if it fits ONE label: "EMPTY" is "C EMPTY", but "10 ML WATER"
+    fits both A and B and is no answer. Anything else -- an invented label --
+    is None, so it can never be matched to a request.
+    """
+    if not reply:
+        return None
+    key = normalize_label(reply)
+    for cand in candidates:
+        if normalize_label(cand) == key:
+            return cand
+    fits = [c for c in candidates if labels_match(reply, c)]
+    return fits[0] if len(fits) == 1 else None
+
+
 def read_one_label_vlm(vlm_client, image_bgr: np.ndarray, inst: dict,
                        model: str = "gpt-4o",
-                       neighbours: Optional[List[dict]] = None) -> Optional[str]:
-    """Transcribe the label belonging to a single container."""
+                       neighbours: Optional[List[dict]] = None,
+                       candidates: Optional[List[str]] = None) -> Optional[str]:
+    """
+    Transcribe the label belonging to a single container.
+
+    With ``candidates`` (every label on the bench) the model chooses among
+    them instead of transcribing. Free transcription invented labels on the
+    real Magic Beaker bench on 2026-10-07 -- "A 10% NaOH", "ACETONE",
+    "B 0.1 M NaOH" -- and read "C EMPTY" as "C 10 ML WATER", the pattern of
+    its neighbours. Citric acid was read by 1 camera of 4 and C by none.
+    """
     crop = crop_around_instance(image_bgr, inst, neighbours=neighbours)
     if crop.size == 0:
         return None
     b64 = _encode_jpeg(crop)
 
-    prompt = """This crop shows ONE container, outlined in yellow, standing on or beside a
+    if candidates:
+        listed = "\n".join(f"  - {c}" for c in candidates)
+        prompt = f"""This crop shows ONE container, outlined in yellow, standing on or beside a
+white paper square with a handwritten label.
+
+The handwritten labels on this bench are exactly these, and no others:
+{listed}
+
+Which of them is on the paper the OUTLINED container is standing on?
+
+- The handwriting is frequently ROTATED, sideways or upside down. Read it at
+  whatever orientation it is written.
+- Labels differ by their leading letter (A, B, C) or their volume. Choose by
+  what is written on THIS paper, not by what the neighbours look like.
+- Read ONLY the paper the outlined container is standing on or directly
+  beside. Grey blocks are other containers; ignore them and any paper near
+  them.
+- If you cannot see this container's label, or it is none of the above,
+  return null. Never answer with a label that is not in the list.
+
+Return ONLY JSON, with the label copied exactly as listed: {{"label": "{candidates[0]}"}}  or  {{"label": null}}
+"""
+    else:
+        prompt = """This crop shows ONE container, outlined in yellow, standing on or beside a
 white paper square with a handwritten label.
 
 Transcribe that label COMPLETELY and VERBATIM.
@@ -489,7 +567,14 @@ Return ONLY JSON: {"label": "A 10 ML WATER"}  or  {"label": null}
     if lab is None:
         return None
     lab = str(lab).strip()
-    return None if (not lab or lab.lower() == "null") else lab
+    lab = None if (not lab or lab.lower() == "null") else lab
+    if lab is not None and candidates:
+        snapped = snap_to_candidates(lab, candidates)
+        if snapped is None:
+            print(f"[LabelResolver] reply {lab!r} is no single label on this bench; "
+                  f"treated as unread")
+        lab = snapped
+    return lab
 
 
 def _parse_cup_labels(text: str, n: int) -> List[Optional[str]]:
@@ -576,10 +661,17 @@ def pick_matching_instance(
         # higher-scoring mask here is a coin flip, and on 2026-09-21 it landed
         # on a cup 31cm away. Two masks of one cup (camera 2, 2026-09-25)
         # are not that case.
+        #
+        # So this camera answers nothing. It used to pick the higher score
+        # anyway, and on the real Magic Beaker bench (2026-10-07, four clear
+        # cups in a tight row) cam 3 read two cups as "A 10 ML WATER", the
+        # pick was the wrong one, and as a projection seed it carried cam 4
+        # with it: "clear cup a" came back 39 cm from where it stood.
         print(f"[LabelResolver] DUPLICATE: {len(matches)} containers all read "
               f"as {matches[0][1]!r}. Only one can be right — the crop has "
-              f"probably picked up a neighbouring label. Position from this "
-              f"camera is unreliable.")
+              f"probably picked up a neighbouring label. Not using this camera "
+              f"for {requested!r}.")
+        return None, None
 
     matches.sort(key=lambda t: t[2], reverse=True)
     inst, lab, _ = matches[0]
@@ -591,10 +683,19 @@ class LabelResolver:
     Resolve a reagent name to per-camera cup masks via SAM instances + VLM OCR.
     """
 
-    def __init__(self, vlm_client=None, model: str = "gpt-4o",
-                 per_instance: bool = True):
+    def __init__(self, vlm_client=None, model: Optional[str] = None,
+                 per_instance: bool = True,
+                 candidates: Optional[List[str]] = None):
         self.vlm_client = vlm_client
+        if model is None:
+            # The agents' strong tier (gpt-4.1 by default). This was pinned
+            # to gpt-4o, whose API shuts down on 2026-10-23.
+            from ..agents import config as agent_config
+            model = agent_config.strong_model()
         self.model = model
+        #: Every label on the bench, written as on the paper. When given, the
+        #: reader chooses among them rather than transcribing freely.
+        self.candidates = list(candidates) if candidates else None
         #: Read each container in its own cropped call. Default True.
         #:
         #: Measured on scene_captures/ab_water_20260921_102436, which has the
@@ -611,6 +712,45 @@ class LabelResolver:
         #: 3GB free, not this.
         self.per_instance = per_instance
 
+    def read_all(
+        self,
+        images: Dict[int, np.ndarray],
+        instances_by_cam: Dict[int, List[dict]],
+    ) -> Dict[int, List[Optional[str]]]:
+        """The label under every instance in every camera (None where unread)."""
+        if self.vlm_client is None:
+            from openai import OpenAI
+            self.vlm_client = OpenAI()
+
+        out: Dict[int, List[Optional[str]]] = {}
+        for cam_id, instances in instances_by_cam.items():
+            if cam_id not in images or not instances:
+                continue
+            try:
+                if self.per_instance:
+                    # One call per container: slower, but it cannot mis-assign
+                    # a label to the wrong cup, which reading the whole frame
+                    # at once demonstrably does.
+                    labels = [read_one_label_vlm(self.vlm_client, images[cam_id],
+                                                 inst, model=self.model,
+                                                 neighbours=instances,
+                                                 candidates=self.candidates)
+                              for inst in instances]
+                else:
+                    labels = read_labels_vlm(
+                        self.vlm_client, images[cam_id], instances, model=self.model
+                    )
+            except Exception as e:
+                print(f"[LabelResolver] cam {cam_id}: VLM label read failed: {e}")
+                continue
+
+            readable = [
+                f"{i}:{lab!r}" for i, lab in enumerate(labels) if lab
+            ]
+            print(f"[LabelResolver] cam {cam_id}: labels [{', '.join(readable) or 'none'}]")
+            out[cam_id] = labels
+        return out
+
     def resolve(
         self,
         images: Dict[int, np.ndarray],
@@ -626,39 +766,12 @@ class LabelResolver:
         Returns:
             (masks, confidences, observed_labels) for cameras that matched
         """
-        if self.vlm_client is None:
-            from openai import OpenAI
-            self.vlm_client = OpenAI()
-
         masks: Dict[int, np.ndarray] = {}
         confidences: Dict[int, float] = {}
         observed: Dict[int, str] = {}
 
-        for cam_id, instances in instances_by_cam.items():
-            if cam_id not in images or not instances:
-                continue
-            try:
-                if self.per_instance:
-                    # One call per container: slower, but it cannot mis-assign
-                    # a label to the wrong cup, which reading the whole frame
-                    # at once demonstrably does.
-                    labels = [read_one_label_vlm(self.vlm_client, images[cam_id],
-                                                 inst, model=self.model,
-                                                 neighbours=instances)
-                              for inst in instances]
-                else:
-                    labels = read_labels_vlm(
-                        self.vlm_client, images[cam_id], instances, model=self.model
-                    )
-            except Exception as e:
-                print(f"[LabelResolver] cam {cam_id}: VLM label read failed: {e}")
-                continue
-
-            readable = [
-                f"{i}:{lab!r}" for i, lab in enumerate(labels) if lab
-            ]
-            print(f"[LabelResolver] cam {cam_id}: labels [{', '.join(readable) or 'none'}]")
-
+        for cam_id, labels in self.read_all(images, instances_by_cam).items():
+            instances = instances_by_cam[cam_id]
             inst, lab = pick_matching_instance(instances, labels, requested_label)
             if inst is None:
                 print(f"[LabelResolver] cam {cam_id}: no cup matched "

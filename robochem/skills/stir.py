@@ -163,6 +163,13 @@ class StirSkill(BaseSkill):
             "probe_above_rim": 0.010,
             "probe_step": 0.002,
             "probe_seconds": 0.4,
+            # Through the open part of the container the steps are coarse;
+            # only the last fine_zone above the deepest target is felt at
+            # probe_step. Every step is its own motion plus a force read, and
+            # 1 mm all the way down a 47 mm cup (to_floor) took ~60 steps:
+            # the user found the descent too slow (2026-10-08).
+            "coarse_step": 0.005,
+            "fine_zone": 0.015,
             # After contact, rise this much before stirring, so the circle is
             # not dragged along whatever the rod touched.
             "contact_backoff": 0.003,
@@ -665,9 +672,13 @@ class StirSkill(BaseSkill):
               f"steps, stopping on a {stop_force:.1f}N change "
               f"(baseline {baseline:+.2f}N)")
 
+        coarse = max(step, float(params.get("coarse_step") or step))
+        fine_from = stir_z + float(params.get("fine_zone") or 0.0)
         z = z_from
         while z > stir_z + 1e-9:
-            z = max(stir_z, z - step)
+            # Coarse while a whole coarse step stays above the fine zone.
+            this_step = coarse if z - coarse >= fine_from else step
+            z = max(stir_z, z - this_step)
             probe[2] = z
             if not self.goto_pose_rigid(probe, rotation, duration=seconds):
                 return {"error": "Failed to command a descent step"}
@@ -685,7 +696,9 @@ class StirSkill(BaseSkill):
                 "contact_z": float(z),
                 "contact_tip_below_rim": float(tip_below_rim),
             }
-            if tip_below_rim <= 0.0:
+            # Felt within one step below the rim is the rim: the step that
+            # met it may have carried the commanded tip that far past it.
+            if tip_below_rim <= this_step + 0.0005:
                 felt["error"] = (f"The stirrer hit something at or above the "
                                  f"rim ({delta:+.2f}N with the tip "
                                  f"{-tip_below_rim * 1000:.0f}mm above it) — "

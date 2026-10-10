@@ -23,6 +23,19 @@ WORLD_FRAME = "world"
 # Named speeds mapped to goto_pose durations in seconds.
 SPEED_DURATIONS = {"slow": 6.0, "normal": 3.0, "fast": 1.5}
 
+# frankapy's FC.HOME_JOINTS, where reset_joints goes (the sim's is the same).
+HOME_JOINTS = np.array([0.0, -np.pi / 4, 0.0, -3 * np.pi / 4, 0.0, np.pi / 2, np.pi / 4])
+
+# libfranka faults that are about the command stream, not about touching
+# anything: a refused or cut-short trip home is retried once after these.
+RETRYABLE_ERRORS = ("discontinuity", "communication_constraints_violation")
+
+REFUSED_HINT = ("the robot refused the motion. frankapy ignores franka-interface "
+                "errors, so nothing else says so: check the franka-interface terminal. "
+                "If it says 'in collision with virtual walls', the arm is parked inside "
+                "franka-interface's walls and every motion from there is refused, a "
+                "restart included: guide it out by hand (white light, wrist buttons)")
+
 
 def _orthonormalize(rotation: np.ndarray) -> np.ndarray:
     """
@@ -72,6 +85,75 @@ def to_rigid_transform(pose) -> "RigidTransform":
         from_frame=FRANKA_TOOL_FRAME,
         to_frame=WORLD_FRAME,
     )
+
+
+#: Seconds a streamed path holds its last setpoint before the skill ends.
+STREAM_SETTLE_SECONDS = 0.5
+
+#: DO NOT USE on the robot as it stands. Tried 2026-10-08 for scoop's sweep and
+#: dump's carry/tip, to make the arm follow a streamed path as the sim does
+#: (frankapy's dynamic default is [600]*3 N/m + [50]*3 Nm/rad, and the scoop's
+#: roll ended 19 deg short with the TCP 13.4 mm off). With these values -- and
+#: a pose read inside the setpoint loop added in the same change -- the arm
+#: shook heavily through the scoop rehearsal. Dynamic mode passes 50 Hz
+#: setpoints straight through; stiffer springs turn each step into vibration.
+#: Kept only so the value is not tried again blind. Not passed by any skill.
+STREAM_TRACKING_IMPEDANCES = [1500.0, 1500.0, 1500.0, 150.0, 150.0, 150.0]
+
+
+def pose_error(actual, wanted):
+    """(metres, degrees, [dx, dy, dz]) from ``wanted`` to ``actual`` (RigidTransforms)."""
+    d = np.asarray(actual.translation, dtype=float) - np.asarray(wanted.translation, dtype=float)
+    R = np.asarray(actual.rotation, dtype=float).T @ np.asarray(wanted.rotation, dtype=float)
+    ang = float(np.degrees(np.arccos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0))))
+    return float(np.linalg.norm(d)), ang, d
+
+
+def dynamic_start_kwargs(seconds: float, cartesian_impedance: bool = False,
+                         stiffness=None) -> dict:
+    """The ``goto_pose`` keywords that open a streamed (dynamic) path."""
+    kwargs = {
+        "duration": float(seconds),
+        "dynamic": True,
+        # buffer_time generously longer than the path: the skill must not
+        # self-terminate before the last setpoint is consumed.
+        "buffer_time": float(seconds) + STREAM_SETTLE_SECONDS + 5.0,
+        "use_impedance": bool(cartesian_impedance),
+    }
+    if stiffness is not None:
+        kwargs["cartesian_impedances"] = [float(v) for v in stiffness]
+    return kwargs
+
+
+def resample_path_eased(path, mats, count: int):
+    """
+    ``count`` setpoints along a waypoint path, timed exactly as the sim times it.
+
+    frankapy's dynamic mode passes setpoints straight through
+    (PassThroughPoseTrajectoryGenerator): nothing smooths them. Evenly spaced
+    setpoints started the arm at full speed from rest and stopped it dead, and
+    on the robot (2026-10-07/08) dump's carry ended 22 mm short. The sim's
+    ``follow_pose_path`` has always run a path min-jerk over its waypoints,
+    each waypoint-to-waypoint segment given the same time; this is that
+    timing, so a streamed path moves on the robot as it does in the sim.
+
+    Returns (positions, rotations), lists of ``count``.
+    """
+    path = [np.asarray(p, dtype=float) for p in path]
+    mats = [np.asarray(m, dtype=float) for m in mats]
+    t = np.linspace(0.0, 1.0, int(count))
+    src = (t ** 3 * (10.0 - 15.0 * t + 6.0 * t ** 2)) * (len(path) - 1)
+    xyzs, rots = [], []
+    for u in src:
+        i = min(int(np.floor(u)), max(len(path) - 2, 0))
+        j = min(i + 1, len(path) - 1)
+        f = float(u - i)
+        xyzs.append((1.0 - f) * path[i] + f * path[j])
+        # Small angular steps between waypoints (5 deg or so on a scoop), so
+        # blending the matrices and re-orthonormalising is an adequate
+        # stand-in for a proper slerp.
+        rots.append(_orthonormalize((1.0 - f) * mats[i] + f * mats[j]))
+    return xyzs, rots
 
 
 def tool_y_delta(angle_degrees: float) -> np.ndarray:
@@ -593,6 +675,7 @@ class BaseSkill(ABC):
         """
         try:
             pose = self.get_current_pose()
+            before = np.asarray(pose.translation, dtype=float).copy()
             pose.translation = self._clamp_position(np.asarray(xyz, dtype=float))
             pose.rotation = _orthonormalize(np.asarray(rotation, dtype=float))
             self.robot.goto_pose(
@@ -601,6 +684,14 @@ class BaseSkill(ABC):
                 use_impedance=use_impedance,
             )
             self.wait(0.1)
+            after = np.asarray(self.get_current_pose().translation, dtype=float)
+            moved = float(np.linalg.norm(after - before))
+            if moved < 0.005 and float(np.linalg.norm(after - pose.translation)) > 0.05:
+                # 2026-10-08, step 25: the place hover "missed by 271 mm",
+                # which was the arm still standing where step 24's pour had
+                # left it -- franka-interface had gone "not ready" there.
+                print(f"[Safety] The arm did not move at all ({moved * 1000:.1f} mm): "
+                      f"{REFUSED_HINT}.{self.robot_fault()}")
             return True
         except Exception as e:
             print(f"Oriented motion failed: {e}")
@@ -608,7 +699,8 @@ class BaseSkill(ABC):
 
     def stream_pose_path(self, points, rotation, seconds: float,
                          rate_hz: float = 50.0, tag: str = "Skill",
-                         cartesian_impedance: bool = False) -> Tuple[bool, str]:
+                         cartesian_impedance: bool = False,
+                         stiffness=None) -> Tuple[bool, str]:
         """
         Run a path as ONE continuous frankapy skill, streamed at ``rate_hz``.
 
@@ -691,33 +783,25 @@ class BaseSkill(ABC):
         # because _circle_path already emits seconds*rate_hz points.
         wanted = max(2, int(round(float(seconds) * float(rate_hz))))
         if len(poses) < wanted:
-            src = np.linspace(0.0, len(poses) - 1, wanted)
-            dense = []
-            for u in src:
-                i = int(np.floor(u))
-                j = min(i + 1, len(poses) - 1)
-                f = u - i
-                xyz = (1.0 - f) * path[i] + f * path[j]
-                # Small angular steps between waypoints (5 deg or so on a
-                # scoop), so blending the matrices and re-orthonormalising is
-                # an adequate stand-in for a proper slerp.
-                R = _orthonormalize((1.0 - f) * mats[i] + f * mats[j])
-                dense.append(as_pose(xyz, R))
+            xyzs, rots = resample_path_eased(path, mats, wanted)
             print(f"[{tag}] Resampled {len(poses)} waypoints to {wanted} "
-                  f"setpoints so the path actually takes {seconds:.1f}s")
-            poses = dense
+                  f"setpoints so the path actually takes {seconds:.1f}s "
+                  f"(min-jerk, the sim's timing)")
+            poses = [as_pose(xyz, R) for xyz, R in zip(xyzs, rots)]
+        # Then hold the last setpoint. Dynamic mode is cartesian impedance,
+        # so the arm trails the setpoints; when the skill ends it stays where
+        # it got to. Without the hold, dump's carry on 2026-10-07 ended 22 mm
+        # short and was refused as not arrived.
+        hold = max(0, int(round(STREAM_SETTLE_SECONDS * float(rate_hz))))
+        poses = list(poses) + [poses[-1]] * hold
 
         dt = 1.0 / float(rate_hz)
         rate = rospy.Rate(float(rate_hz))
         published = 0
+
         try:
-            # buffer_time generously longer than the path: the skill must not
-            # self-terminate before the last setpoint is consumed.
             self.robot.goto_pose(
-                poses[0], duration=float(seconds), dynamic=True,
-                buffer_time=float(seconds) + 5.0,
-                use_impedance=bool(cartesian_impedance),
-            )
+                poses[0], **dynamic_start_kwargs(seconds, cartesian_impedance, stiffness))
             init_time = rospy.Time.now().to_time()
             for i, pose in enumerate(poses[1:], start=1):
                 timestamp = rospy.Time.now().to_time() - init_time
@@ -757,6 +841,15 @@ class BaseSkill(ABC):
                     except Exception:
                         pass
             self.wait(0.2)
+            # Read once, after the skill has ended: nothing may sit between
+            # setpoints in the loop above (see STREAM_TRACKING_IMPEDANCES).
+            try:
+                end = pose_error(self.get_current_pose(), poses[-1])
+                print(f"[{tag}] end of path: {end[0] * 1000:.1f}mm / {end[1]:.1f}deg "
+                      f"from the last setpoint (dx {end[2][0] * 1000:+.1f} "
+                      f"dy {end[2][1] * 1000:+.1f} dz {end[2][2] * 1000:+.1f} mm)")
+            except Exception:
+                pass
             return True, f"streamed {published + 1} setpoints over {seconds:.1f}s"
         except Exception as exc:
             # Never leave a dynamic skill running after an error.
@@ -871,6 +964,7 @@ class BaseSkill(ABC):
         try:
             target = to_rigid_transform(pose)
             target.translation = self._clamp_position(target.translation)
+            before = to_rigid_transform(self.robot.get_pose()).translation
             self.robot.goto_pose(
                 target, duration=SPEED_DURATIONS.get(speed, SPEED_DURATIONS["normal"])
             )
@@ -881,6 +975,16 @@ class BaseSkill(ABC):
                       f"{np.round(target.translation, 4)}, actual "
                       f"{np.round(actual, 4)} (err={err * 1000:.1f} mm, "
                       f"tol={reach_tol * 1000:.0f} mm).")
+                moved = float(np.linalg.norm(actual - before))
+                if moved < 0.005 and err > 0.05:
+                    # frankapy's goto_pose ignores errors by default: a skill
+                    # the robot refuses returns at once and the arm never
+                    # leaves. Twice on 2026-10-08, after a failed dump, every
+                    # pick "missed" its hover by 297 mm from home -- which
+                    # read as a reach problem and was not one.
+                    print(f"[Safety] The arm did not move at all ({moved * 1000:.1f} mm): "
+                          f"the robot refused the motion. Check the franka-interface "
+                          f"terminal; restart the control stack if it stays this way.")
                 return False
             if err > 0.01:
                 print(f"[PickUp] Reached within {err * 1000:.1f} mm of target "
@@ -1083,14 +1187,109 @@ class BaseSkill(ABC):
             print(f"Tool-axis rotation failed: {e}")
             return False
     
-    def go_home(self) -> bool:
-        """Move robot to home position."""
-        try:
-            self.robot.reset_joints()
-            return True
-        except Exception as e:
-            print(f"Go home failed: {e}")
+    def go_home(self, tol: float = 0.1, retry_wait: float = 2.0) -> bool:
+        """
+        Move robot to home position, and say False if it did not get there.
+
+        reset_joints returns normally when the robot refuses it. On 2026-10-08
+        franka-interface went "not ready" at the end of a pour's 90 deg tip and
+        refused the righting and the trip home after it; pour reported
+        success, and the next step failed 271 mm from where it thought the arm
+        was. ``tol`` (rad, any joint) leaves room for the sim's actuators; a
+        refused trip home is a radian or more out.
+        """
+        getter = getattr(self.robot, "get_joints", None)
+
+        def joints():
+            if getter is None:
+                return None
+            try:
+                q = np.asarray(getter(), dtype=float).ravel()[:7]
+            except Exception:
+                return None
+            return q if q.size == 7 else None
+
+        for attempt in (1, 2):
+            before = joints()
+            try:
+                self.robot.reset_joints()
+            except Exception as e:
+                print(f"Go home failed: {e}")
+                return False
+            q = joints()
+            if q is None:
+                return True
+            off = float(np.max(np.abs(q - HOME_JOINTS)))
+            if off <= tol:
+                return True
+            unmoved = before is not None and float(np.max(np.abs(q - before))) < 0.01
+            flags = self._error_flags()
+            timing = bool(flags) and all(any(t in f for t in RETRYABLE_ERRORS) for f in flags)
+            if attempt == 1 and (unmoved or timing):
+                # Refused without moving, or stopped by a timing fault only.
+                # franka-interface recovers from a motion error on its own in
+                # a second or two, and a command sent inside that window is
+                # refused: on 2026-10-08 a pick's lift ended in
+                # joint_velocity_discontinuity and the next step's trip home,
+                # sent 2 s later, was turned away (sub-task 9); the same after
+                # a stir's lift (sub-task 14). A reflex or safety flag (a
+                # collision) is never retried.
+                print(f"[Safety] reset_joints was refused or cut short "
+                      f"({'did not move' if unmoved else 'timing fault only'})."
+                      f"{self.robot_fault()} Waiting {retry_wait:.0f}s for "
+                      f"franka-interface to recover, then trying once more...")
+                self.wait(retry_wait)
+                continue
+            print(f"[Safety] reset_joints did not reach home (a joint is "
+                  f"{np.degrees(off):.0f} deg off): {REFUSED_HINT}.{self.robot_fault()}")
             return False
+        return False
+
+    def _error_flags(self) -> List[str]:
+        """libfranka's error flags set now (current and last motion); [] off the robot."""
+        arm = getattr(self.robot, "unpaced", self.robot)
+        try:
+            state = arm._state_client._get_current_robot_state().robot_state
+        except Exception:
+            return []
+        out = []
+        for group in ("current_errors", "last_motion_errors"):
+            flags = getattr(state, group, None)
+            out += [f for f in getattr(flags, "__slots__", ())
+                    if getattr(flags, f, False) is True]
+        return out
+
+    def robot_fault(self) -> str:
+        """
+        What franka-interface and libfranka report, as " ..." to append, or "".
+
+        frankapy drops these (``ignore_errors``), so a refused motion looks
+        like an unreachable target. The robot state still carries libfranka's
+        flags: on 2026-10-08 the 90 deg pour step ended in
+        ``last_motion_errors: cartesian_motion_generator_joint_acceleration_discontinuity``
+        and everything after it was refused. Empty in the sim.
+        """
+        arm = getattr(self.robot, "unpaced", self.robot)
+        found = []
+        try:
+            status = arm._get_current_franka_interface_status().franka_interface_status
+            if not status.is_ready:
+                found.append("franka-interface is not ready")
+            if status.error_description:
+                found.append(str(status.error_description))
+        except Exception:
+            pass
+        try:
+            state = arm._state_client._get_current_robot_state().robot_state
+            found.append(f"robot_mode {state.robot_mode}")
+            for group in ("current_errors", "last_motion_errors"):
+                flags = getattr(state, group, None)
+                on = [f for f in getattr(flags, "__slots__", ()) if getattr(flags, f, False) is True]
+                if on:
+                    found.append(f"{group}: {', '.join(on)}")
+        except Exception:
+            pass
+        return (" Robot reports: " + "; ".join(found)) if found else ""
     
     def wait(self, seconds: float):
         """Wait for specified duration."""
@@ -1100,10 +1299,13 @@ class BaseSkill(ABC):
         """
         External wrench on the end effector, base frame, or None.
 
-        frankapy reports this as the force the environment exerts ON the robot,
-        so pressing a held tool down onto something gives a positive Z. None
-        means this arm has no force reading at all, which callers must treat as
-        "cannot tell", never as "no contact".
+        On this cell, pressing a held tool down onto something reads a
+        NEGATIVE Z (measured 2026-10-05: the stirrer pressed into its holder
+        went to -96N from a -2.6N resting baseline). frankapy's docs suggest
+        the opposite, so callers detect contact by the SIZE of the change from
+        a resting baseline, never by its sign. None means this arm has no
+        force reading at all, which callers must treat as "cannot tell", never
+        as "no contact".
         """
         getter = getattr(self.robot, "get_ee_force_torque", None)
         if getter is None:
@@ -1116,7 +1318,9 @@ class BaseSkill(ABC):
         return wrench if wrench.shape == (6,) else None
 
     def ee_push_up_n(self) -> Optional[float]:
-        """Upward force the world is pushing back with, in newtons, or None."""
+        """World-Z external force, newtons, or None. Pressing down reads
+        NEGATIVE on this arm (see ee_wrench) despite the name -- compare
+        magnitudes of change, not signs."""
         wrench = self.ee_wrench()
         return None if wrench is None else float(wrench[2])
 
