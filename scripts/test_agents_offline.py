@@ -585,6 +585,181 @@ def test_a_pour_that_is_not_the_last_keeps_some():
           f"{outcome.record['steps'][1].get('adjusted')}")
 
 
+def test_a_container_put_down_between_its_pours_still_keeps_some():
+    """
+    60 then 90 even when the beaker is put down for another tool in between.
+    2026-10-15: the old rule stopped looking at the first put-down, and the
+    beaker's first pour ran at the planner's 80.
+    """
+    print("\n[loop: pour some, put it down, pour the rest]")
+    subtasks = [subtask("pick_up the plastic beaker"),
+                subtask("pour from plastic beaker into clear cup a at 80 degrees", "clear cup a"),
+                subtask("place the plastic beaker back to plastic beaker"),
+                subtask("pick_up the stirrer"),
+                subtask("stir clear cup a with the stirrer", "clear cup a"),
+                subtask("place the stirrer back to stirrer"),
+                subtask("pick_up the plastic beaker"),
+                subtask("pour from plastic beaker into clear cup b at 80 degrees", "clear cup b"),
+                subtask("place the plastic beaker back to plastic beaker")]
+    calls = [("pick_up", {"object_name": "plastic beaker"}),
+             ("pour", {"target_container": "clear cup a", "pour_angle": 80}),
+             ("place", {"target_location": "plastic beaker"}),
+             ("pick_up", {"object_name": "stirrer"}),
+             ("stir", {"target_container": "clear cup a"}),
+             ("place", {"target_location": "stirrer"}),
+             ("pick_up", {"object_name": "plastic beaker"}),
+             ("pour", {"target_container": "clear cup b", "pour_angle": 80}),
+             ("place", {"target_location": "plastic beaker"})]
+    responses = scoop_responses(
+        subtask_plan=plan_response(subtasks),
+        skill_call=lambda i, r: call_response(*calls[i % len(calls)]))
+    orchestrator, llm, skills = build(responses)
+    outcome = orchestrator.run("make the magic beaker")
+    pours = [p for n, p in skills.calls if n == "pour"]
+    check("the run succeeds", outcome.success, outcome.reason)
+    check("the beaker's first pour is 60 although it is put down before the next",
+          pours[0]["pour_angle"] == 60.0, f"{pours}")
+    check("its second and last pour is 90", pours[1]["pour_angle"] == 90.0, f"{pours}")
+    check("the record names the later pour",
+          "sub-task 8" in outcome.record["steps"][1]["adjusted"],
+          f"{outcome.record['steps'][1].get('adjusted')}")
+    check("a put-down for another tool is kept", len(skills.calls) == 9,
+          f"{[n for n, _ in skills.calls]}")
+
+
+def test_the_first_of_two_pours_into_one_cup_keeps_some():
+    """A, then B, into C: 65 then 90 (the user, 2026-10-15: first 60, then 65)."""
+    print("\n[loop: two cups into one]")
+    subtasks = [subtask("pick_up clear cup a"),
+                subtask("pour from clear cup a into clear cup c at 80 degrees", "clear cup c"),
+                subtask("place clear cup a back to clear cup a"),
+                subtask("pick_up clear cup b"),
+                subtask("pour from clear cup b into clear cup c at 80 degrees", "clear cup c"),
+                subtask("place clear cup b back to clear cup b")]
+    calls = [("pick_up", {"object_name": "clear cup a"}),
+             ("pour", {"target_container": "clear cup c", "pour_angle": 80}),
+             ("place", {"target_location": "clear cup a"}),
+             ("pick_up", {"object_name": "clear cup b"}),
+             ("pour", {"target_container": "clear cup c", "pour_angle": 80}),
+             ("place", {"target_location": "clear cup b"})]
+    responses = scoop_responses(
+        subtask_plan=plan_response(subtasks),
+        skill_call=lambda i, r: call_response(*calls[i % len(calls)]))
+    orchestrator, llm, skills = build(responses)
+    outcome = orchestrator.run("make the magic beaker")
+    pours = [p["pour_angle"] for n, p in skills.calls if n == "pour"]
+    check("the run succeeds", outcome.success, outcome.reason)
+    check("A into C at 65, B into C at 90", pours == [65.0, 90.0], f"{pours}")
+    check("the record says C is poured into again",
+          "poured into again at sub-task 5" in outcome.record["steps"][1]["adjusted"],
+          f"{outcome.record['steps'][1].get('adjusted')}")
+
+
+def test_a_put_down_and_pick_up_of_the_same_container_is_dropped():
+    """2026-10-15: place the beaker, pick it straight up again, between two pours."""
+    print("\n[plan: no needless put-down]")
+    subtasks = [subtask("pick_up the plastic beaker"),
+                subtask("pour from plastic beaker into clear cup a at 80 degrees", "clear cup a"),
+                subtask("place the plastic beaker back to plastic beaker"),
+                subtask("pick_up the plastic beaker"),
+                subtask("pour from plastic beaker into clear cup b at 90 degrees", "clear cup b"),
+                subtask("place the plastic beaker back to plastic beaker")]
+    calls = [("pick_up", {"object_name": "plastic beaker"}),
+             ("pour", {"target_container": "clear cup a", "pour_angle": 80}),
+             ("pour", {"target_container": "clear cup b", "pour_angle": 90}),
+             ("place", {"target_location": "plastic beaker"})]
+    responses = scoop_responses(
+        subtask_plan=plan_response(subtasks),
+        skill_call=lambda i, r: call_response(*calls[i % len(calls)]))
+    orchestrator, llm, skills = build(responses)
+    outcome = orchestrator.run("make the magic beaker")
+    ran = [n for n, _ in skills.calls]
+    pours = [p for n, p in skills.calls if n == "pour"]
+    check("the run succeeds", outcome.success, outcome.reason)
+    check("the beaker is held from one pour to the next",
+          ran == ["pick_up", "pour", "pour", "place"], f"{ran}")
+    check("the stored plan is the one that ran, numbered 1-4",
+          [s["index"] for s in outcome.record["plans"][0]["subtasks"]] == [1, 2, 3, 4],
+          f"{outcome.record['plans'][0]['subtasks']}")
+    check("the record says what was dropped",
+          "dropped sub-tasks 3-4" in " ".join(outcome.record.get("plan_edits") or []),
+          f"{outcome.record.get('plan_edits')}")
+    check("still 60 then 90", [p["pour_angle"] for p in pours] == [60.0, 90],
+          f"{pours}")
+
+    from robochem.agents.planner import Plan, SubTask
+    from robochem.orchestrator.agent_orchestrator import drop_needless_regrasps
+    moved = Plan(goal="g", subtasks=[
+        SubTask(1, "pick_up the plastic beaker"),
+        SubTask(2, "place the plastic beaker at the centre of the bench"),
+        SubTask(3, "pick_up the plastic beaker")])
+    check("a put-down somewhere else is kept",
+          drop_needless_regrasps(moved) == [] and len(moved.subtasks) == 3)
+
+
+def test_the_bench_is_photographed_after_each_pour():
+    """2026-10-15: the report found B empty and could not say it had turned blue."""
+    print("\n[loop: photos after each pour]")
+    subtasks = [subtask("pick_up the plastic beaker"),
+                subtask("pour from plastic beaker into clear cup a", "clear cup a"),
+                subtask("pour from plastic beaker into clear cup b", "clear cup b"),
+                subtask("place the plastic beaker back to plastic beaker")]
+    calls = [("pick_up", {"object_name": "plastic beaker"}),
+             ("pour", {"target_container": "clear cup a", "pour_angle": 60}),
+             ("pour", {"target_container": "clear cup b", "pour_angle": 90}),
+             ("place", {"target_location": "plastic beaker"})]
+    taken = []
+
+    def snapshot(subtask, call):
+        taken.append(subtask.index)
+        if subtask.index == 3:
+            raise RuntimeError("cam 4 did not stream")
+        return [f"/tmp/s{subtask.index:02d}_{call.skill}_cam{c}.jpg" for c in (2, 3)]
+
+    responses = scoop_responses(
+        subtask_plan=plan_response(subtasks),
+        skill_call=lambda i, r: call_response(*calls[i % len(calls)]))
+    orchestrator, llm, skills = build(responses, snapshot=snapshot)
+    outcome = orchestrator.run("make the magic beaker")
+    steps = outcome.record["steps"]
+    check("photographed after each pour and nothing else", taken == [2, 3], f"{taken}")
+    check("the paths are in the pour's step record",
+          steps[1]["photos"] == ["/tmp/s02_pour_cam2.jpg", "/tmp/s02_pour_cam3.jpg"]
+          and steps[0]["photos"] == [], f"{[s['photos'] for s in steps]}")
+    check("a failed snapshot does not stop the run",
+          outcome.success and steps[2]["photos"] == [], outcome.reason)
+
+
+def test_the_operator_can_change_a_parameter_at_the_step_prompt():
+    """--step: "pour_angle=60" changes the call and is recorded."""
+    print("\n[loop: --step parameter change]")
+    from robochem.orchestrator.agent_orchestrator import parse_step_overrides
+
+    check("key=value is read as JSON",
+          parse_step_overrides("pour_angle=60 to_floor=false") ==
+          {"pour_angle": 60, "to_floor": False})
+    check("quoted text is kept whole",
+          parse_step_overrides("target_container='clear cup b'") ==
+          {"target_container": "clear cup b"})
+    check("prose is not a change", parse_step_overrides("60 degrees") == {})
+
+    def confirm(subtask, call):
+        if call.skill == "dump":
+            call.params.update(parse_step_overrides("dump_angle_deg=60"))
+        return True
+
+    orchestrator, llm, skills = build(scoop_responses(), confirm=confirm)
+    outcome = orchestrator.run("scoop citric acid into the white paper cup")
+    dumps = [p for n, p in skills.calls if n == "dump"]
+    step = outcome.record["steps"][2]
+    check("the changed value is what ran", dumps and dumps[0].get("dump_angle_deg") == 60,
+          f"{dumps}")
+    check("the record shows the value that ran", step["params"].get("dump_angle_deg") == 60,
+          f"{step['params']}")
+    check("and says the operator changed it", "operator" in (step.get("adjusted") or ""),
+          f"{step.get('adjusted')}")
+
+
 def test_dry_run_moves_nothing():
     print("\n[loop: dry run]")
     orchestrator, llm, skills = build(scoop_responses(), dry_run=True)
@@ -785,6 +960,221 @@ def test_a_dropped_tool_shows_up_as_a_disagreement():
           "larger spoon" in orchestrator._held_description())
 
 
+class _ToolFn:
+    def __init__(self, name, args): self.name, self.arguments = name, json.dumps(args)
+
+
+class _ToolCall:
+    def __init__(self, i, name, args):
+        self.id, self.type, self.function = f"call_{i}", "function", _ToolFn(name, args)
+
+
+class _ToolMessage:
+    def __init__(self, content=None, tool_calls=None):
+        self.content, self.tool_calls = content, tool_calls
+
+
+class ToolFakeLLM:
+    """
+    A model that uses tools: each scripted turn is either
+    ``{"tool_calls": [(name, args), ...]}`` or ``{"final": {...}}``.
+    """
+
+    def __init__(self, script):
+        self.script, self.requests, self.chat = list(script), [], _Chat(self)
+
+    def _respond(self, request):
+        # A snapshot: the caller keeps appending to the same message list.
+        self.requests.append(dict(request, messages=list(request["messages"])))
+        turn = self.script.pop(0)
+        if "tool_calls" in turn:
+            calls = [_ToolCall(i, n, a) for i, (n, a) in enumerate(turn["tool_calls"])]
+            return _Completion([_Choice(_ToolMessage(None, calls))])
+        return _Completion([_Choice(_ToolMessage(json.dumps(turn["final"]), None))])
+
+
+class FakeBenchCamera:
+    """The report writer's cameras: overview photos and close-ups of one object."""
+    color_order = "rgb"
+    cameras = [2, 3, 4, 5]
+
+    def __init__(self):
+        self.looked, self.photographed = [], 0
+
+    def names(self):
+        return ["clear cup a", "clear cup b"]
+
+    def photos(self, cameras=None):
+        self.photographed += 1
+        return [(c, np.full((48, 64, 3), 100, dtype=np.uint8)) for c in (cameras or self.cameras)]
+
+    def close_up(self, name, views=2):
+        self.looked.append(name)
+        return (f"'{name}' located at x 0.425 m, y -0.159 m; close-ups from cameras [3, 4].",
+                [(3, np.full((32, 32, 3), 200, dtype=np.uint8)),
+                 (4, np.full((32, 32, 3), 210, dtype=np.uint8))])
+
+
+def _image_count(content):
+    return sum(1 for b in content if isinstance(b, dict) and b.get("type") == "image_url") \
+        if isinstance(content, list) else 0
+
+
+def test_the_report_covers_every_session():
+    """A failed run and its resume make one report; the writer looks at what it needs."""
+    import tempfile
+    from robochem.agents.reporter import (load_run_chain, write_report, measurements,
+                                          latest_record, find_console_logs)
+    print("\n[report]")
+    tmp = Path(tempfile.mkdtemp())
+    first = {
+        "started": "2026-10-15 17:24:34", "goal": "Make the magic beaker",
+        "instruction": {"goal": "magic beaker", "steps": ["acid cup", "base cup"],
+                        "expected_outcome": "red in the acid cup, blue in the base cup"},
+        "scene": {"objects": [{"name": "clear cup a", "contents": "10 ml water"}]},
+        "plans": [{"subtasks": [{"index": 1, "description": "pick_up the larger spoon"}],
+                   "expected_observation": "cup a turns red"}],
+        "outcome": "failed", "reason": "sub-task 6 failed", "seconds": 400.0,
+        "steps": [
+            {"subtask_index": 1, "subtask": "pick_up the larger spoon", "skill": "pick_up",
+             "params": {"object_name": "larger spoon"}, "success": True, "reason": "",
+             "seconds": 59.3, "result": {"gripper_width": 0.0083,
+                                         "grasp_pose": [[1, 0, 0, 0.7]] * 4}},
+            {"subtask_index": 6, "subtask": "stir clear cup a", "skill": "stir",
+             "params": {"target_container": "clear cup a"}, "success": False,
+             "reason": "landing on the rim", "seconds": 20.0, "result": {}},
+        ],
+    }
+    second = {
+        "started": "2026-10-15 17:39:18", "goal": "Make the magic beaker",
+        "resumed_from": {"started": first["started"], "log_path": None, "from_step": 6},
+        "plans": first["plans"], "outcome": "success", "reason": "all done", "seconds": 300.0,
+        "steps": [{"subtask_index": 6, "subtask": "stir clear cup a", "skill": "stir",
+                   "params": {"target_container": "clear cup a"}, "success": True,
+                   "reason": "", "seconds": 90.0,
+                   "result": {"contact_force_n": -1.8876, "stopped_by_force": True}}],
+    }
+    (tmp / "agent_run_1.json").write_text(json.dumps(first))
+    (tmp / "agent_run_2.json").write_text(json.dumps(second))
+    # A later dry run (plans only) is not the experiment to report on.
+    (tmp / "agent_run_3.json").write_text(json.dumps(
+        {"started": "2026-10-15 18:00:00", "dry_run": True, "steps": [{"subtask_index": 1}]}))
+    newest = latest_record(tmp)
+    check("the newest record that moved the robot is found, dry runs skipped",
+          newest is not None and newest.name == "agent_run_2.json", str(newest))
+    records, paths = load_run_chain(newest)
+    check("the resume is chained back to the session it resumed",
+          [r["started"] for r in records] == [first["started"], second["started"]], paths)
+    # The console as tee kept it, with --step's prompt line.
+    (tmp / "pipeline.log").write_text("\n".join([
+        "[step 6] stir clear cup a",
+        "   [step 6] Enter to run it, q to stop here: [Skills] stir 'clear cup a': bench-validated",
+        "[ObjectLocalizer] opening cam 2...",
+        "[Stir] Lowering to z=0.1271 (rod tip 10mm above the rim)...",
+        "[Stir] Contact at z=0.1071: +1.00N from baseline, rod tip 10mm below the rim",
+        "   FAILED: landing on the rim",
+        "[failed] exhausted 0 corrective attempts",
+    ]))
+    logs = find_console_logs(tmp, records)
+
+    final = {
+        "title": "Magic beaker, first attempt", "summary": "The robot made the acid cup.",
+        "objective": "Show pH colours.", "materials": ["citric acid", "clear cup a"],
+        "procedure": "Sub-tasks 1-6 ran; 6 was resumed.",
+        "observations": [{"subject": "clear cup a", "observed": "red liquid", "source": "photos"}],
+        "result_vs_expected": "Cup a turned red as expected.",
+        "issues": [{"subtask": 6, "what_happened": "stir refused", "likely_cause": "landing on the rim"}],
+        "conclusion": "Partly done.", "next_steps": ["Run the base cup."]}
+    # The writer looks at cup a, then takes fresh views, then writes.
+    llm = ToolFakeLLM([{"tool_calls": [("look_at", {"object_name": "clear cup a"})]},
+                       {"tool_calls": [("photograph_bench", {"cameras": [3]})]},
+                       {"final": final}])
+    camera = FakeBenchCamera()
+    md = write_report(records, camera=camera, record_paths=paths, out_dir=tmp,
+                      model="fake-model", client=llm, console_logs=logs)
+    text = md.read_text()
+    first_request = llm.requests[0]
+    check("the writer starts from four overview photos and is offered the camera tools",
+          _image_count(first_request["messages"][1]["content"]) == 4
+          and {t["function"]["name"] for t in first_request["tools"]}
+          == {"look_at", "photograph_bench"})
+    check("it is told to write in English", "in English" in first_request["messages"][0]["content"])
+    check("look_at photographs the object it asked for",
+          camera.looked == ["clear cup a"] and camera.photographed == 2)
+    second_request = llm.requests[1]["messages"]
+    check("the result goes back as a tool message, the close-ups as a following image message",
+          any(m.get("role") == "tool" and "located at" in m.get("content", "")
+              for m in second_request)
+          and _image_count(second_request[-1]["content"]) == 2)
+    check("the close-ups are saved and shown in the report",
+          (md.parent / "closeup_01_clear_cup_a_cam3.jpg").is_file()
+          and "![clear cup a, camera 3](closeup_01_clear_cup_a_cam3.jpg)" in text
+          and "photo_01_cam3.jpg" in text)
+    check("what it looked at is listed",
+          "what the writer looked at" in text and "look_at(object_name=clear cup a)" in text)
+    check("the failure reaches the model", "landing on the rim" in json.dumps(first_request))
+    check("every executed step is in the table, the failed one marked",
+          text.count("| stir |") == 2 and "**FAILED**: landing on the rim" in text, text[:600])
+    check("the model's prose is in the report",
+          "The robot made the acid cup." in text and "red liquid" in text)
+    check("the failed step's own console lines reach the model and the appendix",
+          "Contact at z=0.1071: +1.00N" in json.dumps(first_request)
+          and "console lines of the failed steps" in text
+          and "opening cam 2" not in text.split("console lines of the failed steps")[1])
+    check("measured values reach the appendix, poses do not",
+          "contact_force_n = -1.8876" in text and "grasp_pose" not in text)
+    check("measurements keeps scalars and drops matrices",
+          measurements({"a": 1.23456, "grasp_pose": [[1]], "s": "x", "v": [1, 2, 3]})
+          == {"a": 1.2346, "s": "x", "v": [1.0, 2.0, 3.0]})
+
+    # The photos the run took after a pour reach the model before today's views,
+    # and are copied into the report.
+    import cv2
+    shots = tmp / "photos_20261015_173918"
+    shots.mkdir()
+    for cam in (2, 3):
+        cv2.imwrite(str(shots / f"s06_pour_cam{cam}.jpg"), np.full((24, 32, 3), 50, np.uint8))
+    poured = dict(second, steps=[dict(second["steps"][0], skill="pour",
+                                      subtask="pour from plastic beaker into clear cup b",
+                                      photos=[str(shots / "s06_pour_cam2.jpg"),
+                                              str(shots / "s06_pour_cam3.jpg"),
+                                              str(tmp / "gone" / "s06_pour_cam4.jpg")])])
+    llm3 = ToolFakeLLM([{"final": final}])
+    md3 = write_report([first, poured], camera=FakeBenchCamera(), out_dir=tmp,
+                       model="fake-model", client=llm3)
+    content3 = llm3.requests[0]["messages"][1]["content"]
+    texts3 = [b.get("text", "") for b in content3 if b.get("type") == "text"]
+    check("the run's photos go to the model with the step they follow, then today's",
+          _image_count(content3) == 2 + 4
+          and any("after sub-task 6" in t and "clear cup b" in t for t in texts3)
+          and texts3.index(next(t for t in texts3 if t.startswith("RUN PHOTOS")))
+          < texts3.index(next(t for t in texts3 if t.startswith("PHOTOS:"))), texts3)
+    check("a photo no longer on disk is skipped, the rest copied into the report",
+          (md3.parent / "run_s06_s06_pour_cam2.jpg").is_file()
+          and "run_s06_s06_pour_cam3.jpg" in md3.read_text())
+    check("the model is told what the run photos are for",
+          "RUN PHOTOS show each container as it was" in llm3.requests[0]["messages"][0]["content"])
+
+    # A writer that keeps asking is cut off and made to answer.
+    llm2 = ToolFakeLLM([{"tool_calls": [("look_at", {"object_name": "clear cup b"})]}] * 2
+                       + [{"final": final}])
+    write_report(records, camera=FakeBenchCamera(), out_dir=tmp, model="fake-model",
+                 client=llm2, max_tool_rounds=2)
+    check("after the last tool round the tools are withdrawn",
+          "tools" in llm2.requests[1] and "tools" not in llm2.requests[2])
+
+    # No cameras: one structured call, no tools.
+    llm3 = FakeLLM({"experiment_report": final})
+    md3 = write_report(records[1:], camera=None, out_dir=tmp, model="fake-model", client=llm3,
+                       notes=["step 6 was a false contact reading"])
+    check("with no cameras the report says so and no photo is sent",
+          "No photos were taken" in md3.read_text()
+          and llm3.calls_for("experiment_report")[0]["images"] == 0)
+    check("operator notes reach the model and are shown as given",
+          "false contact reading" in llm3.calls_for("experiment_report")[0]["user"]
+          and "## Operator notes" in md3.read_text())
+
+
 def test_the_record_is_serialisable():
     print("\n[loop: the trial record]")
     skills = RecordingSkills(results={
@@ -817,6 +1207,11 @@ def main():
     test_infeasible_is_reported_not_approximated()
     test_happy_path()
     test_a_pour_that_is_not_the_last_keeps_some()
+    test_a_container_put_down_between_its_pours_still_keeps_some()
+    test_a_put_down_and_pick_up_of_the_same_container_is_dropped()
+    test_the_first_of_two_pours_into_one_cup_keeps_some()
+    test_the_operator_can_change_a_parameter_at_the_step_prompt()
+    test_the_bench_is_photographed_after_each_pour()
     test_a_malformed_value_is_dropped_not_passed_on()
     test_dry_run_moves_nothing()
     test_step_mode_stops_where_the_operator_says()
@@ -827,6 +1222,7 @@ def main():
     test_the_measured_tool_offset_is_carried_forward()
     test_a_dropped_tool_shows_up_as_a_disagreement()
     test_the_record_is_serialisable()
+    test_the_report_covers_every_session()
 
     print("\n" + "=" * 60)
     print(f"{len(PASS)} passed, {len(FAIL)} failed")

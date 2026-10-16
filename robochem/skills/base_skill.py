@@ -910,6 +910,78 @@ class BaseSkill(ABC):
         err = float(np.linalg.norm(actual - np.asarray(target_xyz, dtype=float)))
         return err <= tol, err
 
+    def wait_until_ready(self, timeout: float = 5.0, poll: float = 0.2) -> bool:
+        """
+        Wait for franka-interface to report ready again; True at once off the robot.
+
+        After libfranka aborts a motion (a reflex, a discontinuity) the
+        interface spends about a second recovering, and every command sent
+        meanwhile is refused without a word (frankapy ignores errors). On
+        2026-10-15 a scoop's lift went out in that window, was refused, and
+        the arm was left standing in the dish.
+        """
+        arm = getattr(self.robot, "unpaced", self.robot)
+        getter = getattr(arm, "_get_current_franka_interface_status", None)
+        if not callable(getter):
+            return True
+        deadline = time.time() + float(timeout)
+        while True:
+            try:
+                if getter().franka_interface_status.is_ready:
+                    return True
+            except Exception:
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(poll)
+
+    def lift_out(self, height: float = 0.06, duration: float = 3.0,
+                 tag: str = "Skill", tries: int = 3) -> bool:
+        """
+        Straight up from wherever the tool is, its orientation kept: the way
+        out of a jam. Waits for the controller to be ready before each try,
+        so a command is not thrown away inside its recovery window.
+        """
+        start = np.asarray(self.get_current_pose().translation, dtype=float)
+        rotation = np.asarray(self.get_current_pose().rotation, dtype=float)
+        target = start + np.array([0.0, 0.0, float(height)])
+        for attempt in range(1, int(tries) + 1):
+            if not self.wait_until_ready(timeout=5.0):
+                print(f"[{tag}] franka-interface still not ready after 5s; trying anyway."
+                      f"{self.robot_fault()}")
+            self.wait(0.5)
+            self.goto_pose_rigid(target, rotation, duration=duration)
+            arrived, err = self.reached(target, 0.02)
+            if arrived:
+                print(f"[{tag}] Lifted straight out by {height * 1000:.0f}mm "
+                      f"(try {attempt}).")
+                return True
+            print(f"[{tag}] Lift-out try {attempt}/{tries} stopped {err * 1000:.0f}mm "
+                  f"short.{self.robot_fault()}")
+        return False
+
+    def goto_with_retry(self, xyz, rotation, duration: float, tol: float,
+                        use_impedance: bool = False, tag: str = "Skill") -> Tuple[bool, float]:
+        """
+        goto_pose_rigid, and once more if the arm stayed where it was: a
+        refusal while the controller recovers, not a target out of reach.
+        """
+        before = np.asarray(self.get_current_pose().translation, dtype=float)
+        self.goto_pose_rigid(xyz, rotation, duration=duration, use_impedance=use_impedance)
+        arrived, err = self.reached(xyz, tol)
+        if arrived:
+            return True, err
+        moved = float(np.linalg.norm(
+            np.asarray(self.get_current_pose().translation, dtype=float) - before))
+        if moved < 0.005:
+            print(f"[{tag}] The motion was refused (moved {moved * 1000:.1f}mm); waiting "
+                  f"for the controller and trying once more.{self.robot_fault()}")
+            self.wait_until_ready(timeout=5.0)
+            self.wait(0.5)
+            self.goto_pose_rigid(xyz, rotation, duration=duration, use_impedance=use_impedance)
+            arrived, err = self.reached(xyz, tol)
+        return arrived, err
+
     def capture_scene_image(self) -> np.ndarray:
         """Capture current scene image for verification."""
         return self.vision.capture_scene()[0]  # Return first camera

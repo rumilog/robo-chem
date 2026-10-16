@@ -92,6 +92,15 @@ class StirSkill(BaseSkill):
             "smooth": True,
             "seconds_per_revolution": 4.0,
             "stream_rate_hz": 50.0,
+            # Cartesian stiffness of the streamed circle, [x, y, z, rx, ry, rz]
+            # (N/m, Nm/rad). frankapy's dynamic mode is always cartesian
+            # impedance, by default 600 N/m on every axis, so joint friction
+            # that changes direction around the circle moves the height by
+            # millimetres. A stiffer z alone holds the height: z's setpoint
+            # is constant, so the 50 Hz setpoint steps that made an all-axis
+            # 1500 shake (2026-10-08, STREAM_TRACKING_IMPEDANCES) do not
+            # occur in z. None keeps frankapy's default.
+            "stream_stiffness": None,
             # Swing the tool's long axis from horizontal to straight down
             # before stirring. pick_up grasps a spoon lying FLAT — handle along
             # +X, away from the base — so without this the "stirrer" is held
@@ -518,14 +527,18 @@ class StirSkill(BaseSkill):
         streamed = False
         if smooth:
             print(f"[Stir] Tracing {revolutions} revolution(s), "
-                  f"{rev_seconds:.1f}s each, streamed at {rate_hz:.0f}Hz...")
+                  f"{rev_seconds:.1f}s each, streamed at {rate_hz:.0f}Hz"
+                  + (f", stiffness {params['stream_stiffness']}"
+                     if params.get("stream_stiffness") else "") + "...")
             streamed = True
             for rev in range(1, revolutions + 1):
                 path = self._circle_path(center, radius, stir_z,
                                          rev_seconds, rate_hz)
+                stiffness = params.get("stream_stiffness")
+                extra = {"stiffness": stiffness} if stiffness else {}
                 ok, msg = self.stream_pose_path(path, rotation,
                                                 seconds=rev_seconds,
-                                                rate_hz=rate_hz, tag="Stir")
+                                                rate_hz=rate_hz, tag="Stir", **extra)
                 if not ok:
                     print(f"[Stir] Smooth trace unavailable ({msg}); "
                           f"falling back to waypoints")
@@ -682,6 +695,11 @@ class StirSkill(BaseSkill):
             probe[2] = z
             if not self.goto_pose_rigid(probe, rotation, duration=seconds):
                 return {"error": "Failed to command a descent step"}
+            if this_step > step:
+                # A coarse step moves fast; read the force once the arm has
+                # settled. Read at once after a 20 mm step in 0.4 s, it rose
+                # +1.00 N in free air and was refused as a rim hit (2026-10-15).
+                self.wait(0.15)
             delta = self.mean_push_up_n() - baseline
             if abs(delta) <= stop_force:
                 continue

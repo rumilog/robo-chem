@@ -60,7 +60,7 @@ def main() -> int:
     vision.object_localizer.camera_ids = list(args.cameras)
     fa = FrankaArm()
     # Any skill gives locate_container: the rim centre and top every skill aims at.
-    probe = DumpSkill(fa, vision, {"workspace_min": [0.25, -0.40, -0.13], "table_z": 0.0})
+    probe = DumpSkill(fa, vision, {"workspace_min": [0.25, -0.40, -0.13], "table_z": vision.table_z})
 
     def go(xyz, seconds=5.0):
         pose = fa.get_pose()
@@ -68,9 +68,11 @@ def main() -> int:
         pose.rotation = DOWN
         fa.goto_pose(to_rigid_transform(pose), duration=seconds, use_impedance=False)
         got = np.asarray(fa.get_pose().translation, dtype=float)
-        off = float(np.linalg.norm(got - np.asarray(xyz, dtype=float)))
-        if off > 0.005:
-            print(f"   (arm stopped {off * 1000:.1f} mm from the command)")
+        miss = (got - np.asarray(xyz, dtype=float)) * 1000
+        # Always shown: a few mm here and the offset read at the fingertips
+        # is the arm's, not perception's.
+        print(f"   arm reached ({miss[0]:+.1f}, {miss[1]:+.1f}, {miss[2]:+.1f}) mm "
+              f"from the command (x + away from the base)")
 
     rows = []
     fa.reset_joints()
@@ -88,11 +90,13 @@ def main() -> int:
         top = float(located["top_z"])
         # The rim reads low on the cage (16 mm for the 29 mm dish): use the
         # bench's known height when there is one, so the fingers stay clear.
+        # Heights are above the table, which is at vision.table_z (-11.2 mm),
+        # not 0; until 2026-10-10 this hovered 11 mm higher than asked.
         known = None
         if obj is not None:
             known = obj.height or dict(obj.scoop).get("container_height")
         if known:
-            top = max(top, float(known))
+            top = max(top, vision.table_z + float(known))
         hover = np.array([centre[0], centre[1], top + float(args.above)])
         print(f"   perceived centre ({centre[0]:.4f}, {centre[1]:+.4f}), top z {top:.4f} "
               f"[{located.get('rim_method', '')}; cams {located.get('cameras')}]")

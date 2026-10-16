@@ -1,6 +1,6 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-10-08
+Last updated: 2026-10-15
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
@@ -143,7 +143,7 @@ python scripts/run_experiment.py --skill pour \
 | Scoop via the text prompt `"white plastic tool"` | The live path again (see below). Partial on the 2026-09-18 sweep: cam5 the whole tool, cam2 the handle only |
 | Exemplar matching (`exemplars/`, DINOv2 + SAM-vit-base) | Measured 0.95-1.00, **not loaded**. Opt-in with `--exemplars exemplars` |
 | Sequential RealSense capture (cams 2–5, one at a time) | Working — avoid streaming all four at once (USB wedge) |
-| Live factory intrinsics + board-free cube extrinsic calib | Working (~3–6 mm held-out) |
+| Live factory intrinsics + board-free cube extrinsic calib | **Recalibrated 2026-10-10** (cube-model + table fit, `--level-table -0.0112 --cube-offset 0.0065 0`): cameras agree to 0-8 mm on flat paper (was up to 40), dish rims within 2.9 mm, table -10.1..-11.4 mm vs measured -11.2, fingertips centred in the clear cups by ruler. The Sep 4 "~3-6 mm held-out" hid a ~18 mm per-camera bias (see end of file) |
 | `pick_up` upright top grasp + reset_joints pre-scan | Working (beaker + spoon params above) |
 | `pour` tip toward/away base + stall detection + site offsets | Working with `forward_offset=-0.08` |
 | Smoke scripts | `scripts/smoke_test_skills.py`, `scripts/smoke_test_motion.py` |
@@ -2147,7 +2147,9 @@ C, place B back. That used the slide-in pick and the 58 mm `grip_width`.
 - **The beaker's first pour (into A, sub-task 23) now tips to 60, not 80**
   (the user: "turn that 80 into 60").
   - `POUR_KEEP_SOME_DEG` is 60. It caps a pour whose container pours again
-    before it is put down; B's pour, the beaker's last, stays 90.
+    before it is put down; B's pour, the beaker's last, stays 90. (Widened
+    2026-10-15 to "pours again anywhere later in the plan"; see the end of
+    this file.)
   - The catalog's cap sentence says 60. Its general advice ("about 80" for a
     partial pour) is unchanged. A version saying "about 60" lasted an hour.
     It was reverted because it would also have steered the model's free
@@ -2846,3 +2848,1099 @@ replans.**
   the depth this time.
 - The user moved the scoop to y -0.14 between runs; it was found and picked
   there.
+
+**Seeing the point cloud (2026-10-10): `scripts/view_pointcloud.py`.**
+- Read-only. One frame per camera, every 2nd pixel deprojected in colour
+  and moved to the base frame with the skills' extrinsics, cropped to the
+  bench box.
+- Writes `diag_out/pointcloud/pointcloud_<time>.ply` and a `.png`, then opens an Open3D
+  window. Needs the robot venv (py3.8 has open3d 0.19; perception_env does
+  not).
+- Options:
+  - `--objects NAME ...` paints what `vision.locate` returns for each, in its
+    own colour;
+  - `--per-camera` colours by camera, for a calibration check;
+  - `--video` renders a 120-frame turntable .mp4;
+  - `--no-show` skips the window.
+- First capture: about 270k bench points from the four cameras. Dishes,
+  papers, stirrer holder, cage posts and the hand at home are clear. **The
+  clear cups barely appear: depth passes through them**, which is why they
+  are placed by silhouette. The scoop, highlighted, sat where it lies.
+- Open3D's `ViewControl.rotate` drifted the turntable off level. The video
+  now re-aims the camera round the vertical axis each frame.
+- **What the viewer shows is not what locates objects.** Objects are found
+  from 2D masks (SAM, label reads). Only the masked pixels are deprojected,
+  each camera separately, and cameras that disagree are rejected before
+  fusing. Clear cups are triangulated from silhouettes, with no depth. The
+  viewer overlays every raw pixel of all four cameras, unfiltered. The user
+  found it "terrible, all messed up together".
+- **Measured from the same capture, 2026-10-10 (scratch `cam_agree.py`):**
+  - Bare-table patch (x 0.30-0.80, |y| < 0.35):
+    - cams 2/3/4/5 put the table at -12.7 / -11.5 / -11.9 / -13.2 mm:
+      agreeing within 2 mm, but **~12 mm below the `table_z` 0 the code
+      assumes**;
+    - tilts dz/dx 11.5 / 6.8 / 5.5 / **27.1** mm/m, dz/dy 4.9 / -6.6 /
+      -14.5 / -12.6 mm/m.
+  - White dishes, centroid of each camera's own masked depth: the same dish
+    lies **34-49 mm apart** across cameras in xy. Part is visibility (each
+    camera sees the near wall), part calibration.
+  - This is the likely common cause behind several bench offsets: scoop
+    z_offset -15..-25 mm (the table is 12 mm low), cup A -5 mm, dump 10 mm
+    back.
+  - The root fix is a recalibration (`scripts/calibrate_cameras.py`,
+    `validate_calibration.py`). Offered to the user, not done: every tuned
+    offset would need rechecking after it.
+
+**Why the fused cloud looks like a mess (2026-10-10, measured offline from
+`pointcloud_20261010_153342.ply` (`--per-camera`) and `..._153049.ply`
+(colour)).**
+- **Not the table, not flying pixels.** Each camera's own table plane:
+  - resid std 1.4-1.5 mm, 10-17 mm below z 0;
+  - the four planes agree within 1.6 mm at (0.55, 0) and ≤ 8 mm at the
+    corners;
+  - points with < 4 neighbours in 8 mm: 0.3-0.5 % per camera.
+  - The red/green/blue/yellow speckle on the table in `--per-camera` is that
+    1.5 mm noise interleaving. It is normal, not a calibration sign.
+- **Objects are shifted between cameras by centimetres.** Two independent
+  checks, same answer:
+  - ICP on object points, same-side pairs (fitness 0.91-0.98): 3→2
+    (+37, +3, -3) mm; 5→4 (-33, +13, +5) mm.
+  - **Flat white paper on the table** (no height step, no occlusion, no edge
+    veil, so visibility cannot explain it), best-IoU shift: 3→2 (+36, +4),
+    5→4 (-36, +4), 4→2 (+40, +20), 5→3 (-32, +16), 5→2 (+4, +20),
+    4→3 (+4, +4) mm.
+  - Pattern: **every camera puts things farther from itself**, about 18 mm
+    horizontally. Cameras opposite in x (2/3, 4/5) disagree by ~36 mm.
+    Every object therefore shows up as two to four offset copies.
+- How the colour PLY was split back into cameras: each camera's block is in
+  image raster order. So y/z in that camera's own frame never decreases;
+  the first decrease marks the next camera. This recovered blocks of
+  67210 / 70058 / 70642 / 64994 points.
+- **Likely root cause: the cube calibration bakes each camera's view of the
+  cube into its extrinsics.**
+  - `calibrate_cameras.py` pairs the TCP with the median of the cube's
+    *visible* surface.
+  - Each camera sees the 4 cm cube's top and the faces toward it. Its
+    "centre" therefore sits toward that camera and up, and Kabsch absorbs
+    this.
+  - The result: that camera's whole cloud is pushed away from it and down.
+  - Modelled (scratch `cube_bias.py`): 40 mm cube over the default sweep,
+    ±y faces hidden by the finger pads, real camera positions. It predicts:
+    - pushes of (+12, 0, -9) / (-9, +1, -11) / (-11, -1, -10) /
+      (+10, -1, -10) mm for cams 2/3/4/5;
+    - pairwise 3→2 +21, 5→4 -21, 5→2 +1, 4→3 +2 mm in x.
+  - **Sign and pattern match all six measured pairs, and the z push matches
+    the low table. The model gives ~60 % of the measured magnitude.**
+  - Probably the rest: the sweep only spans x 0.42-0.62, |y| ≤ 0.20,
+    **z 0.10-0.25**, so the table is extrapolated. Also the report's max
+    residuals of 16-21 mm on cams 2/4/5.
+  - Inferred, not proven on the robot.
+- What would fix it (not done, nothing changed):
+  - recalibrate with a view-independent centre: a ball with a sphere fit, a
+    tag, or the cube's centroid corrected by half a side along the ray;
+  - extend the sweep down to ~z 0.03 and wider in x/y;
+  - then recheck every bench offset that has been compensating for this.
+- Other things that add to the look but are secondary:
+  - depth passes through the clear cups;
+  - each camera sees only its own side of an object;
+  - exposure differs: the same table has median brightness 0.18-0.19 in
+    cams 2/3 against 0.28-0.34 in cams 4/5, so the colour view is a
+    patchwork.
+
+**Recalibration with a cube model (2026-10-10, code ready, not yet run on the
+robot).** The user chose to recalibrate and then reset the per-skill offsets.
+Only the green cube is available, **39.8 mm** (user's measurement).
+- Re-running the old solve would not have helped. The Sept 4 calibration was
+  fresh and still had the bias; the bias is in the method.
+- `robochem/vision/cube_calibration.py` (new): each camera's raw cube points
+  are fitted to a 39.8 mm cube centred on the TCP, jointly over all cameras
+  plus the cube's tilt in the grip. The old median + Kabsch solve is the
+  starting point.
+  - The cube-to-TCP offset cannot be solved from these data: shifting every
+    camera with it fits equally well. It moves all cameras together, so it
+    only shows as the table height.
+- `scripts/calibrate_cameras.py`:
+  - `--centre model` is the default; the median solve is always printed for
+    comparison.
+  - **Cameras are now captured one at a time** (`VisionSystem(cameras={})`).
+    The script used to stream all four together, which wedged USB on
+    2026-09-25.
+  - Default sweep is 48 poses: x 0.38-0.66, y ±0.25, **z 0.07-0.25** (was
+    27 poses, 0.42-0.62, ±0.20, 0.10-0.25). **The bench under it must be
+    clear.**
+  - Every sweep saves `calibration_out/observations_<time>.npy`.
+    `--from-observations` re-solves it with no robot.
+  - The report adds:
+    - per-camera table z (installed / median / new), from the last capture;
+    - the cube centre each camera implies at every pose vs the TCP;
+    - the per-pose gap between cameras.
+  - `--level-table Z` shifts all cameras together in z. Use it only if the
+    table really is at Z in the base frame. `REAL_TABLE_Z` 0 is an
+    assumption, never measured.
+- `scripts/test_cube_calibration.py` (new, offline, PASS). It renders the
+  cube as the four installed cameras would see it: finger pads hiding the
+  ±y faces, z-buffered per pixel, 1.5 mm noise, 5 % edge pixels.
+  - Table-point error per camera, median solve: **12-14 mm in xy, -3.5 to
+    -5.5 mm in z**. This reproduces the bench pattern.
+  - Cube model: **0.2-0.4 mm**. A 4° tilt in the grip comes back as 3.9°.
+- End-to-end through `--from-observations` on synthetic data, with the cube
+  10 mm above the TCP:
+  - the table read -9.5 mm on all four cameras;
+  - `--level-table 0` recovered the truth to 0.2-0.4 mm.
+- An earlier implied-centre diagnostic showed 30-50 mm outliers, from edge
+  pixels on corner views. Gating to points within 10 mm of the cube first
+  fixed it (max 6 mm). The calibration fit itself was never affected.
+- **First live attempt (2026-10-10, 16:12-16:15).**
+  - `--check` passed: all four cameras saw the cube at (0.513, 0.004,
+    0.158). Masks were 577-1456 px, with 302-1050 points, spread 10-14 mm.
+  - The `--skip-grasp` sweep then **segfaulted in librealsense** (dmesg:
+    `python: segfault ... in libc-2.31.so`, 16:15:25) about a minute in.
+    Nothing was saved: stdout through `tee` was block-buffered, and the
+    observations were only written at the end.
+  - The `usb 2-x: Failed to query (GET_CUR) UVC control 1 on unit 3: -32`
+    spam (~700 per camera) appears on **all four** cameras from 16:12:47,
+    including during the successful `--check`. It is noise from opening a
+    pipeline, not one bad camera.
+  - The four D415s sit on bus 2, ports 3/4/5/6, all at 5000 Mb/s.
+  - Changes made:
+    - observations are saved after every pose, and `--resume <npy>`
+      continues from there (mock-tested: crash at pose 4 of 8, resume
+      finished 4-8);
+    - `keep_cameras_alive` holds every opened camera object and pauses
+      0.3 s after each stop. This is a guess at the cause, not a proven fix.
+    - Run with `python -u` so the log keeps up.
+- **The table is 11.2 mm below the robot's base frame (user measured,
+  2026-10-10).** The bottom of the white Panda base, the link0 origin, sits
+  11.2 mm above the tabletop. So the real table is at **z = -0.0112**, not
+  the `REAL_TABLE_Z` 0.0 / `VisionSystem.table_z` 0.0 the code assumes.
+  - The old calibration's -10..-17 mm table was therefore mostly right in z.
+    Its error was the 36 mm between cameras.
+  - The skills aiming 11 mm high on the table fits the bench offsets they
+    needed: scoop z_offset -15..-25 mm against a floor taken as
+    `table_z` + 8 mm, and cup/beaker grasp z_offset -12 mm.
+  - Plan:
+    - install the recalibration with `--level-table -0.0112`;
+    - set `REAL_TABLE_Z` / `table_z` to -0.0112 before re-tuning any offset
+      (not done yet).
+- **Second live sweep (2026-10-10 16:22-16:35, `python -u ... --skip-grasp`,
+  `calibration_out/observations_20261010_162214.npy`,
+  log `sweep_20261010.log`).** 48 poses, no segfault.
+  - Usable observations: cam 2 **32**, cam 3 **42**, cam 4 **44**, cam 5 **2**.
+  - **Cam 5 stopped delivering frames from pose 12 on**: 37 ×
+    `Frame didn't arrive within 5000`. It was still dead after the sweep.
+    `pyrealsense2 hardware_reset()` on serial 151322066932 brought it back
+    (it re-enumerated). Before it died, at the z 0.07 layer, cam 5's masks
+    were only 12-354 px. At `--check`'s z 0.16 it had 577 px.
+  - Cams 2/3/4, cube model, with the cube 2.1° off square in the grip:
+    - implied centre vs TCP: mean 2.4-2.8 mm, max 5.7-6.9 mm;
+    - surface rms 1.4-1.7 mm;
+    - gap between cameras per pose: median 4.3, max 8.7 mm.
+  - Old median solve on the same data: held-out mean 4.2 / 5.6 / 9.5 mm.
+  - Change from installed: cam 2 21.5 mm / 1.00°, cam 3 9.3 mm / 0.35°,
+    cam 4 8.8 mm / 0.51°.
+  - **Offline check on the 15:30 colour capture**, re-expressed with the new
+    extrinsics (scratch `eval_new.py`):
+    - flat paper shift 3→2 drops from **(+36, 0) to (+4, 0) mm**; 4→2 from
+      (+40, +20) to (+4, +4); 4→3 from (+4, +12) to (+4, 0). 4 mm is the
+      grid cell.
+    - Paper IoU as-is 0.44 → 0.65, which equals the best after shifting.
+    - New table z: -18.7 / -15.6 / -17.0 mm. Against the measured -11.2,
+      the cube centre sits ~6 mm above the TCP.
+  - Not installed yet: cam 5 still needs observations.
+  - Additions to `calibrate_cameras.py`:
+    - with a single `--cameras N`, that camera streams for the whole run
+      (never stopped), and 5 frames are drained before each capture;
+    - `--from-observations A.npy B.npy` merges sweeps. Valid only with the
+      cube in the same grip.
+  - Plan:
+    1. `--skip-grasp --cameras 5 --check`, then the cam-5 sweep, same grip;
+    2. merge, then `--level-table -0.0112 --apply`.
+  - My Bash sandbox cannot open the RealSense devices: enumeration hangs.
+    Running outside it was denied by the permission classifier, so the user
+    runs camera commands.
+- **Cam 5 re-sweep (16:50-16:55, `--skip-grasp --cameras 5`, same grip,
+  persistent stream, `observations_20261010_165047.npy`,
+  `sweep_cam5_20261010.log`).**
+  - 0 dropped frames. 41 usable observations, 7 masks too small.
+  - The first solve was garbage: median residual 124 mm, cube "23.8° off
+    square". **Two misdetections were the cause**: pose 31 had 43 points
+    0.59 m off; pose 44 was 1.9 m off. The other 39 sat within 5-19 mm of
+    where the old calibration put the cube. Frame lag was ruled out: pairing
+    with pose i-1 or i-2 fits worse.
+  - The median solve now drops observations above max(30 mm, 4× median
+    residual) and refits, up to 3 rounds. It dropped exactly those two.
+- **Table in the fit.** With `--level-table Z`, each camera's bare-table
+  points (from the sweep's last capture, 3000 per camera) are held at Z in
+  the joint fit. The cube's height above the TCP becomes a fitted parameter:
+  **+5.0 mm**.
+  - Independent check on the 15:30 colour capture, which was not in the fit:
+
+    | | table z, cams 2/3/4/5 (mm) | spread | paper shifts |
+    | --- | --- | --- | --- |
+    | installed (Sep 4) | -12.6 / -12.0 / -13.3 / -13.6 | 1.6 | up to (+40, +20) mm |
+    | cube only, then leveled | -13.6 / -8.0 / -9.1 / -13.1 | 5.6 | 0-4 mm |
+    | **cube + table (chosen)** | **-10.8 / -11.3 / -11.6 / -9.9** | **1.7** | 0-8 mm (one pair 8, rest ≤ 4) |
+
+  - Tilts with cube + table: ≤ 8.5 mm/m, against up to 19 mm/m installed.
+  - The cube fit itself loosens slightly: implied-centre mean 2.3-3.4 mm
+    (was 1.9-2.7); per-pose gap median 5.4 mm (was 4.2).
+- **Staged, not yet installed** (`calibration_out/`,
+  `solve_merged_20261010.log`). Change from installed: cam 2 22.7 mm /
+  0.68°, cam 3 9.8 / 0.28, cam 4 10.6 / 0.65, cam 5 21.6 / 0.67.
+  Reproduce with:
+  `python scripts/calibrate_cameras.py --from-observations calibration_out/observations_20261010_162214.npy calibration_out/observations_20261010_165047.npy --level-table -0.0112`
+
+**Installed and verified (2026-10-10 17:05).**
+- `--install-only` installed the staged cube + table solve. The previous
+  extrinsics are in `calib/Past_Calibrations/backup_20261010_170502`.
+- Fresh capture `diag_out/pointcloud/pointcloud_20261010_170527.ply`, bench
+  partly restored:
+  - table z: -10.8 / -11.0 / -11.4 / -10.1 mm (cams 2/3/4/5), tilts
+    ≤ 6.7 mm/m;
+  - flat-paper shifts 0-8 mm. 4→3 showed (0, -20), but its IoU was flat
+    (0.40 as-is = 0.40 best), so that pair saw too little shared paper to
+    judge;
+  - **dish rim circle per camera (rim-top band z 10-24 mm): the four
+    centres within 2.9 mm of their mean**, 65-85 % inliers. The same check
+    with the old calibration on the 15:30 capture: 15.1 and 17.6 mm on two
+    dishes, cams 2/5 against 3/4 about 28 mm apart in x, 21-38 % inliers.
+  - Point-to-point ICP between opposite-side cameras on object points
+    drifted to (+14, +72, -40) mm with fitness 0.94. It contradicts the
+    1.3 mm table agreement: opposite cameras see different walls of each
+    dish. **Do not use cross-side ICP as a calibration check.**
+- **Table height is now -0.0112 everywhere on the real cell.**
+  - `robochem.vision.REAL_TABLE_Z` feeds `VisionSystem.table_z`, which is
+    where clear cups stand when rebuilt.
+  - `run_experiment.py` now imports it; `point_at.py` passes
+    `vision.table_z`.
+  - Why it matters now: scoop's floor and pick's held-container bottom
+    accept the table only when base_z - table_z is within -5..+12 mm. With
+    the new calibration, base_z reads about -8..-5 mm. Against table_z 0
+    that falls outside the window, so the floor would have fallen back to
+    base_z.
+- **Bench offsets reset to 0** for re-tuning (`bench_manifest.py`; the old
+  values are kept in its comments):
+
+  | constant | was |
+  | --- | --- |
+  | `DISH_SCOOP_Z_OFFSET` | -0.025 |
+  | `DUMP_FORWARD_OFFSET` | -0.010 |
+  | `CUP_A_LATERAL_OFFSET` | -0.005 |
+  | `CLEAR_CUP_GRASP_Z_OFFSET` | -0.012 |
+  | `BEAKER_GRASP_Z_OFFSET` | -0.012 |
+
+  - The cups' -12 mm is most likely exactly the old table_z error: the cup
+    model stood on z 0, while the table is at -11.2.
+  - **Kept**, because they are not calibration:
+    - the scoop pick's `forward_offset` -0.010 (crank geometry);
+    - `STIR_RADIUS` / `STIR_WALL_CLEARANCE` and the impedance shrink;
+    - `DUMP_MIN_TIP_DEG`, `sweep_mode`, cup `slide_in` / `grip_width`.
+  - The pipeline commands' `lateral_offset` / `forward_offset` values for
+    dump and stir, earlier in this file, were tuned on the old calibration.
+    Drop them when re-testing.
+  - Dump's forward offset may partly come back: the streamed carry
+    overshoots 11.9 mm in free air, which no calibration fixes.
+- Tests:
+  - `test_agents_offline.py` 90/90.
+  - `test_skills_offline.py` **must run in perception_env**:
+    `perception_env/bin/python scripts/test_skills_offline.py`.
+    - There it gives 421 passed, 2 failed: the 2 long-known scoop
+      workspace-floor checks.
+    - In the robot venv, 39 tests raise `TypeError ... 'FakePose'`. The test
+      doubles subclass a stub RigidTransform, but that venv has the real
+      autolab_core, so `to_rigid_transform`'s isinstance check fails.
+    - An earlier note here called the suite "broken at HEAD"; that was this
+      environment mix-up.
+- **First bench check with `point_at.py` after the recalibration
+  (2026-10-10).**
+  - On every object the user checked, **the fingertips stopped 3-5 mm toward
+    the base** from the true centre. That is one shift everywhere:
+    perception reads x ~4 mm low.
+  - Likely cause: the cube sat ~4 mm forward of the TCP along the pads. The
+    sweep cannot see that offset (assumed 0 in xy), and it moves every
+    camera alike.
+  - Not excluded: the arm stopping short. `point_at` only warned above 5 mm.
+    It now always prints the reached-minus-commanded offset in x/y/z.
+  - Fix: `calibrate_cameras.py --cube-offset DX DY` moves every camera by
+    (DX, DY) after the fit. The cube + table solve was re-staged with
+    `--cube-offset 0.004 0` (`solve_merged_20261010_offset.log`). Its only
+    difference from the installed one is +4.0 mm in x on all four cameras,
+    rotations identical.
+  - The terminal output of that point_at run was not kept.
+- **Second point_at check, after installing `--cube-offset 0.004 0`
+  (17:37, backup `backup_20261010_173751`).**
+  - The user read the fingertips "still ~5 mm toward the base".
+  - `arm reached` was within ±0.3 mm of the command in x on every move, so
+    the arm is not the cause.
+  - The reading did not move with the 4 mm shift: 3-5 mm before, ~5 after.
+    So the reading itself is suspect. Hovering 5 cm above the object,
+    **a 5° off-vertical view shifts the apparent position ~4 mm**. Viewed
+    from the bench front, the fingertips appear displaced toward the base.
+  - Next measurement, no parallax: fingertips 5 mm *below* the rim inside
+    clear cups A/B/C (`--above -0.005`), then ruler the gap to the wall on
+    the base side and the far side; offset = (far - base) / 2.
+  - **Bug fixed in `point_at.py`**: it took the bench height (47.3 mm cup,
+    29 mm dish) as an absolute z, ignoring `table_z`. Every hover sat 11 mm
+    higher than `--above` said. It now uses `vision.table_z + height`.
+- **Inside-the-cup measurement (2026-10-10, `--above -0.005`, +4 mm
+  installed).** Cup A: wall gap 26.8 mm on the base side, 32.1 mm on the far
+  side. So the fingertips sit **2.65 mm toward the base**, and the total x
+  correction would be ~+6.5 mm.
+  - Waiting for cups B and C before changing anything. Cup A's centre has
+    been odd before (it needed its own -5 mm lateral offset on 2026-10-08).
+- Cups B and C read the same as A, ~2.7 mm toward the base. That is one
+  global offset. Re-staged with **`--cube-offset 0.0065 0`**
+  (`solve_merged_20261010_offset65.log`): +2.5 mm in x on every camera
+  over the installed +4 mm, rotations unchanged. Next: install, then one
+  inside-the-cup check, expecting equal wall gaps (~29.5 mm each side on
+  A).
+  - Implied: during the sweep the cube centre sat ~6.5 mm forward of the
+    TCP along the pads.
+
+**Calibration done (2026-10-10 17:50).** Installed: cube + table solve with
+`--cube-offset 0.0065 0` (backup of the +4 mm version:
+`backup_20261010_175026`). Inside cup B at `--above -0.005`, the user read
+the fingertips **at the very centre**. Final command, reproducible with no
+robot:
+
+```bash
+python scripts/calibrate_cameras.py \
+  --from-observations calibration_out/observations_20261010_162214.npy calibration_out/observations_20261010_165047.npy \
+  --level-table -0.0112 --cube-offset 0.0065 0 --apply
+```
+
+- **To check absolute x/y on the bench, put the fingertips inside a clear
+  cup below the rim and ruler the wall gaps.**
+  - Reading by eye from 5 cm above was 3-5 mm off by parallax. It also did
+    not move when the calibration moved 4 mm.
+  - The cube-to-TCP offset in xy is invisible to the sweep. Expect to set
+    it this way after any future recalibration, unless the cube is placed
+    reproducibly.
+- y was not measured with the ruler, so `--cube-offset` y stays 0. The
+  earlier hover reads gave no left/right complaint.
+- Next: re-tune skills one at a time with the bench offsets at 0. Drop the
+  old pipeline `lateral_offset` / `forward_offset` params.
+- **All bench offsets now 0 (user's request, 2026-10-10).**
+  - Also the larger spoon's pick `forward_offset`, which was -0.010 and was
+    there to keep the jaws off the crank. If they land on the crank again,
+    put it back.
+  - Not offsets, so unchanged: `STIR_RADIUS`, `STIR_WALL_CLEARANCE`,
+    `DUMP_MIN_TIP_DEG`, `sweep_mode`, cup `slide_in` / `grip_width`, and
+    the tool geometry. tool_offset is measured at each pick.
+  - Skill test commands given to the user mirror the params of the 31/31 run
+    (`agent_run_20261008_221001.json`): names only, plus `to_floor` for
+    stir and `pour_angle` for pour. Everything else comes from the bench
+    manifest and the executor.
+  - `--step` only pauses agent runs (`--task` / `--instruction-image`). A
+    `--skill` chain runs straight through and stops at the first failure.
+- **First scoop test after the reset (2026-10-10, `--skill` chain, no log
+  saved).**
+  - The user: the scoop is still too high and needs ~25 mm more, at
+    `z_offset` 0.
+  - Not put back blindly. The table_z fix already moved the assumed floor
+    11 mm down, so -25 today digs 11 mm deeper than -25 on 2026-10-08.
+    Picks at a 40 mm jaws-to-bowl offset could press the bowl into the dish
+    floor under the position sweep.
+  - The depth error is mostly the per-pick jaws-to-bowl x offset: 40-56 mm
+    on 2026-10-08, ~1 mm of height per mm at the 60° dig. Camera
+    calibration does not fix it.
+  - The spoon pick's `forward_offset` moving -10 → 0 also moved the grasp
+    spot.
+  - Asked for the `[PickUp] Measured tool offset` and `[Scoop] Inside floor`
+    / `z_offset` / `Descending` lines before choosing a value.
+  - Real cure, still open: a repeatable grasp point on the handle.
+- **Scoop log from that run** (user-pasted):
+  - The cloud read the dish at `top z=0.0170, base z=0.0028`. The real rim
+    is -11.2 + 29 = 17.8 mm, so the top was right; the base was 14 mm above
+    the table.
+  - base_z - table_z = 14 mm is outside scoop's -5..+12 mm "on the table"
+    window, so the floor fell back to base_z + 8 mm = **0.0108**. The real
+    floor is about **-0.0032**: the whole dig ran 14 mm high.
+  - With the old calibration and table_z 0, the window passed (base_z read
+    -0.1..-1.5 mm), but the floor was then assumed 11 mm high. That explains
+    much of the -15..-25 mm the scoop needed before.
+  - The measured jaws-to-bowl offset was 34.6 mm (forward_offset now 0; the
+    ruler gave 52.9 at -10 mm).
+- **Fix (`scoop.py`):** with a known `container_height`, a container whose
+  measured top lies within 8 mm of `table_z + height` counts as on the
+  table, and the floor is `table_z + floor_thickness`. The base_z window
+  still works on its own.
+  - New test: `test_scoop_floor_from_the_table_when_the_base_reads_high`.
+  - Run in perception_env: the two new checks pass. The unchanged-path
+    check needed a 1 mm tolerance, since the synthetic cloud's 3rd
+    percentile is 3.3 mm, not 2.8 mm. Not re-run after the user asked to go
+    straight to the arm.
+- **`DISH_SCOOP_Z_OFFSET` = -0.011.** The user asked for 25 mm deeper:
+  14 mm comes from the floor fix and 11 mm from this offset. Not yet run on
+  the arm.
+- **Scoop run 18:19 (2026-10-10, `experiments/test_scoop.log`): the user
+  calls it "perfect".**
+  - Settings: `z_offset` -0.011 and the floor from the table "by its top".
+    The log line: `Inside floor z=-0.0142 (table z -0.0222 ... on the table
+    by its top) + 8 mm`. The table and floor are shown shifted by the
+    offset; the real floor is -0.0032.
+  - Measured jaws-to-bowl offset 35.7 / 5.3 mm (forward_offset 0).
+  - **The bowl reached the floor.** The compliant descent stopped 6.5 mm
+    above its command (2.7 mm the run before), and was +3.6 mm after
+    compensation. The position sweep ended 6.0 mm from its last setpoint
+    (x +4.3, y -1.2, ~4 mm in z).
+  - So -11 mm is the limit: do not go deeper. If the dish moves or scrapes,
+    use -0.008.
+  - Validated scoop on the new calibration:
+    `--skill pick_up --params '{"object_name":"larger spoon"}' --skill scoop
+    --params '{"powder_source":"baking soda cup"}'`, bench defaults as in
+    `bench_manifest.py`.
+- Dump in the same chain, before the user's verdict on it:
+  - carry end 11.1 mm from setpoint (dx -2.7, dy -6.0, dz +9.0);
+  - tip end 16.9 mm off (dx -16.5), "bowl 14.8 mm from over the target",
+    tip 76.1° (the streamed impedance path lags);
+  - `DUMP_FORWARD_OFFSET` is 0.
+- **Stir after the reset (2026-10-10, no log saved).** The user: the rod
+  "touches the bottom of the cup and moves the cup".
+  - Cause traced from the code and the 2026-10-08 record
+    (`agent_run_20261008_221001.json`).
+  - On 2026-10-08, stir A/B felt the floor at TCP z **0.0803** (-1.65 /
+    -1.07 N against the 1.0 N threshold) and stirred at 0.0843. The 1 mm
+    probe steps started at `stir_z + fine_zone` = 0.0773 + 0.015 =
+    **0.0923**, about 12 mm above the floor.
+  - With table_z -0.0112 the cup model's base, the to_floor aim (5 mm under
+    it) and the fine zone all moved 11.2 mm down. The fine zone then
+    started at ~**0.0798**, below where the floor is felt, so the rod met
+    the floor at the end of a 5 mm coarse step.
+  - **Fix: bench stir default `fine_zone` 0.026** (`STIR_FINE_ZONE`; 15 + 11.2
+    mm). The 1 mm steps start at ~0.0908 again. Not yet run on the arm.
+  - Side note from the same record: the floor felt at TCP 0.0803 puts the
+    CAD rod tip (`tool_length` 0.081) at -0.7 mm. The cup's inside floor
+    should be ~-8 mm (table -11.2 + ~3 mm base), so the real
+    `tool_length` is likely ~7 mm longer than the CAD. This does not matter
+    for to_floor, which stops on force.
+- **Stir with `fine_zone` 0.026 (18:26, `experiments/test_stir.log`).**
+  - Probing now works as on 2026-10-08: coarse steps to ~0.092, then
+    1 mm steps, contact at TCP z **0.0821** (-2.20 N), stir at 0.0861
+    (4 mm back off).
+  - **The rod still touched the bottom and moved the cup.** The user: "when
+    it stirs the height is not the same".
+  - The circle is streamed at 50 Hz under cartesian impedance. Each
+    revolution ended 5.7 mm off its setpoint (dx -5.1, dy -2.6,
+    dz -0.1). The log only shows the end of each revolution, not the z
+    excursion mid-circle.
+  - Today's streamed dump carry ended dz +9.0 mm off, so mm-level z swings
+    on a streamed path are expected. With the tip ~3-4 mm above the felt
+    floor, they reach it.
+  - Options put to the user, since this is a control-mode change:
+    - `smooth: false`: the existing blocking-waypoint path, position
+      controlled (`goto_pose_rigid` defaults to `use_impedance=False`),
+      12 points per revolution at 0.4 s. Constant height, slightly
+      stepped. The scoop's position sweep tracked to 0.3 mm.
+    - Keep streaming and raise `contact_backoff` 4 → 7 mm. The tip may
+      then sit above a 4.4 mm-deep 10 ml.
+  - **The user chose: keep streaming, 3 mm higher.** Bench stir default
+    `contact_backoff` 0.007 (`STIR_CONTACT_BACKOFF`). to_floor applies
+    max(param, 0.004), so 7 mm holds. Not yet run.
+- **Stir at 7 mm, streamed (18:36): still touched the bottom.**
+  - Contact at TCP z 0.0821 (-2.05 N), stirred at 0.0891.
+  - Revolutions ended 6.3-6.8 mm off (dx -5.6..-6.1, dy -2.5..-2.7,
+    dz +1.0..+1.2).
+  - Side note: the CAD tip (0.081) read 35 mm below the rim at contact,
+    while the inside floor is ~44 mm below it. So the real rod reach is
+    ~9 mm longer than the CAD again.
+  - **The user asked for position control: bench stir default
+    `smooth` False** (`STIR_SMOOTH`): 12 blocking `goto_pose_rigid`
+    waypoints per revolution, `use_impedance=False`, 0.4 s each.
+  - Back off kept at 7 mm for this run to isolate the cause. If position
+    control stops the touching, the wander was the cause and the back off
+    can go down toward the liquid. If it still touches at 7 mm, look at the
+    cup floor flexing under the 2 N contact, or a tilted rod.
+- **Stir, position-controlled waypoints, 7 mm back off (18:37-18:40):** no
+  longer touched the bottom (the user then asked for 4 mm again). So the
+  touching was the streamed circle's height, not the floor or the rod.
+  - The streamed circle is cartesian impedance. frankapy `goto_pose(dynamic=True)`
+    forces `use_impedance=True` and uses `CartesianImpedanceFeedbackController`
+    (`/home/rumi/frankapy/frankapy/franka_arm.py`), at
+    `FC.DEFAULT_TRANSLATIONAL_STIFFNESSES` 600 N/m unless
+    `cartesian_impedances` is given. The `use_impedance: False` in
+    `dynamic_start_kwargs` has no effect there.
+- **User: the descent too slow; the stir too slow, wanted faster and
+  smoother. Bench stir defaults now:**
+  - `coarse_step` 0.020 and `fine_zone` 0.020: 7 descent steps instead of
+    ~17 (simulated for cup B: 0.1071, 0.0871, then 1 mm to 0.0821);
+  - `contact_backoff` 0.004;
+  - `smooth` False with `waypoints_per_rev` 16 and `seconds_per_waypoint`
+    0.25 (was 12 at 0.4).
+  - Not yet run.
+- **User: keep the stream, fix its height drift (2026-10-10).**
+  - Diagnosis: at 600 N/m, a few N of unmodelled joint friction is several
+    mm of z. The friction changes direction as the circle goes round, so
+    the height wanders; 7 mm of back off was not enough.
+  - Change:
+    - new stir param `stream_stiffness` passed to `stream_pose_path` →
+      `cartesian_impedances`;
+    - bench `STIR_STREAM_STIFFNESS` = [600, 600, **1500**, 50, 50, 50];
+    - `STIR_SMOOTH` True again; back off stays 4 mm.
+  - Why z alone: the 2026-10-08 all-axis 1500/150 shook because each 20 ms
+    x/y setpoint step became a jolt. z's setpoint is constant on a circle,
+    so a stiffer z has nothing to jolt on. Expected drift: ~1/2.5 of
+    before.
+  - frankapy confirmed to honour custom impedances in dynamic mode
+    (`skill.set_cartesian_impedances`).
+  - Not yet run. **If it shakes, e-stop and set `STIR_SMOOTH` False**
+    (position waypoints, 16 x 0.25 s, still configured).
+- **Streamed stir, z 1500 N/m, back off 4 mm (18:54,
+  `experiments/test_stir.log`): no shaking, "轻微碰底" (light touching).**
+  - Contact at TCP z 0.0801 (-1.79 N; 2 mm lower than the earlier 0.0821,
+    a different cup spot), stirred at 0.0841.
+  - Revolutions ended 5.6-5.7 mm off (dx -4.9..-5.0, dy -2.7..-2.8,
+    **dz +0.4..+0.5**, against +1.0..+1.2 at 600 N/m).
+  - The contact reads only after the rod presses in past 1 N, so the tip
+    sits ~2-3 mm above the real floor at a 4 mm back off.
+  - **Now z 2000 N/m and `contact_backoff` 0.005.** Not yet run.
+
+**Point cloud presentation rewrite (2026-10-10): `scripts/view_pointcloud.py`.**
+User asked for a denser, clearer cloud, each object outlined and labelled in
+its own colour, ending in an interactive 3D view.
+- **Capture:** cameras one at a time, 15 warm-up + 8 frames each.
+  - Depth is the per-pixel median.
+  - A pixel is dropped if it had depth in < 60 % of frames, or flickered
+    more than 3 mm + 0.5 % of range (edge veils).
+- **Cloud:**
+  - stride 1;
+  - flying pixels dropped where a 4-neighbour jumps more than 4 mm + 1.2 %
+    of range;
+  - exposure balanced per camera by median ratio over 1 cm table cells all
+    cameras see. A plain per-view median was skewed by white paper:
+    gains 0.5-2.0, against 0.95-1.08 on shared cells;
+  - 1.5 mm voxel merge, statistical outlier removal, normals oriented up;
+  - rendered lit.
+- **Objects:** `vision.locate` for every bench object (or `--objects`).
+  - Containers get a cylinder outline of the manifest's radius and height,
+    drawn 3 mm outside and 2 mm above, or the points hide it.
+    - Dishes: inside radius + 2 mm, 29 mm tall, centred by a rim-top
+      circle fit.
+    - Clear cups: silhouette centroid, plus a translucent shell.
+  - Tools get an oriented box.
+  - Scene points in or near each object take its colour; the rest are
+    dimmed.
+  - Labels are drawn on the PNGs by projecting anchors through the offscreen
+    camera, with leader lines, no overlaps, plus a legend (name, label,
+    size).
+- **Outputs:**
+  - `_raw.npy` (re-render with `--from-raw`, no cameras);
+  - `.ply`;
+  - perspective `.png` and `_top.png`;
+  - `.mp4` with `--video`;
+  - then an O3DVisualizer window, in a fresh process (the offscreen
+    renderer leaves Open3D headless), with 3D labels. It falls back to
+    `draw_geometries` without labels if the GUI fails.
+- **Offline-tested only**, on a capture rebuilt from
+  `pointcloud_20261010_170527.ply` (half resolution) with synthetic objects
+  from clusters: renders correctly. The interactive window and the live
+  capture/locate path are **not yet run** (my sandbox cannot open the
+  cameras, and the window would open on the user's display).
+- **First live run (19:09, `pointcloud_20261010_190900_*`): the user found
+  the objects' shapes still bad.** The labelled O3DVisualizer did open.
+  Analysis of the saved raw capture:
+  - **Bug:** the flicker mask never applied, due to operator precedence:
+    `seen >= N & (spread <= ...)` binds as `seen >= (N & ...)`. The log said
+    "407040 steady pixels of 407040" on every camera, so the edge veils
+    stayed in. Fixed with parentheses. NaN medians are zeroed.
+  - The cameras run at **848x480** (robomail default). The D415's best depth
+    is 1280x720. Capture now asks for 1280x720 (`--size`) and falls back to
+    848x480 if refused.
+  - **Points are the wrong representation here.** Four noisy views (±1-3 mm
+    at 0.6-0.9 m, stereo-smoothed edges, mm calibration residuals) stacked
+    as points give fuzzy shells and blobs.
+    - **TSDF fusion** of the same raw (2 mm voxel, 8 mm truncation,
+      `ScalableTSDFVolume`, 2.8 s) gave solid dishes with walls and rims,
+      the black stirrer holder as one column, and a continuous table with
+      sharp paper edges.
+    - Now the default: `--mode mesh`. The `.ply` is the surface's vertices
+      (330k); `_mesh.ply` is the surface.
+  - **Clear cups and beaker cannot be measured:** they are absent from the
+    TSDF too, except faint footprints. They now own no scene points (the
+    "cup" blobs were table and paper seen through them). They are drawn as
+    a translucent model shell (alpha 0.38) plus outline at their silhouette
+    position.
+  - The spoon stays a blob: small, white, flat, at 0.7 m. The stirrer
+    holder was "not found" by locate on that run.
+  - Fixes for the top view: labels sit on the objects (map style), the
+    legend goes bottom-left, and label placement tries free spots in order
+    instead of drifting.
+  - Exposure gains for the mesh are taken at stride 2 (stride 4 left only 3
+    shared cells).
+  - Re-rendered offline from the 19:09 raw: clean. **A fresh capture with
+    the flicker fix and 1280x720 is not yet run.**
+- Further options, not done:
+  - CAD meshes (the sim's spoon / stirrer STLs) placed at the located pose,
+    for a true digital twin;
+  - a close-range scan with the wrist camera (cam 1, `realsense_ee.tf`),
+    if it is mounted.
+- **Second live run (19:22, 1280x720, `pointcloud_20261010_192220_*`): "the
+  transparent part is completely missing, even worse".**
+  - **Cause, a new bug:** `get_live_intrinsics` cached by camera id only.
+    The 1280x720 capture cached its intrinsics, and every later `locate`
+    in the same process (848x480 captures) deprojected with them.
+  - Result: 6 of 10 objects "not found"; the citric acid dish was placed at
+    (0.438, -0.101), the beaker from one camera only. No clear cup was
+    located, so none was drawn.
+  - The TSDF itself was fine at 1280x720: dishes and holder solid.
+  - **Fix (`object_localizer.py`):** the cache key is now
+    `(cam_id, cam.W, cam.H)`. Tested with fake cameras (1280x720 and
+    848x480 kept apart). Skills always run 848x480, so their behaviour is
+    unchanged.
+  - Clear cups are now drawn as **frosted open cups**: a wall and floor
+    mesh, the object colour lightened, alpha 0.7, 4 outline verticals.
+    The legend marks them "(model)" with one explaining line, and lists
+    objects that were not found.
+  - Re-rendered offline from the 19:09 raw: all four clear containers read
+    as cups. **A fresh live run with the fix is not yet done.**
+
+**Scoop rerun failed (2026-10-15 17:06, `experiments/test_scoop.log`): "Scoop
+did not lift clear (off by 101mm)".**
+- **Cause: the spoon pick, with `forward_offset` 0 (reset 2026-10-10).**
+  - The jaws first held at **27.1 mm** (`gripper_is_grasped=False`), closed
+    13.9 mm from the commanded grasp, and read **8.2 mm** by the start of
+    the scoop. So the spoon slid or turned in the jaws after the lift.
+  - This is the crank failure the manifest warned about: "The default
+    forward_offset 0 lands on the crank, where the handle's section changes
+    and they cannot seat".
+  - On 2026-10-10 a pick at 0 happened to seat (8.2 mm) and passed.
+- With the spoon moved in the grip, the tool offset measured at the pick
+  (37.1 / 5.2 mm) no longer described it:
+  - the compliant descent stopped 7.2 mm high (+4.5 after compensation);
+  - the position sweep jammed at once: long axis 31.5° at the end, where
+    it should be ~90°, TCP 29.6 mm off (x -22.0);
+  - libfranka aborted with `cartesian_motion_generator_joint_acceleration_discontinuity`;
+  - the lift and roll were refused ("did not move at all").
+- Afterwards (read over ROS): `is_ready` True, no current errors, EE at home
+  (0.307, 0.000, 0.487), the spoon still held at 8.2 mm.
+- Proposed to the user, not yet changed: restore the spoon pick's
+  `forward_offset` -0.010. `DISH_SCOOP_Z_OFFSET` -0.011 stays: it is at the
+  limit, but it was not the cause.
+- **User agreed: the spoon pick's `forward_offset` is -0.010 again**
+  (`bench_manifest.py`). The offline bench-defaults test now expects
+  -0.010. Not yet rerun on the arm.
+- **Rerun with `forward_offset` -0.010 (2026-10-15 17:15,
+  `experiments/test_scoop.log`): all four steps succeeded.** pick → scoop
+  baking soda → dump into B → place back.
+  - Pick: held at 19.6 mm (`gripper_is_grasped=False`), measured offset
+    [0.045, 0.004, 0.021], about 10 mm more than at 0 as expected.
+    Scoop start: 8.2 mm. The width still changes after the pick; it was
+    harmless this time.
+  - Scoop: descent stopped 6.2 mm high, then the position sweep completed
+    (long axis 90.7°, TCP 6.0 mm off), as in the 2026-10-10 "perfect" run.
+- Next: the whole pipeline with `--step`, given to the user. Not re-verified
+  on the arm since the recalibration and offset reset: beaker pick
+  (z_offset 0, was -12 mm), cup pick + pour, the dump landing
+  (forward_offset 0, was -10 mm), and stir at back off 5 mm / z 2000 N/m.
+
+**Whole pipeline with `--step` (2026-10-15 17:2x-17:31,
+`experiments/agent_run_20261015_173140.json`, `pipeline_20261015.log`).**
+- Steps 1-5 ok: pick spoon, scoop citric acid, dump into A, spoon back, pick
+  stirrer.
+- **Step 6, stir A, failed with "landing on the rim".**
+  - The **first 20 mm coarse step** (0.1271 → 0.1071 in 0.4 s, in free air
+    over A's opening) read **+1.00 N** against the 1.0 N threshold
+    (baseline -1.58 N). That was a false trigger: the rod tip was 10 mm
+    below the rim at the centre of a 36 mm-radius opening.
+  - With a 20 mm `this_step`, the rim check (contact within one step below
+    the rim) then called it a rim hit.
+  - Afterwards: arm back over A at z 0.217, ready, no errors, stirrer held
+    (31 mm).
+- Fixes:
+  - **`STIR_COARSE_STEP` 0.010**: 9 descent steps to a floor at 0.0821,
+    against 7 at 20 mm and ~17 originally;
+  - `_feel_down` waits 0.15 s after a coarse step before reading the
+    force.
+- **Found while testing:** the 2026-10-10 `stream_stiffness` change passed
+  `stiffness=None` to `stream_pose_path` every time, which broke the
+  offline test double (`fake_stream` has no such keyword). It was never
+  caught because the suite was not rerun in perception_env. stir now passes
+  it only when set.
+  - `test_skills_offline.py` (perception_env): **424 passed**, the 2 old
+    scoop workspace-floor failures.
+- Resume from step 6 with the stirrer still in the jaws, **without
+  `--reset`** (it would open the gripper).
+- **Resumed at 6 (17:39-17:45, `agent_run_20261015_174505.json`): 6-8 ok,
+  9 failed.**
+  - **Stir fix confirmed on the arm:** 10 mm coarse steps plus the settle
+    found A's floor at TCP z 0.0851 (-1.89 N) and stirred at 0.0901. 7
+    (stirrer back, seated at 0.1061, -3.35 N) and 8 (spoon pick, held
+    17.5 → 8.2 mm, offset [0.043, -0.000, 0.023]) were ok.
+  - **9, scoop baking soda, jammed the same way as 17:06**, this time with
+    the -10 mm grasp:
+    - descent stopped 6.6 mm high;
+    - sweep ended with the long axis at 34.9° (should be ~90°), TCP
+      33.6 mm off;
+    - `joint_velocity_discontinuity` abort, then "did not lift clear (off
+      by 91 mm)".
+  - Scoops at -11 mm on 2026-10-15: 17:06 jam (bad grasp), 17:15 ok, 17:2x
+    (citric) ok, 17:4x jam. **-11 mm is past the margin.**
+  - Proposed `DISH_SCOOP_Z_OFFSET` -0.008, pending the user's word.
+
+**Experiment report written by the model after each run (2026-10-15).**
+- `robochem/agents/reporter.py`:
+  - `load_run_chain(record)`: a resumed record names its predecessor only
+    by `resumed_from.started` (`log_path` is None), so predecessors are
+    found by that timestamp among the records in the same folder.
+  - `build_facts`: goal, parsed instruction sheet, bench, plan, and every
+    executed step across sessions, with params, outcome, failure, seconds
+    and `measurements(result)` (scalars, short strings, ≤3-vectors; poses
+    and point sets dropped).
+  - `write_report`: one `structured_completion` (strong tier, gpt-4.1,
+    strict schema) with the facts plus the final photos, all four cameras.
+  - The model writes the title, summary, objective, materials, procedure,
+    observations (source photos/record), result vs expected, issues,
+    conclusion and next steps.
+  - **The header, the step table and the measured-values appendix are
+    rendered from the record, not by the model.**
+  - Output: `experiments/report_<time>/report.md`, `final_cam<N>.jpg`,
+    `facts.json`.
+  - Prompt rules: nothing beyond the facts and photos; colours only from
+    photos ("not visible" otherwise); failure messages quoted, not
+    reinterpreted; operator notes attributed.
+- `run_experiment.py`: after every `--task` / `--instruction-image` /
+  `--resume` run (not `--dry-run`), it photographs the bench
+  (`vision.capture_scene()`) and writes the report. `--no-report` skips it;
+  `--report-language Chinese` changes the prose language. A report error
+  never fails the run.
+- `scripts/write_report.py [RECORD] [--capture] [--language L]
+  [--note TEXT ...]`: report on any finished run (default the newest).
+  `--capture` photographs the bench now.
+- Tests: `test_agents_offline.py` **101/101** in both venvs (new
+  `test_the_report_covers_every_session`, which uses the FakeLLM double).
+- Real model on today's two sessions (no photos, two operator notes):
+  `experiments/report_20261015_175040/report.md`. It is factual and covers
+  both sessions and both failures.
+  - The first version paraphrased "did not lift clear" as "failed to lift
+    the powder", hence the quote rule.
+
+**Scoop jams: cause and fix (2026-10-15, after the user hand-recovered the
+arm from the dish).** The arm had stood in the baking-soda dish from 17:45,
+TCP (0.570, -0.190, 0.052), spoon held, interface ready.
+- **Cause, from all five scoops at z_offset -11 mm:**
+
+  | run | descent stopped high | sweep end | result |
+  | --- | --- | --- | --- |
+  | 10-10 18:19 | 6.5 mm | TCP **+6.0 mm** above the last setpoint, 90.7° | ok |
+  | 10-15 17:06 | 7.2 | long axis 31.5°, 29.6 mm off | jam |
+  | 10-15 17:15 | 6.2 | **+6.0 mm**, 90.7° | ok |
+  | 10-15 citric (step 2) | 7.3 | **+5.7 mm**, 90.7° | ok |
+  | 10-15 baking soda (step 9) | 6.6 | 34.9°, 33.6 mm off | jam |
+
+  - Every finished sweep ended ~6 mm above its last setpoint: the plan ran
+    ~6 mm below the dish floor, and position control pressed the bowl
+    into it. The descent's 6.2-7.3 mm stop, against 2.7 mm free-air sag,
+    says the same at the entry.
+  - Whether the tip slid or pinned at the 60° entry decided ok or jam: 2
+    of 5 jammed.
+  - The user's "25 mm deeper" on 2026-10-10 was about 6 mm more than the
+    floor allows.
+- **Two bugs made a jam fatal:**
+  - `goto_pose_rigid` returns True for a command sent, so the sweep logged
+    "Swept 12/12" over refused waypoints;
+  - the lift went out in franka-interface's recovery window, was refused,
+    and the skill returned with the arm in the dish.
+- **Fix:**
+  - **`DISH_SCOOP_Z_OFFSET` -0.005**: the sweep ends on the floor, not
+    6 mm into it. The bowl cannot collect anything below the floor, so the
+    depth is unchanged in effect.
+  - scoop: each position-sweep waypoint must end within `sweep_jam_tol`
+    15 mm (jams were 30-34 mm off, finished sweeps 6), else it is a JAM.
+    The scoop is then lifted straight out (`BaseSkill.lift_out`: waits for
+    `is_ready`, up to 3 tries) and dug again `jam_raise` 4 mm higher,
+    `jam_retries` 1 time. If it still jams, it fails with the arm out of
+    the dish. The result carries `jams` and `dig_raised`.
+  - Stage and rise lifts use `BaseSkill.goto_with_retry` (one retry after
+    waiting for ready when the arm did not move), then `lift_out` before
+    failing.
+  - New `BaseSkill.wait_until_ready` (polls franka_interface_status; True
+    off the robot).
+  - Test `test_scoop_lifts_out_of_a_jam_and_digs_again` (JammingArm: pins
+    after the descent, refuses while stuck). `test_skills_offline.py`
+    (perception_env) **429 passed**, the 2 old scoop workspace-floor
+    failures.
+- Not yet run on the arm. Next: resume the 17:39 record from step 8 (spoon
+  pick); the stirrer is back in its holder and the spoon on its spot.
+- **Reports are written only on request (user, 2026-10-15).**
+  `run_experiment.py` no longer photographs the bench or writes a report;
+  `--no-report` and `--report-language` are gone.
+  - `python scripts/write_report.py` finds everything itself:
+    - `latest_record()`: the newest `agent_run_*.json` that moved the
+      robot (dry runs and step-less records skipped);
+    - the `--resume` chain;
+    - `find_console_logs()`: every `experiments/*.log` modified since the
+      experiment started;
+    - photos taken now by default (`--no-photos` to skip). It warns when
+      the run ended over 30 min ago, and the report states when the photos
+      were taken (`facts.photos_taken`).
+  - `console_excerpts()`: for each failed step, the skill's own console
+    lines (`[Scoop]`, `[Stir]`, `[Safety]` ...) from the last block under
+    `[step N] <sub-task>` that contains a failure. The `--step` prompt line
+    is handled. They are given to the model and quoted in an appendix.
+    On today's log it pulled 1.6 (the +1.00 N false contact) and 2.9 (the
+    jam: 34.9°, 33.6 mm, the refused rise).
+  - Options: `--language`, `--note`, `--no-console`, `--experiments`, or a
+    record path.
+  - `test_agents_offline.py` **103/103** in both venvs.
+- **Resumed at 8 (2026-10-15 ~18:06-18:11, `agent_run_20261015_181120.json`;
+  the user then deleted `experiments/`. It is in
+  `~/.local/share/Trash/files/experiments/`, `pipeline_20261015.log`
+  included): 9 jammed again at z_offset -5 mm.**
+  - The descent stopped 5.1 mm high and was compensated to -0.6 mm.
+  - The position sweep jammed. It was detected only at the +20° waypoint
+    (18 mm off): the wrist had never left the 60° entry (tool z-axis
+    (-0.87, -0.02, -0.49) when read afterwards), and the error grew
+    gradually as the waypoints moved away. Detection is too late.
+  - **All three `lift_out` tries were refused outright** ("did not move at
+    all (0.0 mm)") while franka-interface reported ready.
+    `robot_fault()`: robot_mode 1, last_motion_errors
+    `joint_velocity_discontinuity`, no "not ready".
+  - So it was not just the recovery window. A persistent refusal is the
+    virtual-walls signature, or an error state that waiting does not
+    clear. Asked the user what the franka-interface window said and
+    whether the software lift worked during recovery. Not yet known.
+  - The run wrote a report automatically because it was started before
+    the auto-report was removed (18:08:02); Python had already loaded the
+    old `run_experiment.py`.
+  - Proposed, awaiting the user (a control change): the sweep and the
+    lift-out under cartesian impedance, so floor contact is a bounded
+    spring force rather than a libfranka abort.
+- **The user's diagnosis (2026-10-15): the baking-soda dish was outside the
+  arm's reachable area.** They hand-guided the arm out, and with the dish
+  moved, the scoop works.
+  - This fits the 18:11 log better than floor contact:
+    - the wrist never left the 60° entry;
+    - `lift_out` was refused with 0.0 mm three times while
+      franka-interface was ready;
+    - that is the arm at a joint/reach limit, where any motion needing that
+      joint further is refused.
+  - All three jams of the day were the baking-soda dish at y ≈ -0.19
+    (the citric dish at y -0.08 never jammed). The same spot also
+    succeeded twice, so it is the edge of the reach, not beyond it.
+  - Consequences:
+    - impedance-sweep proposal withdrawn;
+    - `DISH_SCOOP_Z_OFFSET` -0.005 kept, since the +6 mm end error at -11
+      was real floor pressure. -0.008 if the user finds the scoop too
+      shallow;
+    - jam detection and `lift_out` kept. `lift_out` cannot help at a joint
+      limit: there, only hand-guiding works.
+  - **Keep the powder dishes nearer the middle than y -0.19.** The
+    validated reachable position is not recorded yet; take it from the
+    next scoop log.
+
+**Report writer looks for itself, always in English (user, 2026-10-15).**
+- `llm_client.tool_completion`: an OpenAI tool-calling loop with strict
+  `json_schema` output.
+  - Tool results go back as text; their images follow in a user message,
+    since a tool message can only hold text.
+  - After `max_rounds` the tools are withdrawn and the answer is required.
+- `reporter.BenchCamera(vision)`:
+  - `photos(cameras)`: one capture per camera;
+  - `close_up(name)`: `vision.locate` → project the object's points box into
+    every camera → the two views with the largest whole box, padded 25 %
+    and upscaled to 512 px.
+- `write_report(records, camera=...)`:
+  - starts the model with four overview photos and offers `look_at(object)`
+    and `photograph_bench(cameras)` (8 rounds, 24 photos at most);
+  - every photo it looked at is saved (`overview_cam*`, `closeup_NN_*`,
+    `photo_NN_*`) and shown with a caption;
+  - the calls are listed in "what the writer looked at" and in `facts.json`;
+  - no language option: the prompt says English;
+  - observations sourced "photos" must not mix in record inferences.
+- `scripts/write_report.py`: cameras on by default (`--no-photos` writes
+  from the records alone). `--language` is gone.
+- Tests: `test_agents_offline.py` **107/107** in both venvs.
+  - `ToolFakeLLM` snapshots each request; the caller appends to one message
+    list.
+  - `FakeBenchCamera`.
+  - The model looks at cup a, then fresh views, then writes; the tool
+    rounds are cut off; the no-camera path still works.
+- **Real-API format check:** gpt-4.1 on the three trashed 10-15 records,
+  with a stand-in camera returning point-cloud renders. It called
+  `look_at` for cups a, b, c and the beaker, then wrote the report, so
+  tools plus a strict schema plus image follow-ups are accepted.
+  - Not yet run with the real cameras: needs the user's terminal; my
+    sandbox cannot open them.
+
+**Full pipeline 2026-10-15 18:19-20:27 (`experiments/agent_run_20261015_202701.json`,
+the folder recreated after the user deleted the old one; no console log
+kept): sub-tasks 1-16 ok, 17 failed.**
+- **The first time steps 1-16 all ran in one session on the new
+  calibration:** citric acid → A, stir; baking soda → B, stir; red cabbage
+  scooped.
+  - Dumps into A and B: 79° commanded, 75.8 / 75.9° reached.
+  - Scoops at z_offset -0.005 with no jam: the citric descent sagged
+    2.8 mm, i.e. no floor contact.
+- **17, dump into the beaker: tip stalled at 54.6° of 59°, below
+  `min_tip_deg` 55.**
+  - The planner passed no `dump_angle_deg`, but that does not matter: the
+    beaker, 0.573 m out, is reach-capped (`_wrist_reach`, PANDA_REACH 0.718).
+    On 2026-10-08 it was capped at 64 / 66 / 70 / 67°. Today the cap was 59,
+    since the beaker reads 6.5 mm further out and its rim 11 mm lower after
+    the recalibration and table_z. The streamed tip then ends ~4° short.
+- **The user: "54.6 is okay, don't set it too strict, keep the experiment
+  going is the most important." `DUMP_MIN_TIP_DEG` is now 45** (the test
+  reads the constant). Skills suite 429 passed, the 2 old failures.
+- `dump_heading_deg` (sideways dump, said to reach 90° anywhere) is still
+  untried on the robot; not used.
+- After the failure the arm was home and ready, still holding the spoon
+  (8.2 mm). Resume from 18 (spoon back), since the user judged the 54.6°
+  dump good.
+
+**Pour angles, the needless beaker put-down, and edits at the `--step`
+prompt (2026-10-15, after the resumed run from 18).** Code and tests only;
+not yet run on the robot.
+- **What happened at sub-task 23:** the beaker poured into A at the
+  planner's 80, not 60. The user had typed that it should be 60.
+  - The planner had written 22 pick beaker, 23 pour A at 80, **24 place
+    beaker back, 25 pick beaker**, 26 pour B. Its reason for 24: "the beaker
+    must be put down before pouring into the next cup". No rule says that.
+  - The old cap stopped looking at the first put-down, so it never saw the
+    pour at 26.
+  - Typed text at the `--step` prompt was ignored: anything but q ran the
+    step unchanged.
+  - 26 got `pour_angle=','` from the skill-call agent again; it was dropped
+    and the default 90 applied, which is the right value for the last pour.
+- **The user's rule, now in `_keep_some_for_later`:** "if the container needs
+  to pour again, the first time 60, the second 90".
+  - `_pours_from(plan, source)` follows the plan's pick-ups and put-downs
+    (and "pour from X into ..." wording) to list every pour out of the held
+    container.
+  - With 2+ pours, every one but the last is set to 60 (`POUR_KEEP_SOME_DEG`)
+    and the last to 90 (`POUR_LAST_DEG`), whatever the model asked for. A
+    container that pours once is still left to the model; A into C was
+    planned at 80 and is untouched.
+  - The note names the later pour, e.g. `pour_angle 80 -> 60: plastic beaker
+    pours again at sub-task 24, so this pour must not empty it`.
+  - On the 18:19 plan it finds beaker pours [23, 26], so a `--resume` of
+    that record from 22 or 23 also gets 60 then 90.
+- **Needless put-down then pick-up, now removed (`drop_needless_regrasps`):**
+  - When a "place X" is followed straight away by "pick up X", both are
+    dropped and the plan is renumbered. Logged as `[plan] dropped sub-tasks
+    ...` and kept in the record as `plan_edits`.
+  - A put-down that takes X somewhere else ("at the centre of the bench")
+    is kept, and so is one made to free the gripper for another tool.
+  - It runs only on a fresh plan, never on `--resume`, because
+    `--from-step` counts in the stored plan.
+  - On the 18:19 plan it drops 24-25: 33 sub-tasks become 31, and the beaker
+    pours at 23 then 24.
+  - The pair moved nothing and cost a scan plus a grasp. The re-pick at 25
+    closed 6.6 mm from the commanded grasp and reported
+    `gripper_is_grasped=False` while holding at 37.7 mm.
+  - The pour skill already goes home holding the full beaker before every
+    scan and comes back upright, so two pours in a row are physically
+    nothing new.
+  - New chaining rule in `skill_catalog.CHAINING_RULES`: "a container that
+    pours into more than one target stays in the gripper between its pours".
+    The code guard does not depend on the model following it.
+- **`--step` prompt (`scripts/run_experiment.py:confirm_step`):**
+  - Enter runs the step; q stops.
+  - `key=value` changes the call's parameters (`pour_angle=60`,
+    `to_floor=false`, `target_container='clear cup b'`), prints old -> new,
+    and asks again. Values are read as JSON.
+  - Other text is "not understood" and asks again; it no longer runs the
+    step.
+  - The operator's change comes after the automatic cap, so it wins. It is
+    recorded in the step's `params` and in `adjusted` ("changed by the
+    operator at the step prompt: {...}").
+- Tests: `test_agents_offline.py` **124/124** in both venvs. New:
+  - put down for the stirrer between pours, still 60 then 90;
+  - the put-down then pick-up pair dropped, plan renumbered 1-4;
+  - a relocating put-down kept;
+  - `parse_step_overrides`, and an operator change ran and was recorded.
+  - A piped-stdin check of `confirm_step`: "60 degrees" re-asked,
+    "pour_angle=60" changed 80 -> 60, Enter ran.
+- **Same rule for a cup poured into twice (the user, after watching 29
+  run: "in step 29 the degree should also be 60").**
+  - In the live run, 29 (A into C) poured at the planner's 80. The run was
+    already at 31, so this applies from the next run.
+  - `_pours_into(plan, target)` lists the pours into a container, from the
+    sub-task's `target_container`, else "into X" in its text.
+  - When a target is poured into more than once, every pour into it but the
+    last goes at 60 and the last at 90: A into C 60, B into C 90.
+  - The source rule is checked first.
+  - A pour that is alone on both counts is still the model's choice.
+  - Catalog: the pour note now describes both caps. The "about 80 for a
+    partial pour" advice for a lone pour is unchanged.
+  - Replay of the 18:19 plan through `_keep_some_for_later`: 23 -> 60,
+    26 90, 29 -> 60, 32 90.
+  - After `drop_needless_regrasps` the numbers become 23 / 24 / 27 / 30
+    with the same angles. The step numbers in the next run are 2 lower from
+    24 on.
+  - `test_agents_offline.py` **127/127** in both venvs, with A and B into C
+    planned at 80/80 coming out 60/90.
+- **How much of A and B should go into C (estimate only, nothing measured;
+  the user asked, 2026-10-15):**
+  - Retention by tilt, ideal liquid with no wall cling:
+    - clear cup (47.3 tall, rim r 36.6, ~r 25 at the base by the measured
+      taper) keeps up to 25 / 11 / 2.5 / 0 ml at 50 / 60 / 70 / 80 deg;
+    - the beaker (r 22 x 60 mm cylinder, unmeasured) keeps 51 / 35 / 19 /
+      7 / 0 ml at 50 / 60 / 70 / 80 / 90.
+  - So in the next run: A gets ~15 ml of indicator (~25 ml total) and B
+    ~35 ml (~45 ml). A at 60 puts ~14 ml in C and keeps ~11 ml.
+  - In today's run the beaker went at 80: A got ~43 ml and B ~7 ml.
+  - Chemistry model: charge balance with dissolved CO2 held at 15 mM, B
+    poured whole. With the sim's scoop masses (citric 1.33 g, soda 1.19 g):
+    - all the bicarbonate reacts at ~68% of A;
+    - 56% of A (the 60 pour): pH 6.9, ~240 ml CO2;
+    - 70-80%: pH 6.3-6.6, ~290-300 ml;
+    - all of A: pH 5.6, ~320 ml.
+  - With denser soda in the same scoop (citric ~1.2 g, soda ~1.6 g), all of
+    A is about right (pH 6.7).
+  - What decides it is the citric : soda mass ratio of the real scoops,
+    ideally ~0.76 : 1 (3 NaHCO3 per citric acid). They have never been
+    weighed. Weighing one big scoop of each would fix A's fraction.
+- **A into C is now 65, the rest unchanged (the user: "change the A -> C
+  degree to 65, dont change the rest").**
+  - New `POUR_FIRST_INTO_SHARED_DEG = 65`. It is used only for the first pour
+    into a target that is poured into again.
+  - The beaker's first pour stays `POUR_KEEP_SOME_DEG` 60, and every last
+    pour stays 90. The catalog's pour note says the same.
+  - Replay of the 18:19 plan (after the drop): 23 beaker->A 60, 24
+    beaker->B 90, 27 A->C 65, 30 B->C 90.
+  - `test_agents_offline.py` 127/127 in both venvs.
+  - From the estimate above, 65 should put ~19 of A's ~25 ml (~75%) into
+    C. Not yet seen on the robot.
+
+**Photos after every pour, for the report (2026-10-15).** Code and tests
+only; not yet run on the robot.
+- **Why:** the report said A turned pink-red, but it could not say B had
+  turned blue. When it photographed the bench, B had already been poured
+  into C and was empty. The only photos were taken at report time.
+- **Run side:**
+  - `AgentOrchestrator(snapshot=...)`: after every successful step whose
+    skill is in `SNAPSHOT_AFTER` (`("pour",)`), it calls
+    `snapshot(subtask, call)`.
+  - The paths go in the step record as `photos`.
+  - A snapshot that throws is printed (`[photos] none taken: ...`) and the
+    run goes on.
+- **`run_experiment.py`:**
+  - `make_snapshot(vision, folder)` saves one JPEG per camera from
+    `object_localizer.capture_pointclouds()` as
+    `experiments/photos_<start time>/s<NN>_pour_cam<k>.jpg`.
+  - On by default; `--no-step-photos` turns it off. Dry runs take none.
+  - Each pour ends with `reset_joints` home, so the arm is clear of the
+    cameras when the photo is taken.
+  - The photo after the beaker's second pour (into B) is the bench just
+    before A goes into C, with A red and B blue. That is why it is "after
+    each pour" and not "before A into C": before a pour, the held cup hangs
+    over its pick site in view.
+- **Report side (`reporter.write_report`):**
+  - The model is given FACTS, then RUN PHOTOS grouped by the step they
+    follow ("after sub-task 24 (session 1): pour ..."), then today's
+    overview.
+  - Run photos are capped by `max_run_photos` (24, thinned evenly per step)
+    and copied into the report folder as `run_sNN_*.jpg`.
+  - Missing files are skipped, also looked for next to the records.
+  - The prompt says a cup later poured out is empty now and its colour at
+    each stage is in the run photos.
+  - `facts.steps[].photos_after` gives the count.
+- Tests: `test_agents_offline.py` **133/133** in both venvs. New:
+  - photos only after pours; the paths are recorded; a failing snapshot does
+    not stop the run;
+  - run photos reach the model before today's views, and a missing file is
+    skipped;
+  - `make_snapshot` with a fake localizer wrote `s24_pour_cam2.jpg` and
+    `s24_pour_cam3.jpg`.
+- Not seen on the robot: how long the extra capture takes per pour. The
+  skills' own scans open the four cameras in a few seconds.

@@ -55,7 +55,7 @@ direction-blind: it reads 90° at level, 45° at a 45° nose-down bite and 105°
 from typing import Dict, Any, Tuple
 import numpy as np
 
-from .base_skill import BaseSkill, _orthonormalize, tool_y_delta
+from .base_skill import REFUSED_HINT, BaseSkill, _orthonormalize, tool_y_delta
 
 
 class ScoopSkill(BaseSkill):
@@ -352,6 +352,14 @@ class ScoopSkill(BaseSkill):
             # bed: "the descent is not deep enough". The sim tracks its command,
             # so there the correction is zero.
             "sag_compensation_max": 0.010,
+            # A position-controlled sweep waypoint that ends further than this
+            # from where it was sent has jammed (the bowl caught on the floor):
+            # the jams of 2026-10-15 were 29.6 and 33.6 mm off, finished
+            # sweeps 6 mm. The scoop is then lifted straight out and dug again
+            # jam_raise higher, up to jam_retries times.
+            "sweep_jam_tol": 0.015,
+            "jam_retries": 1,
+            "jam_raise": 0.004,
             # Rehearse the whole scoop this far above the real dish, touching
             # nothing: the dish is planned as if it stood this much higher, so
             # every motion keeps its shape. For checking on the robot how
@@ -530,10 +538,22 @@ class ScoopSkill(BaseSkill):
         table_z = self.config.get("table_z")
         if table_z is not None and lift != 0.0:
             table_z = float(table_z) + lift
+        # Whether the container stands on the table. The base reads high (see
+        # below) and by how much depends on the view: on the cage the dishes'
+        # base_z read 11-14 mm above the table, which a window on base_z alone
+        # rejected after table_z became -0.0112 (2026-10-10: base_z 0.0028,
+        # floor taken from it, the whole dig 14 mm high). The top is seen
+        # well (17.0 measured against 17.8 for the 29 mm dish), so with a
+        # known height the top settles it.
+        height = params.get("container_height")
+        on_table_by_top = (table_z is not None and height is not None and
+                           abs(float(located["top_z"]) - (float(table_z) + float(height)))
+                           <= 0.008)
         if params.get("container_floor_z") is not None:
             floor_z = float(params["container_floor_z"])
             floor_source = "container_floor_z"
-        elif table_z is not None and -0.005 <= base_z - float(table_z) <= 0.012:
+        elif table_z is not None and (-0.005 <= base_z - float(table_z) <= 0.012
+                                      or on_table_by_top):
             # The container stands on the table, and the cell knows where the
             # table is. base_z itself reads 3-6 mm high: it is the 3rd
             # percentile of the cloud, and the bottom edge is seen only at a
@@ -542,7 +562,9 @@ class ScoopSkill(BaseSkill):
             # what left the big scoop empty in every planner-driven run.
             floor_z = float(table_z) + float(params["floor_thickness"])
             floor_source = (f"table z {float(table_z):.4f} (cell config; base_z read "
-                            f"{base_z:.4f}) + floor_thickness "
+                            f"{base_z:.4f}"
+                            + (", on the table by its top" if on_table_by_top else "")
+                            + f") + floor_thickness "
                             f"{float(params['floor_thickness']) * 1000:.1f}mm")
         else:
             floor_z = base_z + float(params["floor_thickness"])
@@ -951,104 +973,165 @@ class ScoopSkill(BaseSkill):
                 "long_axis_wanted": want,
             }
 
-        # 8. Descend straight down into the bed, holding the bite angle.
-        # Vertical, because the tilt is already set: a diagonal entry is what
-        # the old stroke used to carry travel, and travel is what hit the wall.
-        entry_centre = plan[0][1]
-        entry = self.tcp_for_tip(entry_centre, entry_rotation, tool_offset)
-        print(f"[Scoop] Descending the bowl floor to z={entry_centre[2]:.4f} "
-              f"({scoop_depth * 1000:.0f}mm below the surface, tilted, "
-              f"compliant)...")
-        if not self.goto_pose_rigid(entry, entry_rotation,
-                                    duration=max(0.5, float(params["descend_seconds"])),
-                                    use_impedance=True):
-            return False, {"error": "Failed to command the descent"}
-        arrived, err = self.reached(entry, contact_tol)
-        if not arrived:
-            print(f"[Scoop] Descent stopped {err * 1000:.0f}mm short — backing out")
-            self.goto_pose_rigid(approach, entry_rotation, duration=2.5)
-            return False, {
-                "error": (f"Could not enter the powder in '{source}' "
-                          f"(off by {err * 1000:.0f}mm); the bowl is probably "
-                          f"fouling the rim"),
-            }
-
-        ok, msg = self.check_still_holding(start_width, tag="Scoop")
-        if not ok:
-            return False, {"error": f"Lost the scoop entering the powder: {msg}"}
-
-        # 8b. How high the compliant descent actually stopped, and the bowl
-        # put where the plan has it: the descent re-commanded that much lower,
-        # and the sweep below shifted down by the same amount. Still under
-        # impedance, so the bowl stays compliant against a floor it meets.
-        sag_cap = max(0.0, float(params["sag_compensation_max"]))
-        stopped_z = float(np.asarray(self.get_current_pose().translation, dtype=float)[2])
-        descent_sag = stopped_z - float(np.asarray(entry, dtype=float)[2])
-        lowered = np.zeros(3)
-        if descent_sag > 0.002 and sag_cap > 0.0:
-            lowered = np.array([0.0, 0.0, min(descent_sag, sag_cap)])
-            print(f"[Scoop] The compliant descent stopped {descent_sag * 1000:.1f}mm above "
-                  f"its command; commanding {lowered[2] * 1000:.1f}mm lower so the bowl is "
-                  f"where the plan put it")
-            self.goto_pose_rigid(np.asarray(entry, dtype=float) - lowered, entry_rotation,
-                                 duration=max(0.5, float(params["descend_seconds"])),
-                                 use_impedance=True)
-            left = (float(np.asarray(self.get_current_pose().translation, dtype=float)[2])
-                    - float(np.asarray(entry, dtype=float)[2]))
-            print(f"[Scoop]   now {left * 1000:+.1f}mm from the planned height")
-
-        # 9. The sweep. Roll nose-down -> nose-up about a bowl centre that
-        # barely moves. Every waypoint recomputes the TCP from the bowl target,
-        # so the ARM backs up as the wrist rolls — that is what keeps the bowl
-        # in the same piece of powder instead of swinging it on the arc of
-        # |tool_offset|, which for this scoop is ~38mm of unwanted travel.
-        print(f"[Scoop] Sweeping {dig_tilt_deg:+.0f}° -> "
-              f"{sweep_end_tilt_deg:+.0f}° over {sweep_seconds:.1f}s in "
-              f"{waypoints} waypoints; bowl advances "
-              f"{travel * 1000:.0f}mm, floor z "
-              f"{plan[0][1][2]:.4f} -> {plan[-1][1][2]:.4f}...")
-        # ONE continuous motion, not a chain of goto_pose calls.
+        # 8-9. Descend, then sweep; a sweep that jams is lifted out and dug
+        # again a little higher (jam_retries, jam_raise).
         #
-        # Every goto_pose ends in `_settle`, which waits for the servos to
-        # stop — and a bowl buried in powder never stops, so each waypoint
-        # burns its full 1.5s timeout. Twelve of them turned a 2s sweep into a
-        # visible staircase of pauses that `--speed` could not touch, because
-        # settling is deliberately not scaled by it. `arc_scoop` hit exactly
-        # this (16 waypoints, 2.5s of sweep costing 26s) and the fix lives in
-        # BaseSkill.stream_pose_path: one skill, setpoints streamed, and the
-        # roll happening DURING the sweep instead of between two stops.
+        # A jam: on 2026-10-15, two of five scoops at z_offset -11 mm stopped
+        # at the first sweep waypoint, the bowl's tip pinned in the dish floor
+        # at the 60 deg entry. libfranka aborted (joint velocity/acceleration
+        # discontinuity), the remaining waypoints and the lift were refused
+        # in its recovery window, and the skill returned with the arm left
+        # standing in the dish. Every sweep that did finish ended ~6 mm above
+        # its last setpoint: the plan ran 6 mm below the floor and position
+        # control pressed it there (bench z_offset is now -5 mm).
+        entry_centre = plan[0][1]
         position_sweep = str(params["sweep_mode"]).strip().lower() == "position"
-        # The descent's sag is the impedance's; a position-controlled sweep
-        # goes where it is sent and must not inherit the correction.
-        shift = np.zeros(3) if position_sweep else lowered
-        rotations = [rotation_at(a) for a, _ in plan[1:]]
-        tcps = [self.tcp_for_tip(c, R, tool_offset) - shift
-                for (_, c), R in zip(plan[1:], rotations)]
-        swept = 0
-        if position_sweep:
-            streamed, why = False, "sweep_mode 'position'"
-        else:
-            streamed, why = self.stream_pose_path(
-                tcps, rotations, seconds=sweep_seconds, tag="Scoop",
-                cartesian_impedance=True)
-        if streamed:
-            swept = waypoints
-            print(f"[Scoop]   swept as one continuous motion ({why})")
-        else:
-            # Correct, just not smooth — and slow when the bowl is loaded.
+        jam_tol = max(0.005, float(params["sweep_jam_tol"]))
+        jam_retries = max(0, int(params["jam_retries"]))
+        jam_raise = max(0.0, float(params["jam_raise"]))
+        raise_total = 0.0
+        jams = []
+        for dig in range(jam_retries + 1):
+            up = np.array([0.0, 0.0, raise_total])
+            # 8. Descend straight down into the bed, holding the bite angle.
+            # Vertical, because the tilt is already set: a diagonal entry is
+            # what the old stroke used to carry travel, and travel is what hit
+            # the wall.
+            entry = self.tcp_for_tip(entry_centre, entry_rotation, tool_offset) + up
+            print(f"[Scoop] Descending the bowl floor to z={entry_centre[2] + raise_total:.4f} "
+                  f"({(scoop_depth - raise_total) * 1000:.0f}mm below the surface, tilted, "
+                  f"compliant)...")
+            if not self.goto_pose_rigid(entry, entry_rotation,
+                                        duration=max(0.5, float(params["descend_seconds"])),
+                                        use_impedance=True):
+                return False, {"error": "Failed to command the descent"}
+            arrived, err = self.reached(entry, contact_tol)
+            if not arrived:
+                print(f"[Scoop] Descent stopped {err * 1000:.0f}mm short — backing out")
+                self.goto_pose_rigid(approach, entry_rotation, duration=2.5)
+                return False, {
+                    "error": (f"Could not enter the powder in '{source}' "
+                              f"(off by {err * 1000:.0f}mm); the bowl is probably "
+                              f"fouling the rim"),
+                }
+
+            ok, msg = self.check_still_holding(start_width, tag="Scoop")
+            if not ok:
+                return False, {"error": f"Lost the scoop entering the powder: {msg}"}
+
+            # 8b. How high the compliant descent actually stopped, and the bowl
+            # put where the plan has it: the descent re-commanded that much
+            # lower, and an impedance sweep shifted down by the same amount.
+            # Still under impedance, so the bowl stays compliant against a
+            # floor it meets.
+            sag_cap = max(0.0, float(params["sag_compensation_max"]))
+            stopped_z = float(np.asarray(self.get_current_pose().translation, dtype=float)[2])
+            descent_sag = stopped_z - float(np.asarray(entry, dtype=float)[2])
+            lowered = np.zeros(3)
+            if descent_sag > 0.002 and sag_cap > 0.0:
+                lowered = np.array([0.0, 0.0, min(descent_sag, sag_cap)])
+                print(f"[Scoop] The compliant descent stopped {descent_sag * 1000:.1f}mm above "
+                      f"its command; commanding {lowered[2] * 1000:.1f}mm lower so the bowl is "
+                      f"where the plan put it")
+                self.goto_pose_rigid(np.asarray(entry, dtype=float) - lowered, entry_rotation,
+                                     duration=max(0.5, float(params["descend_seconds"])),
+                                     use_impedance=True)
+                left = (float(np.asarray(self.get_current_pose().translation, dtype=float)[2])
+                        - float(np.asarray(entry, dtype=float)[2]))
+                print(f"[Scoop]   now {left * 1000:+.1f}mm from the planned height")
+
+            # 9. The sweep. Roll nose-down -> nose-up about a bowl centre that
+            # barely moves. Every waypoint recomputes the TCP from the bowl
+            # target, so the ARM backs up as the wrist rolls -- that is what
+            # keeps the bowl in the same piece of powder instead of swinging it
+            # on the arc of |tool_offset|, which for this scoop is ~38mm of
+            # unwanted travel.
+            print(f"[Scoop] Sweeping {dig_tilt_deg:+.0f}° -> "
+                  f"{sweep_end_tilt_deg:+.0f}° over {sweep_seconds:.1f}s in "
+                  f"{waypoints} waypoints; bowl advances "
+                  f"{travel * 1000:.0f}mm, floor z "
+                  f"{plan[0][1][2] + raise_total:.4f} -> {plan[-1][1][2] + raise_total:.4f}...")
+            # Streamed (sweep_mode stream) the sweep is ONE continuous
+            # motion: every goto_pose ends in `_settle`, which waits for the
+            # servos to stop, and a bowl buried in powder never stops (12
+            # blocking waypoints turned a 2s sweep into a staircase of
+            # pauses). sweep_mode position walks blocking, position-controlled
+            # waypoints instead: the streamed sweep overshot 11.9 mm in air.
+            # The descent's sag is the impedance's; a position-controlled
+            # sweep goes where it is sent and must not inherit the correction.
+            shift = (np.zeros(3) if position_sweep else lowered) - up
+            rotations = [rotation_at(a) for a, _ in plan[1:]]
+            tcps = [self.tcp_for_tip(c, R, tool_offset) - shift
+                    for (_, c), R in zip(plan[1:], rotations)]
+            swept = 0
+            jammed = None
             if position_sweep:
-                print(f"[Scoop]   position-controlled sweep: {waypoints} blocking "
-                      f"waypoints, each where it is sent")
+                streamed, why = False, "sweep_mode 'position'"
             else:
-                print(f"[Scoop]   continuous sweep unavailable ({why}); "
-                      f"falling back to {waypoints} blocking waypoints")
-            per_step = sweep_seconds / waypoints
-            for (angle, _centre), tcp, R in zip(plan[1:], tcps, rotations):
-                if not self.goto_pose_rigid(tcp, R, duration=max(0.15, per_step),
-                                            use_impedance=not position_sweep):
-                    print(f"[Scoop]   sweep stopped at {angle:+.0f}°")
-                    break
-                swept += 1
+                streamed, why = self.stream_pose_path(
+                    tcps, rotations, seconds=sweep_seconds, tag="Scoop",
+                    cartesian_impedance=True)
+            if streamed:
+                swept = waypoints
+                print(f"[Scoop]   swept as one continuous motion ({why})")
+            else:
+                # Correct, just not smooth -- and slow when the bowl is loaded.
+                if position_sweep:
+                    print(f"[Scoop]   position-controlled sweep: {waypoints} blocking "
+                          f"waypoints, each checked where it arrived")
+                else:
+                    print(f"[Scoop]   continuous sweep unavailable ({why}); "
+                          f"falling back to {waypoints} blocking waypoints")
+                per_step = sweep_seconds / waypoints
+                for (angle, _centre), tcp, R in zip(plan[1:], tcps, rotations):
+                    if not self.goto_pose_rigid(tcp, R, duration=max(0.15, per_step),
+                                                use_impedance=not position_sweep):
+                        print(f"[Scoop]   sweep stopped at {angle:+.0f}°")
+                        break
+                    if position_sweep:
+                        # goto_pose_rigid reports a command sent, not a pose
+                        # reached: after an abort every later waypoint was
+                        # refused and the log still said "Swept 12/12".
+                        there, off = self.reached(tcp, jam_tol)
+                        if not there:
+                            jammed = {"angle_deg": float(angle), "off_mm": round(off * 1000, 1),
+                                      "dig": dig + 1, "raised_mm": round(raise_total * 1000, 1)}
+                            print(f"[Scoop] JAMMED at {angle:+.0f}°: the TCP is "
+                                  f"{off * 1000:.0f}mm from its waypoint (tolerance "
+                                  f"{jam_tol * 1000:.0f}mm), the bowl caught on the dish "
+                                  f"floor.{self.robot_fault()}")
+                            break
+                    swept += 1
+            if jammed is None:
+                break
+
+            # The jam: get out first, whatever happens next.
+            jams.append(jammed)
+            if not self.lift_out(height=0.06, tag="Scoop"):
+                return False, {
+                    "error": (f"Scoop jammed at {jammed['angle_deg']:+.0f}° in '{source}' and "
+                              f"could not be lifted out: the arm is still in the dish. "
+                              f"{REFUSED_HINT}.{self.robot_fault()}"),
+                    "jams": jams,
+                }
+            if dig == jam_retries:
+                return False, {
+                    "error": (f"Scoop jammed {len(jams)} time(s) against the floor of "
+                              f"'{source}' (last at {jammed['angle_deg']:+.0f}°, "
+                              f"{jammed['off_mm']:.0f}mm off); lifted out, nothing scooped. "
+                              f"Raise z_offset for this dish."),
+                    "jams": jams,
+                }
+            raise_total += jam_raise
+            print(f"[Scoop] Digging again {raise_total * 1000:.0f}mm higher "
+                  f"(retry {dig + 1}/{jam_retries})...")
+            arrived, err = self.goto_with_retry(approach, entry_rotation,
+                                                duration=approach_seconds,
+                                                tol=float(params["hover_tol"]), tag="Scoop")
+            if not arrived:
+                return False, {"error": (f"After a jam, could not get back above '{source}' "
+                                         f"(off by {err * 1000:.0f}mm)"), "jams": jams}
+
         final_angle = plan[swept][0] if swept < len(plan) else plan[-1][0]
         end_err = (np.asarray(self.get_current_pose().translation, dtype=float)
                    - np.asarray(tcps[-1], dtype=float))
@@ -1080,16 +1163,24 @@ class ScoopSkill(BaseSkill):
         if handle_clearance > 0.0:
             clear_floor = max(clear_floor, rim_top + handle_clearance
                               - handle_above_floor(exit_angle))
-        clear_z = max(clear_floor, float(plan[-1][1][2]) + 0.005)
+        # A dig raised after a jam ends that much higher; never lift downward.
+        clear_z = max(clear_floor, float(plan[-1][1][2]) + 0.005) + raise_total
 
         stage_rotation = rotation_at(final_angle)
         stage_centre = np.array([final_x, float(site[1]), clear_z])
         stage = self.tcp_for_tip(stage_centre, stage_rotation, tool_offset)
         print(f"[Scoop] Lifting straight out to z={clear_z:.4f} at "
               f"{final_angle:+.0f}° (clearing the rim before rolling up)...")
-        if not self.goto_pose_rigid(stage, stage_rotation,
-                                    duration=max(0.4, float(params["lift_seconds"]) * 0.4)):
-            return False, {"error": "Failed to lift the scoop clear of the rim"}
+        # Retried when refused: a lift sent in the controller's recovery
+        # window was dropped and left the arm in the dish (2026-10-15).
+        arrived, err = self.goto_with_retry(stage, stage_rotation,
+                                            duration=max(0.4, float(params["lift_seconds"]) * 0.4),
+                                            tol=float(params["contact_tol"]), tag="Scoop")
+        if not arrived:
+            self.lift_out(height=0.06, tag="Scoop")
+            return False, {"error": (f"Scoop could not lift clear of the rim (off by "
+                                     f"{err * 1000:.0f}mm); lifted straight out instead"),
+                           "jams": jams}
 
         lift_rotation = rotation_at(exit_angle)
         lift_centre = np.array([final_x, float(site[1]),
@@ -1098,13 +1189,14 @@ class ScoopSkill(BaseSkill):
         print(f"[Scoop] Rising to z={lift_centre[2]:.4f} while rolling "
               f"{final_angle:+.0f}° -> {exit_angle:+.0f}° "
               f"({'levelling' if bool(params['level_on_lift']) else 'cupping the load'})...")
-        if not self.goto_pose_rigid(lift, lift_rotation,
-                                    duration=max(0.5, float(params["lift_seconds"]) * 0.6)):
-            return False, {"error": "Failed to lift the scoop clear"}
-        arrived, err = self.reached(lift, float(params["hover_tol"]))
+        arrived, err = self.goto_with_retry(lift, lift_rotation,
+                                            duration=max(0.5, float(params["lift_seconds"]) * 0.6),
+                                            tol=float(params["hover_tol"]), tag="Scoop")
         if not arrived:
+            self.lift_out(height=0.06, tag="Scoop")
             return False, {
                 "error": f"Scoop did not lift clear (off by {err * 1000:.0f}mm)",
+                "jams": jams,
             }
 
         ok, msg = self.check_still_holding(start_width, tag="Scoop")
@@ -1141,6 +1233,8 @@ class ScoopSkill(BaseSkill):
             "descent_sag": descent_sag,
             "sweep_mode": "position" if position_sweep else "stream",
             "sag_compensation": float(lowered[2]),
+            "jams": jams,
+            "dig_raised": raise_total,
             "surface_z": surface_z,
             "surface_given": surface_override is not None,
             # The bite actually used; differs from dig_tilt_requested when

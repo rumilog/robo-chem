@@ -18,6 +18,12 @@ from .instruction_parser import InstructionParser
 from .label_resolver import (LabelResolver, labels_match, looks_like_label_query,
                              normalize_label, resolve_sam_prompt)
 
+#: The real cell's tabletop in the arm's base frame, metres. The user measured
+#: the bottom of the Panda's base (the base frame's origin) 11.2 mm above the
+#: tabletop (2026-10-10); it had been taken as 0. The recalibrated cameras read
+#: the table at -9.9 to -11.6 mm. The sim's table is at 0 and does not use this.
+REAL_TABLE_Z = -0.0112
+
 
 def triangulate_rays(rays):
     """
@@ -290,7 +296,7 @@ class VisionSystem:
         self.projection_pixel_slack = 40.0
         #: Table height in the base frame (m), what a transparent container
         #: stands on when it is rebuilt from its silhouette.
-        self.table_z = 0.0
+        self.table_z = REAL_TABLE_Z
         #: How far one camera's silhouette ray may pass from a transparent
         #: container's triangulated centre before that camera is dropped. Four
         #: clear cups seen by 3-4 cameras each came in at 6-11 mm (2026-10-07).

@@ -260,6 +260,110 @@ def structured_completion(
     return parsed
 
 
+def tool_completion(
+    *,
+    agent: str,
+    model: str,
+    system_prompt: str,
+    user_content: List[dict],
+    tools: List[dict],
+    handlers: dict,
+    schema: dict,
+    schema_name: str,
+    max_rounds: int = 6,
+    temperature=0.2,
+    client: Any = None,
+    on_call=None,
+) -> dict:
+    """
+    Let the model call tools until it is ready, then return its answer as a
+    dict matching ``schema``.
+
+    ``tools`` are OpenAI function definitions; ``handlers`` maps each name to
+    a callable taking the call's arguments and returning ``(text, images)``:
+    the text goes back as the tool result, and the images (content blocks)
+    follow in a user message, because a tool result can only be text. After
+    ``max_rounds`` rounds the tools are withdrawn and the answer is required.
+    ``on_call(name, args, text)`` is told about every call.
+    """
+    client = client or get_client(agent)
+    messages: List[dict] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {"name": schema_name, "schema": schema, "strict": True},
+    }
+    for round_ in range(max_rounds + 1):
+        final = round_ == max_rounds
+        if final:
+            messages.append({"role": "user", "content": [text_block(
+                "No more tool calls: write the answer now from what you have.")]})
+        request: dict = {"model": model, "messages": messages,
+                         "response_format": response_format}
+        if not final:
+            request["tools"] = tools
+        if temperature is not None:
+            request["temperature"] = temperature
+        try:
+            completion = _create(agent, client, request)
+        except LLMResponseError:
+            raise
+        except Exception as exc:
+            if not _mentions(exc, "temperature"):
+                raise
+            request.pop("temperature", None)
+            temperature = None
+            completion = _create(agent, client, request)
+        message = completion.choices[0].message
+        calls = list(getattr(message, "tool_calls", None) or [])
+        if calls and not final:
+            messages.append({
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": [{"id": c.id, "type": "function",
+                                "function": {"name": c.function.name,
+                                             "arguments": c.function.arguments}}
+                               for c in calls],
+            })
+            images: List[dict] = []
+            for call in calls:
+                name = call.function.name
+                try:
+                    args = json.loads(call.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                handler = handlers.get(name)
+                if handler is None:
+                    text, shown = f"unknown tool {name!r}", []
+                else:
+                    try:
+                        text, shown = handler(**args)
+                    except Exception as exc:
+                        text, shown = f"{name} failed: {type(exc).__name__}: {exc}", []
+                if on_call is not None:
+                    on_call(name, args, text)
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": text})
+                images += list(shown or [])
+            if images:
+                messages.append({"role": "user", "content":
+                                 [text_block("The images from the tool calls above:")] + images})
+            continue
+        raw = message.content
+        if not raw:
+            raise LLMResponseError(f"{agent}: model returned an empty response")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise LLMResponseError(
+                f"{agent}: model response was not valid JSON: {raw[:400]}") from exc
+        if not isinstance(parsed, dict):
+            raise LLMResponseError(f"{agent}: expected a JSON object, got {type(parsed).__name__}")
+        return parsed
+    raise LLMResponseError(f"{agent}: no answer after {max_rounds} tool rounds")
+
+
 def _parses(raw: str) -> bool:
     try:
         json.loads(raw)

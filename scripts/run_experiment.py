@@ -38,13 +38,14 @@ import ast
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from robochem.skills import SkillsExecutor
 from robochem.skills.pacing import paced
-from robochem.vision import VisionSystem
+from robochem.vision import REAL_TABLE_Z, VisionSystem
 from robochem.vision.bench_manifest import BENCHES
 from robochem.verification.chemistry_verifier import ChemistryVerifier
 from robochem.utils.logging_utils import ExperimentLogger
@@ -54,8 +55,6 @@ from robochem.orchestrator.vlm_orchestrator import VLMOrchestrator
 
 DEFAULT_CAMERAS = [2, 3, 4, 5]
 
-#: Table height in the arm's base frame, metres. The sim's is 0.0 too.
-REAL_TABLE_Z = 0.0
 
 
 def parse_params(raw: str) -> dict:
@@ -93,12 +92,65 @@ def parse_params(raw: str) -> dict:
 
 
 def confirm_step(subtask, call) -> bool:
-    """``--step``: run this skill only on Enter. q, n or end of input stop."""
-    try:
-        answer = input(f"   [step {subtask.index}] Enter to run it, q to stop here: ")
-    except EOFError:
-        return False
-    return answer.strip().lower() not in ("q", "quit", "n", "no", "stop")
+    """
+    ``--step``: Enter runs the call; ``key=value`` changes its parameters
+    first (e.g. ``pour_angle=60``), then asks again; q stops the run here.
+    Anything else is not taken as a yes: until 2026-10-15 any text ran the
+    step unchanged, and a typed "60 degrees" was silently ignored.
+    """
+    from robochem.orchestrator.agent_orchestrator import parse_step_overrides
+
+    while True:
+        try:
+            answer = input(f"   [step {subtask.index}] Enter to run it, key=value to change a "
+                           f"parameter (e.g. pour_angle=60), q to stop here: ")
+        except EOFError:
+            return False
+        text = answer.strip()
+        if not text:
+            return True
+        if text.lower() in ("q", "quit", "n", "no", "stop"):
+            return False
+        changes = parse_step_overrides(text)
+        if not changes:
+            print("   Not understood. Type key=value (e.g. pour_angle=60), Enter to run, "
+                  "or q to stop.")
+            continue
+        for key, value in changes.items():
+            print(f"   {key}: {call.params.get(key, '(default)')} -> {value}")
+            call.params[key] = value
+        print(f"   -> --skill {call.skill} --params '{json.dumps(call.params)}'")
+
+
+def make_snapshot(vision, folder: Path):
+    """
+    The orchestrator's ``snapshot``: one photo of the bench per camera,
+    saved as <folder>/s<NN>_<skill>_cam<k>.jpg. Taken after every pour, so
+    the report sees each colour before the cup is poured out.
+    """
+    import cv2
+    import numpy as np
+
+    order = getattr(vision, "frame_color_order", "bgr")
+
+    def snapshot(subtask, call):
+        loc = getattr(vision, "object_localizer", None)
+        if loc is not None and hasattr(loc, "capture_pointclouds"):
+            frames = sorted((loc.capture_pointclouds().get("images") or {}).items())
+        else:
+            frames = list(enumerate(vision.capture_scene() or []))
+        folder.mkdir(parents=True, exist_ok=True)
+        paths = []
+        for cam, frame in frames:
+            image = np.asarray(frame)
+            if str(order).lower() == "rgb":
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+            path = folder / f"s{subtask.index:02d}_{call.skill}_cam{cam}.jpg"
+            cv2.imwrite(str(path), image, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+            paths.append(str(path.resolve()))
+        return paths
+
+    return snapshot
 
 
 def build_sim_stack(args):
@@ -183,9 +235,10 @@ def build_stack(args):
         config={"workspace_min": args.workspace_min, "workspace_max": args.workspace_max,
                 # Where the table is, as the sim's cell config says it
                 # (robochem.sim.build_cell), so scoop's floor and a held cup's
-                # bottom come from the same code path on both. The arm stands
-                # on the bench: the dishes' base_z read -0.1 to -1.5 mm
-                # (2026-10-07/08). Without it scoop fell back to base_z.
+                # bottom come from the same code path on both. The table is
+                # 11.2 mm below the base frame (measured 2026-10-10; the
+                # recalibrated cameras agree). Without it scoop fell back to
+                # base_z.
                 "table_z": REAL_TABLE_Z},
     )
 
@@ -216,6 +269,9 @@ def main() -> int:
         default=os.environ.get("GROUNDING_URL", "http://127.0.0.1:5005"),
     )
     parser.add_argument("--log-dir", default=os.environ.get("ROBOCHEM_LOG_DIR", "experiments"))
+    parser.add_argument("--no-step-photos", action="store_true",
+                        help="Do not photograph the bench after each pour (the report "
+                             "uses those photos for the colours of cups poured out later)")
     parser.add_argument("--max-retries", type=int, default=3,
                         help="Corrective replanning attempts for --task")
     parser.add_argument("--legacy-planner", action="store_true",
@@ -383,6 +439,8 @@ def main() -> int:
             dry_run=args.dry_run,
             log_dir=args.log_dir,
             confirm=confirm_step if args.step else None,
+            snapshot=(None if args.dry_run or args.no_step_photos else make_snapshot(
+                vision, Path(args.log_dir) / f"photos_{time.strftime('%Y%m%d_%H%M%S')}")),
         )
 
         resume = None

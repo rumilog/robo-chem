@@ -162,18 +162,40 @@ DISH_HEIGHT = 0.029
 #: may press the bowl into the dish floor. The user then set -25 mm.
 #: Change this one number to tune it; a run can also pass "z_offset" in
 #: scoop's --params.
-DISH_SCOOP_Z_OFFSET = -0.025
+#: **Reset to 0 on 2026-10-10** after the cameras were recalibrated (they
+#: disagreed by ~36 mm and the table was taken as z 0, not -11.2 mm). Every
+#: offset tuned against the old calibration is being re-checked from zero;
+#: this one was -0.025. First run at 0 (2026-10-10): the user said ~25 mm too
+#: high. 14 mm of that was the floor taken from the dish cloud's base, which
+#: read 14 mm above the table (scoop now takes the table by the dish's top);
+#: -11 mm was the rest, at the user's word.
+#: At -11 mm every sweep that finished ended ~6 mm ABOVE its last setpoint
+#: (+6.0, +6.0, +5.7 mm on 2026-10-10/15): the plan ran 6 mm below the dish
+#: floor and position control pressed the bowl into it. Two of five sweeps
+#: jammed there at the 60 deg entry (libfranka abort, the arm left in the
+#: dish). -5 mm puts the end of the sweep on the floor, no deeper: the bowl
+#: cannot collect anything below the floor, so it scoops as deep as before.
+DISH_SCOOP_Z_OFFSET = -0.005
 
 #: dump's forward_offset on this bench, metres in the base frame (+ away from
 #: the arm, - back toward it). The user saw the dump land too far forward and
 #: asked for 10 mm back (2026-10-08). A run can pass "forward_offset" in
 #: dump's --params instead.
-DUMP_FORWARD_OFFSET = -0.010
+#: **Reset to 0 on 2026-10-10** after the cameras were recalibrated (they
+#: disagreed by ~36 mm and the table was taken as z 0, not -11.2 mm). Every
+#: offset tuned against the old calibration is being re-checked from zero;
+#: this one was -0.010. Part of it may be the streamed carry overshooting
+#: (11.9 mm in free air), which recalibration does not change.
+DUMP_FORWARD_OFFSET = 0.0
 
 #: dump's min_tip_deg on this bench: the least tip that counts as emptied.
 #: The skill's 60 failed a dump into the beaker that stalled at 59.9 deg, which
-#: the user watched empty the scoop well (2026-10-08).
-DUMP_MIN_TIP_DEG = 55.0
+#: the user watched empty the scoop well (2026-10-08). 55 then failed one at
+#: 54.6 deg (2026-10-15: the beaker 0.57 m out caps the tip at 59, and the
+#: streamed tip ends ~4 deg short of its command). The user: 54.6 is fine,
+#: "don't set it too strict, keeping the experiment going is the most
+#: important". 45 leaves room under the reach cap.
+DUMP_MIN_TIP_DEG = 45.0
 
 #: stir's circle on this bench, metres. The skill's defaults (15 mm, kept 12 mm
 #: off the wall) drew a circle the user found too small (2026-10-08). The arm
@@ -182,6 +204,61 @@ DUMP_MIN_TIP_DEG = 55.0
 #: 1.75 mm off the wall at the edge of the circle, if the centre is right.
 STIR_RADIUS = 0.020
 STIR_WALL_CLEARANCE = 0.006
+#: stir's fine_zone on this bench, metres: how far above its aim (5 mm under
+#: the cup model's base, with to_floor) the descent switches from 5 mm steps
+#: to 1 mm force-read steps. The skill's 15 mm worked while the cups stood on
+#: z 0 (2026-10-08: 1 mm steps from TCP z 0.0923, floor felt at 0.0803).
+#: With table_z -0.0112 the aim moved 11.2 mm down and the fine zone with it,
+#: to start at ~0.0798, i.e. at the floor: the rod hit it on a coarse step,
+#: pressed in, and stirred against the bottom, dragging the cup (the user,
+#: 2026-10-10). 15 + 11.2 put the 1 mm steps back where they were (0.026).
+#: Three stirs of cup B then felt the floor at TCP z 0.0821 every time, and
+#: the user found the descent too slow: 0.020 starts the 1 mm steps ~4 mm
+#: above that (0.0861), and STIR_COARSE_STEP crosses the open cup in two
+#: moves. About 7 steps instead of ~17, each a separate motion plus a force
+#: read. The cups are identical and stand on the table, so the floor is felt
+#: at the same height in A, B and C.
+STIR_FINE_ZONE = 0.020
+#: Coarse steps were 20 mm until 2026-10-15: in the pipeline the first one
+#: (20 mm in 0.4 s, in free air above cup A) read +1.00 N against the 1.0 N
+#: threshold and the stir was refused as "landing on the rim". 10 mm, and the
+#: skill now lets the arm settle before reading the force after a coarse step.
+STIR_COARSE_STEP = 0.010
+#: stir's contact_backoff on this bench, metres: how far above the felt floor
+#: the circle runs. The skill's 4 mm (to_floor) still scraped: the circle is
+#: streamed under cartesian impedance and its height wanders by millimetres
+#: (2026-10-10, contact at TCP z 0.0821, stirred at 0.0861, the cup dragged).
+#: The user chose to keep the smooth stream and stir 3 mm higher rather than
+#: switch to position-controlled waypoints (smooth: false). In a 4.4 mm-deep
+#: 10 ml the tip may now ride near the surface. With position control
+#: (STIR_SMOOTH False) 7 mm no longer touched (18:39), and the user asked for
+#: 4 mm again. Streamed with z at 1500 N/m (18:54) it still touched lightly
+#: (contact at TCP z 0.0801, stirred at 0.0841): 5 mm, with z at 2000.
+STIR_CONTACT_BACKOFF = 0.005
+#: stir's smooth on this bench. False: the circle is walked as blocking,
+#: position-controlled waypoints (waypoints_per_rev 12, 0.4 s each) instead of
+#: one streamed impedance motion per revolution. At 7 mm back off the
+#: streamed circle still touched the bottom (2026-10-10 18:36: contact at
+#: TCP z 0.0821, stirred at 0.0891, revolutions ending 6.3-6.8 mm off), and the
+#: user asked for position control. The scoop's position sweep tracked to
+#: 0.3 mm.
+STIR_SMOOTH = False
+#: Then the user asked to keep the smooth stream and fix its height instead:
+#: the stream is cartesian impedance at frankapy's 600 N/m, and joint friction
+#: changing direction around the circle moves z by millimetres. Streamed
+#: again, with z alone stiffened to 1500 N/m (x/y and rotation at frankapy's
+#: defaults, so the 50 Hz x/y setpoint steps stay soft). If the arm shakes,
+#: stop it and go back to STIR_SMOOTH False.
+#: At 1500 (18:54) no shaking, revolutions ended dz +0.4..+0.5 mm (+1.0..+1.2
+#: at 600), and the rod still touched lightly: 2000.
+STIR_SMOOTH = True
+STIR_STREAM_STIFFNESS = [600.0, 600.0, 2000.0, 50.0, 50.0, 50.0]
+#: The waypoint circle's pace: the skill's 12 points at 0.4 s each was too
+#: slow and stepped for the user (18:39). 16 at 0.25 s: shorter segments, so
+#: the stops between them are smaller, and 4.0 s commanded per revolution
+#: instead of 4.8. Each blocking goto_pose still adds its own start-up time.
+STIR_WAYPOINTS_PER_REV = 16
+STIR_SECONDS_PER_WAYPOINT = 0.25
 
 
 def _dish(name: str, label: str) -> BenchObject:
@@ -216,7 +293,11 @@ CLEAR_CUP_HEIGHT = 0.0473
 #: (0.40, -0.16) and B at (0.40, -0.05), so this moves A's grasp 5 mm away
 #: from B. It belongs to that spot: if A is moved, check it again with
 #: point_at.py. A run can pass "lateral_offset" in pick_up's --params.
-CUP_A_LATERAL_OFFSET = -0.005
+#: **Reset to 0 on 2026-10-10** after the cameras were recalibrated (they
+#: disagreed by ~36 mm and the table was taken as z 0, not -11.2 mm). Every
+#: offset tuned against the old calibration is being re-checked from zero;
+#: this one was -0.005.
+CUP_A_LATERAL_OFFSET = 0.0
 
 #: How A, B and C are picked: the user's procedure (2026-10-08). The jaws
 #: open fully, go down CLEAR_CUP_SLIDE_IN behind the cup (toward the base),
@@ -225,8 +306,15 @@ CUP_A_LATERAL_OFFSET = -0.005
 #: user saw the jaws close too high on the cup and asked for 12 mm lower
 #: (rim 25 mm above the TCP instead of 13). 60 mm behind keeps the fingers
 #: (pads +-10 mm) about 13 mm off the 73.2 mm rim on the way down.
+#: CLEAR_CUP_GRASP_Z_OFFSET:
+#: **Reset to 0 on 2026-10-10** after the cameras were recalibrated (they
+#: disagreed by ~36 mm and the table was taken as z 0, not -11.2 mm). Every
+#: offset tuned against the old calibration is being re-checked from zero;
+#: it was -0.012. A clear cup is rebuilt standing on VisionSystem.table_z,
+#: which was 0 while the table is at -11.2 mm: the cup model sat ~11 mm high,
+#: which this offset was compensating.
 CLEAR_CUP_SLIDE_IN = 0.06
-CLEAR_CUP_GRASP_Z_OFFSET = -0.012
+CLEAR_CUP_GRASP_Z_OFFSET = 0.0
 #: Close to this and stop. The force-limited close (1.5 N) kept squeezing:
 #: the user saw the cup "squeezed heavily", held at 37 mm on a section the
 #: user measured at about 61 mm (2026-10-08). 61 - 3 mm. Wider if it still
@@ -238,7 +326,11 @@ _CUP_PICK = (("slide_in", CLEAR_CUP_SLIDE_IN), ("z_offset", CLEAR_CUP_GRASP_Z_OF
 #: pick_up's z_offset for the beaker (the "50 ML WATER" cup): the user found
 #: the jaws closing too high on it (2026-10-08) and gave no number; 12 mm, as
 #: for A-C. Change this one number to tune it.
-BEAKER_GRASP_Z_OFFSET = -0.012
+#: **Reset to 0 on 2026-10-10** after the cameras were recalibrated (they
+#: disagreed by ~36 mm and the table was taken as z 0, not -11.2 mm). Every
+#: offset tuned against the old calibration is being re-checked from zero;
+#: this one was -0.012, likely the same 11 mm as the clear cups'.
+BEAKER_GRASP_Z_OFFSET = 0.0
 
 
 def _cup(name: str, label: str, aliases: Tuple[str, ...],
@@ -294,6 +386,10 @@ MAGIC_BEAKER = BenchManifest("magic_beaker", [
         # this manifest): 10 mm back keeps the jaws off the crank, where the
         # handle's section changes and they cannot seat; 1 N, not the 1.5 N
         # default. The default forward_offset 0 lands on the crank.
+        # Reset to 0 on 2026-10-10 with the other offsets, at the user's
+        # request, after the recalibration. Back to -0.010 on 2026-10-15: at
+        # 0 the jaws closed on the crank (27.1 mm, not grasped), the spoon
+        # slid to 8.2 mm in the jaws, and the scoop jammed on the dish floor.
         pick=(("z_offset", 0.0), ("grasp_force", 1.0), ("forward_offset", -0.010)),
     ),
     BenchObject(
@@ -319,7 +415,14 @@ MAGIC_BEAKER = BenchManifest("magic_beaker", [
     skill_defaults={"dump": {"forward_offset": DUMP_FORWARD_OFFSET,
                              "min_tip_deg": DUMP_MIN_TIP_DEG},
                     "stir": {"stir_radius": STIR_RADIUS,
-                             "wall_clearance": STIR_WALL_CLEARANCE}},
+                             "wall_clearance": STIR_WALL_CLEARANCE,
+                             "fine_zone": STIR_FINE_ZONE,
+                             "coarse_step": STIR_COARSE_STEP,
+                             "contact_backoff": STIR_CONTACT_BACKOFF,
+                             "smooth": STIR_SMOOTH,
+                             "stream_stiffness": STIR_STREAM_STIFFNESS,
+                             "waypoints_per_rev": STIR_WAYPOINTS_PER_REV,
+                             "seconds_per_waypoint": STIR_SECONDS_PER_WAYPOINT}},
 )
 
 #: Benches selectable with ``run_experiment.py --bench``.

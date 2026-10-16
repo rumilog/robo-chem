@@ -2548,7 +2548,9 @@ def test_executor_uses_bench_names():
     """A bench alias becomes the bench name before pick sites and tool CAD are looked up."""
     print("\n[executor: bench names]")
     from robochem.skills import SkillsExecutor
-    from robochem.vision.bench_manifest import MAGIC_BEAKER
+    from robochem.vision.bench_manifest import (
+        BEAKER_GRASP_Z_OFFSET, CLEAR_CUP_GRASP_Z_OFFSET, CUP_A_LATERAL_OFFSET,
+        DISH_SCOOP_Z_OFFSET, DUMP_FORWARD_OFFSET, DUMP_MIN_TIP_DEG, MAGIC_BEAKER)
 
     class Vision:
         canonical_name = staticmethod(MAGIC_BEAKER.canonical)
@@ -2595,9 +2597,9 @@ def test_executor_uses_bench_names():
     check("nothing is invented for an object with nothing measured",
           ex._bench_defaults("pick_up", {"object_name": "citric acid cup"})
           == {"object_name": "citric acid cup"})
-    check("the beaker is grasped 12 mm lower",
+    check("the beaker gets the bench's grasp z_offset",
           ex._bench_defaults("pick_up", ex._bench_names({"object_name": "50 ML WATER"}))
-          == {"object_name": "plastic beaker", "z_offset": -0.012},
+          == {"object_name": "plastic beaker", "z_offset": BEAKER_GRASP_Z_OFFSET},
           f"{ex._bench_defaults('pick_up', {'object_name': 'plastic beaker'})}")
     # ... and set down as much lower when it goes back.
     ex._remember_pick_site("pick_up", {"object_name": "plastic beaker"},
@@ -2615,29 +2617,31 @@ def test_executor_uses_bench_names():
     check("a pick not moved down puts back as before",
           "release_clearance" not in back, f"{back}")
     ex.held = None
-    cup_pick = {"slide_in": 0.06, "z_offset": -0.012, "grip_width": 0.058}
-    check("cups B and C are slid into from behind, 12 mm lower, closed to 58 mm",
+    cup_pick = {"slide_in": 0.06, "z_offset": CLEAR_CUP_GRASP_Z_OFFSET, "grip_width": 0.058}
+    check("cups B and C are slid into from behind, at the bench z_offset, closed to 58 mm",
           ex._bench_defaults("pick_up", {"object_name": "clear cup b"})
           == {"object_name": "clear cup b", **cup_pick}
           and ex._bench_defaults("pick_up", {"object_name": "clear cup c"})
           == {"object_name": "clear cup c", **cup_pick})
-    check("cup A too, its grasp 5 mm away from B as the user read it with point_at.py",
+    check("cup A too, with its own lateral_offset",
           ex._bench_defaults("pick_up", ex._bench_names({"object_name": "cup a"}))
-          == {"object_name": "clear cup a", **cup_pick, "lateral_offset": -0.005})
+          == {"object_name": "clear cup a", **cup_pick,
+              "lateral_offset": CUP_A_LATERAL_OFFSET})
     check("place is not filled", ex._bench_defaults("place", {"target_location":
           "larger spoon"}) == {"target_location": "larger spoon"})
     out = ex._bench_defaults("scoop", ex._bench_names({"powder_source": "CITRIC ACID"}))
     check("a scoop from a dish is sized to its measured inside and height, not a rim fit",
           out == {"powder_source": "citric acid cup", "container_radius": 0.0455,
                   "container_height": 0.029, "sweep_mode": "position",
-                  "z_offset": -0.025}, f"{out}")
+                  "z_offset": DISH_SCOOP_Z_OFFSET}, f"{out}")
     out = ex._bench_defaults("scoop", {"powder_source": "baking soda cup",
                                        "container_radius": 0.04})
     check("a container_radius the call passes is kept", out["container_radius"] == 0.04)
     for target in ("clear cup a", "plastic beaker", "B 10 ML WATER"):
         out = ex._bench_defaults("dump", ex._bench_names({"target_container": target}))
-        check(f"every dump on the bench lands 10 mm back ({target})",
-              out.get("forward_offset") == -0.010 and out.get("min_tip_deg") == 55.0,
+        check(f"every dump on the bench gets the bench forward_offset ({target})",
+              out.get("forward_offset") == DUMP_FORWARD_OFFSET
+              and out.get("min_tip_deg") == DUMP_MIN_TIP_DEG,
               f"{out}")
     out = ex._bench_defaults("dump", {"target_container": "clear cup a", "forward_offset": 0.0})
     check("a forward_offset the call passes is kept", out["forward_offset"] == 0.0)
@@ -2902,6 +2906,42 @@ def test_scoop_takes_a_known_rim_height():
           z0 is not None and z1 is not None and z1 > z0, f"{z0} -> {z1}")
 
 
+def test_scoop_floor_from_the_table_when_the_base_reads_high():
+    """A dish whose cloud bottom reads 14 mm up still gets the table's floor by its top."""
+    print("\n[scoop: floor from the table, base read high]")
+    import io, contextlib
+    # The cage's view on 2026-10-10: table at -11.2 mm, the 29 mm dish's cloud
+    # from 2.8 mm (14 mm above the table) to 17.0 mm (its rim reads right).
+    dish = cylinder_cloud([0.59, -0.19], base_z=0.0028, height=0.0142, radius=0.0505)
+    vision = FakeVision({"baking soda cup": dish})
+
+    def run(extra):
+        arm = FakeArm(tracking=1.0, gripper_width=0.008)
+        skill = ScoopSkill(arm, vision, {"workspace_min": [0.25, -0.40, -0.13],
+                                         "table_z": -0.0112})
+        params = {"powder_source": "baking soda cup", "container_radius": 0.0455,
+                  "tool_offset": [0.0346, 0.0034, 0.0294], "bowl_length": 0.0275,
+                  "bowl_width": 0.0205, "bowl_depth": 0.0115, "tool_back_reach": 0.030}
+        params.update(extra)
+        with contextlib.redirect_stdout(io.StringIO()):
+            return skill.execute(params)
+
+    ok0, r0 = run({})
+    ok1, r1 = run({"container_height": 0.029})
+    check("without a known height the high base still sets the floor (unchanged)",
+          ok0 and abs(r0["floor_z"] - (0.0028 + 0.008)) < 0.001
+          and "table z" not in r0["floor_source"], f"{r0.get('floor_z')}")
+    check("with the bench height the floor is the table's: -11.2 + 8 mm",
+          ok1 and abs(r1["floor_z"] - (-0.0112 + 0.008)) < 1e-6
+          and "by its top" in r1["floor_source"], f"{r1.get('floor_source')}")
+    # A dish standing 20 mm up (its top reads 20 mm high too) is not on the table.
+    raised = cylinder_cloud([0.59, -0.19], base_z=0.0228, height=0.0142, radius=0.0505)
+    vision.objects["baking soda cup"] = raised
+    ok2, r2 = run({"container_height": 0.029})
+    check("a dish whose top is 20 mm high is not taken as on the table",
+          ok2 and "table z" not in r2["floor_source"], f"{r2.get('floor_source')}")
+
+
 def test_scoop_puts_the_bowl_at_the_planned_height_under_impedance():
     """A compliant descent that stops high is re-commanded lower, and the sweep with it."""
     print("\n[scoop: impedance stopping short]")
@@ -3041,6 +3081,75 @@ def test_scoop_position_sweep():
     check("an impedance descent's sag is not carried into a position sweep",
           ok2 and r2["sag_compensation"] > 0 and np.allclose(clean, sag, atol=1e-9),
           f"comp {r2.get('sag_compensation')}")
+
+
+def test_scoop_lifts_out_of_a_jam_and_digs_again():
+    """A sweep pinned on the dish floor is detected, lifted out, and redone higher."""
+    print("\n[scoop: jammed sweep]")
+    import io, contextlib
+    tub = cylinder_cloud([0.50, 0.10], base_z=0.02, height=0.05, radius=0.06)
+    vision = FakeVision({"tub": tub})
+
+    class JammingArm(FakeArm):
+        """
+        As on 2026-10-15: the first position move after the descent pins the
+        bowl, every later move that does not go up stays put, and the first
+        command after the jam is refused (franka-interface recovering).
+        """
+        def __init__(self, jams, **kw):
+            super().__init__(**kw)
+            self.jams, self.armed, self.stuck, self.refuse = jams, False, False, 0
+
+        def goto_pose(self, pose, duration=3.0, use_impedance=True, block=True):
+            target = np.asarray(pose.translation, dtype=float)
+            if self.refuse > 0:
+                self.refuse -= 1
+                self.commands.append((target.copy(), duration, use_impedance))
+                return
+            if self.stuck:
+                if target[2] < self.pose.translation[2] + 0.02:
+                    self.commands.append((target.copy(), duration, use_impedance))
+                    return
+                self.stuck = False
+            if use_impedance:
+                self.armed = True
+            elif self.armed:
+                self.armed = False
+                if self.jams > 0:
+                    self.jams -= 1
+                    self.stuck, self.refuse = True, 0
+                    self.commands.append((target.copy(), duration, use_impedance))
+                    return
+            super().goto_pose(pose, duration=duration, use_impedance=use_impedance, block=block)
+
+    def run(arm):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            ok, r = make(ScoopSkill, vision, arm).execute(
+                {"powder_source": "tub", "push_seconds": 0.5, "sweep_mode": "position"})
+        return ok, r, out.getvalue()
+
+    ok0, r0, _ = run(FakeArm(tracking=1.0, gripper_width=0.03))
+    check("a clean sweep reports no jam and no raise",
+          ok0 and r0["jams"] == [] and r0["dig_raised"] == 0.0, f"{r0}")
+
+    arm = JammingArm(1, tracking=1.0, gripper_width=0.03)
+    ok1, r1, log1 = run(arm)
+    descents = [c[0][2] for c in arm.commands if c[2] is True]
+    check("one jam: lifted out, dug again 4 mm higher, and finished",
+          ok1 and len(r1["jams"]) == 1 and abs(r1["dig_raised"] - 0.004) < 1e-9
+          and "JAMMED" in log1 and "Lifted straight out" in log1, log1[-600:])
+    check("the second descent is commanded 4 mm above the first",
+          len(descents) >= 2 and abs((descents[-2] if len(descents) > 2 else descents[1])
+                                     - descents[0] - 0.004) < 0.003, f"{descents}")
+    check("the log no longer claims every waypoint after a jam",
+          "Swept 12/12" not in log1.split("JAMMED")[0][-200:])
+
+    arm2 = JammingArm(99, tracking=1.0, gripper_width=0.03)
+    ok2, r2, log2 = run(arm2)
+    top = 0.02 + 0.05
+    check("jammed every time: fails, says so, and leaves the arm out of the dish",
+          not ok2 and "jammed 2 time(s)" in r2.get("error", "")
+          and arm2.pose.translation[2] > top, f"{r2.get('error')} z={arm2.pose.translation[2]:.3f}")
 
 
 def test_scoop_site_offsets_and_unknown_params():
@@ -3345,10 +3454,12 @@ def main():
     test_scoop_requires_a_real_tilt()
     test_scoop_site_offsets_and_unknown_params()
     test_scoop_takes_a_known_rim_height()
+    test_scoop_floor_from_the_table_when_the_base_reads_high()
     test_scoop_puts_the_bowl_at_the_planned_height_under_impedance()
     test_streamed_scoop_and_dump_ask_for_stiff_tracking()
     test_scoop_rehearses_in_the_air()
     test_scoop_position_sweep()
+    test_scoop_lifts_out_of_a_jam_and_digs_again()
     test_dispense_never_drops_the_pipette()
     test_dispense_transfer_mode()
     test_target_not_found_is_a_failure()

@@ -31,10 +31,16 @@ def get_live_intrinsics(cam):
     the correct ones for deprojecting the depth image.
 
     Falls back to the file intrinsics if the device cannot be queried.
+
+    Cached per camera AND stream size. Keyed by camera alone, a 1280x720
+    capture (view_pointcloud.py, 2026-10-10 19:22) left its intrinsics in the
+    cache for every later 848x480 capture in the same process: every located
+    object came out misplaced or not found.
     """
     cam_id = cam.get_cam_number()
-    if cam_id in _LIVE_INTRINSICS_CACHE:
-        return _LIVE_INTRINSICS_CACHE[cam_id]
+    key = (cam_id, getattr(cam, "W", None), getattr(cam, "H", None))
+    if key in _LIVE_INTRINSICS_CACHE:
+        return _LIVE_INTRINSICS_CACHE[key]
 
     try:
         import pyrealsense2 as rs
@@ -56,7 +62,7 @@ def get_live_intrinsics(cam):
               f"({e}); using file intrinsics")
         intr = cam.get_cam_intrinsics()
 
-    _LIVE_INTRINSICS_CACHE[cam_id] = intr
+    _LIVE_INTRINSICS_CACHE[key] = intr
     return intr
 
 

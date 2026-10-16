@@ -150,8 +150,10 @@ CATALOG: Dict[str, SkillSpec] = {
              "A container a fifth full pours NOTHING below about 70 degrees. Pouring "
              "a container out -- all of it, or whatever is left in it -- is 90. Tip "
              "less, about 80, only when the step says to pour SOME and keep the rest "
-             "for later. If the plan pours from the same container again before "
-             "putting it down, this pour is capped at 60 so it is not emptied.",
+             "for later. Pours that belong together are set for you: when the same "
+             "container pours more than once, every pour but its last runs at 60; when "
+             "the same target is poured into more than once, every pour into it but "
+             "the last runs at 65; the last runs at 90.",
         params=[
             Param("target_container", "string",
                   "Container to pour into.", required=True),
@@ -386,6 +388,9 @@ CHAINING_RULES: tuple = (
     "is never poured from its tub.",
     "Drop-scale liquid additions use a held pipette and 'dispense'.",
     "'place' the tool down at the end, so the bench is left as it was found.",
+    "A container that pours into more than one target stays in the gripper between "
+    "its pours: pick_up, pour, pour, place. Do not place it and pick it up again in "
+    "between; that moves nothing and adds a scan and a grasp that can fail.",
     "A successful 'pick_up' of a tool measures where that tool's working end sits "
     "relative to the grasp, and that measurement is given to you with the gripper "
     "contents. Every later skill that uses the tool needs it. Passing it on is not "

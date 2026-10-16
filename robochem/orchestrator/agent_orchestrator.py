@@ -75,6 +75,88 @@ MAX_REPLANS = 2
 #: 50 ml spills from ~51 deg and keeps ~33 ml at 60, for B. The sim's wider
 #: beaker keeps everything below ~70, so in sim this first pour gives little.
 POUR_KEEP_SOME_DEG = 60.0
+#: The last pour of a container that pours more than once empties it (the
+#: user, 2026-10-15: "if the container needs to pour again, the first time the
+#: angle should be 60, the second 90").
+POUR_LAST_DEG = 90.0
+#: The first pour into a container that is poured into again: A into C, with
+#: B into C after it. 65 (the user, 2026-10-15), not 60: the clear cup keeps
+#: ~11 ml at 60 and ~6 at 65 of its ~25, and C fizzes most and stays purple
+#: with ~70-80% of A in it (estimate, sim scoop masses; see progress.md).
+POUR_FIRST_INTO_SHARED_DEG = 65.0
+
+#: Skills after which the bench is photographed, when the orchestrator is
+#: given a ``snapshot``. The colours of this experiment change at the pours,
+#: and a cup's colour is gone once it is poured out: on 2026-10-15 the report
+#: could not say whether B had turned blue, because by the time it looked B
+#: was empty. Each pour ends with the arm at home, clear of the cameras.
+SNAPSHOT_AFTER = ("pour",)
+
+
+def _same_container(a: str, b: str) -> bool:
+    a, b = (a or "").strip().lower(), (b or "").strip().lower()
+    return bool(a and b) and (a == b or a in b or b in a)
+
+
+_PLACE_RE = re.compile(
+    r"^\s*(?:place|put)\s+(?:down\s+)?(?:the\s+)?(?P<obj>.+?)(?P<back>\s+back)?"
+    r"(?:\s+(?:down|to|on|onto|at|in|into)(?:\s+(?:the\s+)?(?P<dest>.+?))?)?\s*\.?\s*$")
+_PICK_RE = re.compile(
+    r"^\s*(?:pick(?:_up|\s+up)|grasp)\s+(?:the\s+)?(?P<obj>.+?)(?:\s+again)?\s*\.?\s*$")
+
+
+def drop_needless_regrasps(plan: Plan) -> List[str]:
+    """
+    Take out a put-down that is followed straight away by picking the same
+    object up again, and renumber the sub-tasks. Says what it took out.
+
+    2026-10-15: the planner wrote "place the plastic beaker back" and then
+    "pick_up the plastic beaker" between its two pours (sub-tasks 24-25),
+    giving "the beaker must be put down before pouring into the next cup",
+    which nothing requires. The pair moves nothing and costs a scan and a
+    grasp, either of which can fail. A put-down that takes the object
+    somewhere else (not back where it came from) is kept.
+    """
+    kept: List[SubTask] = []
+    notes: List[str] = []
+    subtasks = list(plan.subtasks)
+    i = 0
+    while i < len(subtasks):
+        here = subtasks[i]
+        after = subtasks[i + 1] if i + 1 < len(subtasks) else None
+        put = _PLACE_RE.match(here.description.lower())
+        picked = _PICK_RE.match(after.description.lower()) if after is not None else None
+        if put and picked and _same_container(put.group("obj"), picked.group("obj")):
+            dest = (put.group("dest") or "").strip()
+            moved = (dest and not put.group("back") and not _same_container(dest, put.group("obj"))
+                     and not dest.startswith(("its ", "original", "where")))
+            if not moved:
+                notes.append(f"dropped sub-tasks {here.index}-{after.index} "
+                             f"('{here.description}', then '{after.description}'): "
+                             f"it keeps hold of {put.group('obj')} instead")
+                i += 2
+                continue
+        kept.append(here)
+        i += 1
+    if notes:
+        plan.subtasks = [replace(s, index=n) for n, s in enumerate(kept, start=1)]
+    return notes
+
+
+def parse_step_overrides(text: str) -> Dict[str, Any]:
+    """
+    ``pour_angle=60 to_floor=false`` -> ``{"pour_angle": 60, "to_floor": False}``.
+
+    What an operator types at the --step prompt to change a call before it
+    runs. Values are read as JSON (numbers, true/false, lists), else as text.
+    """
+    out: Dict[str, Any] = {}
+    for key, raw in re.findall(r"(\w+)\s*=\s*(\[[^\]]*\]|\"[^\"]*\"|'[^']*'|[^\s,]+)", text or ""):
+        try:
+            out[key] = json.loads(raw.replace("'", '"'))
+        except (json.JSONDecodeError, ValueError):
+            out[key] = raw.strip("'\"")
+    return out
 
 #: Guard against a planner that emits an unbounded list of sub-tasks. The
 #: booklet's Magic Beaker is 28 skill calls start to finish (two scoops, three
@@ -98,6 +180,8 @@ class StepRecord:
     seconds: float = 0.0
     #: What the orchestrator changed in the model's call before running it.
     adjusted: str = ""
+    #: Photos of the bench taken right after this step (SNAPSHOT_AFTER).
+    photos: List[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {
@@ -112,6 +196,7 @@ class StepRecord:
             "reason": self.reason,
             "result": self.result,
             "seconds": round(self.seconds, 2),
+            "photos": list(self.photos),
         }
 
 
@@ -158,6 +243,7 @@ class AgentOrchestrator:
         llm_client_override=None,
         verbose: bool = True,
         confirm=None,
+        snapshot=None,
     ) -> None:
         """
         Args:
@@ -181,6 +267,11 @@ class AgentOrchestrator:
             confirm: ``confirm(subtask, call) -> bool``, asked before every
                 skill runs on the arm; False stops the run there, without a
                 replan. For a first run on hardware, one step at a time.
+            snapshot: ``snapshot(subtask, call) -> [paths]``, photographs the
+                bench after every successful step whose skill is in
+                SNAPSHOT_AFTER; the paths go in the step record as ``photos``
+                for the report. A snapshot that fails is reported and the run
+                goes on.
         """
         self.skills = skills_executor
         self.vision = vision_system
@@ -194,6 +285,7 @@ class AgentOrchestrator:
         self.llm = llm_client_override
         self.verbose = verbose
         self.confirm = confirm
+        self.snapshot = snapshot
 
         # What we believe is in the gripper. The arm is the authority on whether
         # anything is held; only the name is bookkeeping.
@@ -310,6 +402,12 @@ class AgentOrchestrator:
                 return self._blocked(record, "planning", str(exc), task, started)
             except LLMResponseError as exc:
                 return self._blocked(record, "planning", str(exc), task, started)
+            # Not on a resume: --from-step counts in the stored plan.
+            edits = drop_needless_regrasps(plan)
+            for note in edits:
+                self._say(f"[plan] {note}")
+            if edits:
+                record["plan_edits"] = edits
         record["plans"] = [plan.as_dict()]
         self._announce_plan(plan)
 
@@ -488,6 +586,7 @@ class AgentOrchestrator:
                 completed.append(subtask)
                 continue
 
+            asked = dict(call.params)
             if self.confirm is not None and not self.confirm(subtask, call):
                 record.reason = "stopped by the operator before it ran"
                 record.seconds = time.time() - started
@@ -496,6 +595,12 @@ class AgentOrchestrator:
                         ("operator", f"stopped by the operator before sub-task "
                                      f"{subtask.index} ({subtask.description!r})"))
 
+            if call.params != asked:
+                changed = {k: v for k, v in call.params.items() if asked.get(k) != v}
+                record.params = dict(call.params)
+                record.adjusted = "; ".join(filter(None, [
+                    record.adjusted, f"changed by the operator at the step prompt: {changed}"]))
+                self._say(f"   [operator] {changed}")
             success, result = self.skills.execute(call.skill, call.params)
             record.success = bool(success)
             record.result = _jsonable(result)
@@ -504,6 +609,13 @@ class AgentOrchestrator:
             )
             record.failure_kind = None if success else "execution"
             record.seconds = time.time() - started
+            if success and self.snapshot is not None and call.skill in SNAPSHOT_AFTER:
+                try:
+                    record.photos = [str(p) for p in (self.snapshot(subtask, call) or [])]
+                    self._say(f"   [photos] {len(record.photos)} of the bench after "
+                              f"sub-task {subtask.index}")
+                except Exception as exc:
+                    self._say(f"   [photos] none taken: {type(exc).__name__}: {exc}")
             steps.append(record)
             self.history.append(
                 StepOutcome(call, bool(success), record.reason or "ok")
@@ -521,12 +633,46 @@ class AgentOrchestrator:
         return True, None, "", None
 
     @staticmethod
-    def _pours_again(plan: Plan, subtask: SubTask) -> bool:
+    def _pours_from(plan: Plan, source: str) -> List[int]:
         """
-        Whether the container held for this pour pours again before it is put
-        down: the next later sub-task that pours, sets something down or picks
-        something up decides it.
+        The sub-tasks of the plan that pour out of ``source``: a pour that
+        names it ("pour from plastic beaker into ..."), or one made while it is
+        held, following the plan's pick-ups and put-downs.
         """
+        held, out = "", []
+        for st in plan.subtasks:
+            text = st.description.lower()
+            picked = re.search(r"\bpick(?:_up|\s+up)?\s+(?:the\s+)?(.+)", text)
+            if picked:
+                held = picked.group(1).strip()
+            elif re.search(r"\b(place|put|return|set)\b", text) and not re.search(
+                    r"\bpour(s|ing)?\b", text):
+                held = ""
+            if re.search(r"\bpour(s|ing)?\b", text):
+                named = re.search(r"\bfrom\s+(?:the\s+)?(.+?)\s+(?:into|to|over|in)\b", text)
+                if _same_container(named.group(1) if named else held, source):
+                    out.append(st.index)
+        return out
+
+    @staticmethod
+    def _pours_into(plan: Plan, target: str) -> List[int]:
+        """The sub-tasks of the plan that pour into ``target``."""
+        out = []
+        for st in plan.subtasks:
+            text = st.description.lower()
+            if not re.search(r"\bpour(s|ing)?\b", text):
+                continue
+            into = str(st.target_container or "").strip()
+            if not into or into.lower() == "none":
+                named = re.search(r"\binto\s+(?:the\s+)?(.+?)(?:\s+at\s+\d.*)?$", text)
+                into = named.group(1) if named else ""
+            if _same_container(into, target):
+                out.append(st.index)
+        return out
+
+    @staticmethod
+    def _pours_again_unknown(plan: Plan, subtask: SubTask) -> bool:
+        """With no held object known: does the next pour come before a put-down?"""
         for later in plan.subtasks:
             if later.index <= subtask.index:
                 continue
@@ -538,19 +684,65 @@ class AgentOrchestrator:
         return False
 
     def _keep_some_for_later(self, plan: Plan, subtask: SubTask, call: SkillCall) -> str:
-        """Cap a pour that is not its container's last; say so, or return ''."""
-        if call.skill != "pour" or not self._pours_again(plan, subtask):
+        """
+        Pours that belong together: the user's rule, "the first time 60, the
+        second 90". The last at POUR_LAST_DEG, the ones before it lower,
+        whatever the model chose, for
+
+          * a container that pours more than once (the beaker into A, then B),
+            whether or not it is put down in between: POUR_KEEP_SOME_DEG, and
+          * a container that is poured into more than once (A, then B, into
+            C): POUR_FIRST_INTO_SHARED_DEG (65; "step 29 should also be 60",
+            then 65 after the fizz estimate).
+
+        2026-10-08 the rule was "pours again before it is put down"; on
+        2026-10-15 the planner wrote pick, pour A, place, pick, pour B, and the
+        beaker's first pour ran at 80. A lone pour is left to the model. Says
+        what it changed, or returns ''.
+        """
+        if call.skill != "pour":
+            return ""
+        source = str(self.held_object or "")
+        target = str(call.params.get("target_container") or "")
+        pours = self._pours_from(plan, source) if source else []
+        if source and subtask.index not in pours:
+            pours = sorted(set(pours) | {subtask.index})
+        fills = self._pours_into(plan, target) if target else []
+        if target and subtask.index not in fills:
+            fills = sorted(set(fills) | {subtask.index})
+        pours_later = [i for i in pours if i > subtask.index]
+        fills_later = [i for i in fills if i > subtask.index]
+        source_name = source or "the container"
+        if pours_later:
+            want = POUR_KEEP_SOME_DEG
+            why = (f"{source_name} pours again at sub-task {pours_later[0]}, "
+                   f"so this pour must not empty it")
+        elif fills_later:
+            want = POUR_FIRST_INTO_SHARED_DEG
+            why = (f"{target} is poured into again at sub-task {fills_later[0]}: "
+                   f"the first of its pours goes at {POUR_FIRST_INTO_SHARED_DEG:g}, "
+                   f"the last at {POUR_LAST_DEG:g}")
+        elif len(pours) >= 2:
+            want = POUR_LAST_DEG
+            why = (f"the last of {source_name}'s {len(pours)} pours "
+                   f"(sub-tasks {pours}) empties it")
+        elif len(fills) >= 2:
+            want = POUR_LAST_DEG
+            why = (f"the last of the {len(fills)} pours into {target} "
+                   f"(sub-tasks {fills}) empties {source_name}")
+        elif not source and self._pours_again_unknown(plan, subtask):
+            want = POUR_KEEP_SOME_DEG
+            why = f"{source_name} pours again, so this pour must not empty it"
+        else:
             return ""
         try:
             angle = float(call.params.get("pour_angle", 90.0))
         except (TypeError, ValueError):
             angle = 90.0
-        if angle <= POUR_KEEP_SOME_DEG:
+        if abs(angle - want) < 0.5:
             return ""
-        call.params["pour_angle"] = POUR_KEEP_SOME_DEG
-        note = (f"pour_angle {angle:g} -> {POUR_KEEP_SOME_DEG:g}: the container "
-                f"still pours again before it is put down, so this pour must not "
-                f"empty it")
+        call.params["pour_angle"] = want
+        note = f"pour_angle {angle:g} -> {want:g}: {why}"
         self._say(f"   [adjusted] {note}")
         return note
 
