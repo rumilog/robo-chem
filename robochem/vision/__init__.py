@@ -8,6 +8,8 @@ Provides visual perception capabilities:
 - Instruction parsing from images
 """
 
+import time
+
 import numpy as np
 from itertools import combinations
 
@@ -213,6 +215,27 @@ def cylinder_points(center_xy, base_z, radius, height, wall=0.001, n=72, levels=
     return np.vstack(parts)
 
 
+def region_change(before, after, box, delta: int = 25) -> float:
+    """
+    Fraction of pixels inside ``box`` whose grey level moved by more than
+    ``delta`` between two frames of the same camera.
+
+    Each crop's mean is taken out first, so an auto-exposure step that
+    brightens the whole crop does not count; a cup that moved, tipped or
+    changed its contents does.
+    """
+    import cv2
+    x1, y1, x2, y2 = box
+    a, b = before[y1:y2, x1:x2], after[y1:y2, x1:x2]
+    if a.size == 0 or a.shape != b.shape:
+        return 1.0
+    a = cv2.GaussianBlur(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY).astype(np.float32), (5, 5), 0)
+    b = cv2.GaussianBlur(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY).astype(np.float32), (5, 5), 0)
+    a -= a.mean()
+    b -= b.mean()
+    return float(np.mean(np.abs(a - b) > delta))
+
+
 def _label_read_cameras(observed) -> list:
     """Cameras whose text was read, not filled in by projecting another view."""
     readers = []
@@ -276,6 +299,27 @@ class VisionSystem:
         """
         self.cameras = cameras or {}
         self.bench = bench
+        #: Bench name -> [x, y] where it was last found or set down. Breaks a
+        #: label-vote tie (see _locate_by_vote); a resume seeds it from the
+        #: record.
+        self.last_seen = {}
+        #: Bench name -> the last full locate of it and the frames it came
+        #: from, so the next skill can reuse it (see _reuse_scan).
+        self.scans = {}
+        #: Category -> [x, y] of every container a label vote placed (by two
+        #: or more cameras), from the latest vote.
+        self.seen_containers = {}
+        #: Bench name -> [x, y] where the arm itself last set it down. Found
+        #: there by position, not by label (see _locate_by_vote).
+        self.tracked = {}
+        #: How far from that spot (m) the container may be found.
+        self.track_tolerance = 0.05
+        #: Reuse a scan of an object nothing has touched since, after one
+        #: camera's fresh frame agrees. False rescans every time, as before.
+        self.reuse_scans = True
+        #: region_change above which the object counts as moved. A first
+        #: guess, not measured on the bench; every check prints its value.
+        self.reuse_max_change = 0.05
         self.consensus_tolerance = consensus_tolerance
         self.max_object_extent = max_object_extent
         self.min_object_height = min_object_height
@@ -353,6 +397,12 @@ class VisionSystem:
         """The bench's name for ``name`` (a label or alias of it), else ``name`` unchanged."""
         return self.bench.canonical(name) if self.bench else name
 
+    def remember_position(self, name, xy):
+        """Note where ``name`` was last found or set down, for vote ties."""
+        if name and xy is not None and len(xy) >= 2:
+            key = self.bench.canonical(name) if self.bench else name
+            self.last_seen[key] = [float(xy[0]), float(xy[1])]
+
     def set_held(self, name):
         """What the gripper holds now (None for nothing), so it is not looked for on the bench."""
         self.held_object = (self.bench.canonical(name) if (self.bench and name) else name)
@@ -413,6 +463,20 @@ class VisionSystem:
                 "cached": True,
             }
 
+        reused = self._reuse_scan(object_name, category)
+        if reused is not None:
+            return reused
+        started = time.time()
+        before = self.object_localizer.last_capture
+        located = self._locate_fresh(object_name, category, use_labels)
+        print(f"[VisionSystem] full scan for {object_name!r}: "
+              f"{time.time() - started:.1f}s")
+        if located is not None and self.object_localizer.last_capture is not before:
+            self._keep_scan(object_name, category, located)
+        return located
+
+    def _locate_fresh(self, object_name, category, use_labels):
+        """Capture every camera and find ``object_name`` in the frames."""
         entry = (self.bench.find(object_name)
                  if self.bench is not None and use_labels is None else None)
         if entry is not None:
@@ -433,6 +497,133 @@ class VisionSystem:
                   f"falling back to direct SAM prompt")
 
         return self._locate_direct(object_name)
+
+    # ------------------------------------------------------- scan reuse
+    #
+    # Every skill rescans its target from home: four cameras one after
+    # another, SAM, and for a labelled container one model call per cup per
+    # camera. Most of the time the target has not moved since the last skill
+    # looked at it. A scan is reused when (1) no skill has touched the object
+    # since (SkillsExecutor forgets what each skill touches) and (2) one
+    # camera's fresh frame of the object's box matches the frame the scan was
+    # made from, which catches a hand that moved it during a --step pause.
+
+    #: Farthest a bench object can be from the arm's base (m). The Panda
+    #: reaches ~0.85; a pick at 0.725 m was already at the edge (2026-10-19).
+    #: Beyond this is the next table, which cam 5 also sees.
+    BENCH_MAX_REACH = 0.82
+
+    def on_bench(self, point) -> bool:
+        """True if ``point`` (x, y, ...) is somewhere the arm could work."""
+        x, y = float(point[0]), float(point[1])
+        return 0.15 <= x and float(np.hypot(x, y)) <= self.BENCH_MAX_REACH
+
+    def track(self, name, xy):
+        """The arm set ``name`` down at ``xy`` (None: it was picked up again)."""
+        key = self._scan_key(name)
+        if not key:
+            return
+        if xy is None:
+            self.tracked.pop(key, None)
+        else:
+            self.tracked[key] = np.asarray(xy, dtype=float)[:2].copy()
+            print(f"[VisionSystem] tracking {name!r} at ({self.tracked[key][0]:.3f}, "
+                  f"{self.tracked[key][1]:+.3f}), where the arm set it down")
+
+    def _scan_key(self, name):
+        name = self.canonical_name(name) if name else name
+        return str(name or "").strip().lower()
+
+    def forget_scans(self, names=None):
+        """Drop kept scans: of ``names`` (aliases are fine), or all of them."""
+        if names is None:
+            if self.scans:
+                print(f"[VisionSystem] forgetting all {len(self.scans)} kept scans")
+            self.scans.clear()
+            return
+        for name in names:
+            if self.scans.pop(self._scan_key(name), None) is not None:
+                print(f"[VisionSystem] forgetting the scan of {name!r}: touched")
+
+    def _keep_scan(self, object_name, category, located):
+        """Keep ``located`` and the frames it came from, with the object's box per camera."""
+        data = self.object_localizer.last_capture or {}
+        points = located.get("points")
+        if not data.get("images") or points is None or len(points) == 0:
+            return
+        lo, hi = np.percentile(np.asarray(points, float), [2, 98], axis=0)
+        corners = [[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1])
+                   for z in (lo[2], hi[2])]
+        boxes = {}
+        for cam, image in data["images"].items():
+            intr = (data.get("intrinsics") or {}).get(cam)
+            try:
+                uv = [self.object_localizer.project_world_point(c, cam, intrinsics=intr)
+                      for c in corners]
+            except Exception:
+                continue
+            if intr is None or any(p is None for p in uv):
+                continue
+            h, w = image.shape[:2]
+            us, vs = [p[0] for p in uv], [p[1] for p in uv]
+            pad = 15
+            x1, x2 = int(max(0, min(us) - pad)), int(min(w, max(us) + pad))
+            y1, y2 = int(max(0, min(vs) - pad)), int(min(h, max(vs) + pad))
+            if x2 - x1 >= 20 and y2 - y1 >= 20:
+                boxes[cam] = (x1, y1, x2, y2)
+        if not boxes:
+            return
+        self.scans[self._scan_key(object_name)] = {
+            "name": object_name,
+            "category": category,
+            "located": located,
+            "images": {c: data["images"][c] for c in boxes},
+            "intrinsics": {c: (data.get("intrinsics") or {}).get(c) for c in boxes},
+            "boxes": boxes,
+            "time": time.time(),
+        }
+
+    def best_scan_camera(self, scan):
+        """The camera that sees the object biggest in ``scan``."""
+        return max(scan["boxes"], key=lambda c: (scan["boxes"][c][2] - scan["boxes"][c][0])
+                   * (scan["boxes"][c][3] - scan["boxes"][c][1]))
+
+    def _reuse_scan(self, object_name, category):
+        """The kept scan of ``object_name`` if one camera says it has not moved, else None."""
+        key = self._scan_key(object_name)
+        scan = self.scans.get(key) if self.reuse_scans else None
+        if scan is None or scan["category"] != category:
+            return None
+        if key == self._scan_key(getattr(self, "held_object", None)):
+            self.scans.pop(key, None)
+            return None
+        started = time.time()
+        cam = self.best_scan_camera(scan)
+        try:
+            now = self.object_localizer.capture_pointclouds(cam_ids=[cam])
+        except Exception as exc:
+            print(f"[VisionSystem] check frame from cam {cam} failed ({exc}); full scan")
+            return None
+        image = now["images"].get(cam)
+        if image is None:
+            return None
+        change = region_change(scan["images"][cam], image, scan["boxes"][cam])
+        if change > self.reuse_max_change:
+            print(f"[VisionSystem] {object_name!r} changed in cam {cam} since its scan "
+                  f"(change {change:.3f} > {self.reuse_max_change}): full scan")
+            self.scans.pop(key, None)
+            return None
+        print(f"[VisionSystem] {object_name!r} unchanged in cam {cam} since its scan "
+              f"{time.time() - scan['time']:.0f}s ago (change {change:.3f} <= "
+              f"{self.reuse_max_change}): reusing it, {time.time() - started:.1f}s")
+        located = dict(scan["located"])
+        located["reused_scan"] = {"camera": cam, "change": round(change, 4),
+                                  "age_s": round(time.time() - scan["time"], 1)}
+        if located.get("points") is not None:
+            # Skills read the cache back by the name they asked for.
+            self.object_localizer.cache_object(object_name, located["points"],
+                                               located.get("centroid"))
+        return located
 
     def _locate_bench_object(self, object_name, entry, category=None):
         """
@@ -913,77 +1104,124 @@ class VisionSystem:
                 members = {keys[i][0]: keys[i][1] for i in group}
                 point = np.mean([spots[i] for i in group], axis=0)
                 placed.append((point, None, members))
+        off = [p for p in placed if not self.on_bench(p[0])]
+        if off:
+            # 2026-10-22: cam 5 sees the next table, 1 m out, where the
+            # "20 ML WATER" paper had gone; the vote gave that label to a cup
+            # there and the preflight tried to fetch it.
+            print(f"[VisionSystem] ignoring {len(off)} {category!r} beyond the arm's "
+                  f"reach: " + ", ".join(f"({p[0][0]:.2f}, {p[0][1]:+.2f})" for p in off))
+            placed = [p for p in placed if self.on_bench(p[0])]
         if not placed:
             print(f"[VisionSystem] No {category!r} could be placed")
             return None
+        # Every container of the category, labelled or not: what a planner
+        # moving things around has to keep clear of. Depth does not see clear
+        # cups, so this is the only record of where they stand.
+        self.seen_containers[category] = [
+            [float(p[0]), float(p[1])] for p, _f, members in placed if len(members) >= 2]
 
-        reads = self.label_resolver.read_all(images, instances)
+        # The arm put this container down itself: it is where the arm left
+        # it, whatever paper it now stands on. The label stays behind when a
+        # cup is moved (2026-10-22, the preflight's relocations), so reading
+        # labels would find the old paper, not the cup.
+        reads = {}
+        k, how = None, None
+        tracked = self.tracked.get(self._scan_key(getattr(shape, "name", None)))
+        if tracked is not None:
+            gaps = [float(np.linalg.norm(np.asarray(p)[:2] - tracked)) for p, _f, _m in placed]
+            near = int(np.argmin(gaps))
+            if gaps[near] <= self.track_tolerance:
+                k = near
+                how = (f"where the arm set it down ({tracked[0]:.3f}, {tracked[1]:+.3f}), "
+                       f"{gaps[near] * 1000:.0f} mm off; labels not read")
+                print(f"[VisionSystem] {label!r}: {how}")
+            else:
+                print(f"[VisionSystem] {label!r}: nothing within "
+                      f"{self.track_tolerance * 1000:.0f} mm of where the arm set it down "
+                      f"({tracked[0]:.3f}, {tracked[1]:+.3f}) -- moved by hand? Reading labels")
 
         def read_of(cam, idx):
             labels_here = reads.get(cam) or []
             return labels_here[idx] if idx < len(labels_here) else None
 
-        votes = []
-        for _point, _fix, members in placed:
-            row = [0] * len(names)
-            for cam, idx in members.items():
-                read = read_of(cam, idx)
-                for j, name in enumerate(names):
-                    if read and normalize_label(read) == normalize_label(name):
-                        row[j] += 1
-            votes.append(row)
+        if k is None:
+            reads = self.label_resolver.read_all(images, instances)
 
-        _best, shares = assign_labels(votes)
-        for k, (point, _fix, members) in enumerate(placed):
-            got = [names[j] for j, kk in enumerate(shares[0]) if kk == k]
-            tally = ", ".join(f"{names[j]} x{n}" for j, n in enumerate(votes[k]) if n)
-            print(f"[VisionSystem]   {category} at ({point[0]:.3f}, {point[1]:+.3f}) "
-                  f"cams {sorted(members)}: reads [{tally or 'none'}] -> "
-                  f"{got[0] if got else 'unassigned'}")
-        strong = [i for i, (_p, _f, members) in enumerate(placed) if len(members) >= 2]
-        twin = misread_twin(votes, names, want, [np.asarray(p)[:2] for p, _f, _m in placed],
-                            strong, 2.0 * float(getattr(shape, "radius", None) or 0.03),
-                            chosen=shares[0][want])
-        if twin is not None:
-            other, cups = twin
-            spots = ", ".join(f"({placed[c][0][0]:.3f}, {placed[c][0][1]:+.3f})" for c in cups)
-            if len(cups) > 1:
-                why = (f"{names[want]!r} was read on {len(cups)} cups [{spots}] and {other!r} "
-                       f"on none: one of them is {other!r} misread")
-            else:
-                why = (f"the cup at {spots} would be {names[want]!r}, but it is the only one "
-                       f"read as {other!r}: its reads disagree")
-            print(f"[VisionSystem] {why}. Refusing to guess; rewrite the {other!r} label "
-                  f"(and {names[want]!r}) bigger and bolder")
-            return None
-        k = shares[0][want]
-        if not any(row[want] for row in votes):
-            # Nobody read it anywhere. The bench says how many of these there
-            # are, though: if every other label is settled on a container two
-            # or more cameras placed, and exactly one such container is left,
-            # that is this one. On 2026-10-07 two cameras read cup C as "A"
-            # and none read "C EMPTY", with A, B and the beaker all read.
-            k = eliminate(votes, shares, want,
-                          [i for i, (_p, _f, members) in enumerate(placed)
-                           if len(members) >= 2])
-            if k is None:
-                print(f"[VisionSystem] No camera read {label!r} on any container, "
-                      f"and it cannot be told by elimination")
+            votes = []
+            for _point, _fix, members in placed:
+                row = [0] * len(names)
+                for cam, idx in members.items():
+                    read = read_of(cam, idx)
+                    for j, name in enumerate(names):
+                        if read and normalize_label(read) == normalize_label(name):
+                            row[j] += 1
+                votes.append(row)
+
+            _best, shares = assign_labels(votes)
+            for k, (point, _fix, members) in enumerate(placed):
+                got = [names[j] for j, kk in enumerate(shares[0]) if kk == k]
+                tally = ", ".join(f"{names[j]} x{n}" for j, n in enumerate(votes[k]) if n)
+                print(f"[VisionSystem]   {category} at ({point[0]:.3f}, {point[1]:+.3f}) "
+                      f"cams {sorted(members)}: reads [{tally or 'none'}] -> "
+                      f"{got[0] if got else 'unassigned'}")
+            strong = [i for i, (_p, _f, members) in enumerate(placed) if len(members) >= 2]
+            twin = misread_twin(votes, names, want, [np.asarray(p)[:2] for p, _f, _m in placed],
+                                strong, 2.0 * float(getattr(shape, "radius", None) or 0.03),
+                                chosen=shares[0][want])
+            if twin is not None:
+                other, cups = twin
+                spots = ", ".join(f"({placed[c][0][0]:.3f}, {placed[c][0][1]:+.3f})" for c in cups)
+                if len(cups) > 1:
+                    why = (f"{names[want]!r} was read on {len(cups)} cups [{spots}] and {other!r} "
+                           f"on none: one of them is {other!r} misread")
+                else:
+                    why = (f"the cup at {spots} would be {names[want]!r}, but it is the only one "
+                           f"read as {other!r}: its reads disagree")
+                print(f"[VisionSystem] {why}. Refusing to guess; rewrite the {other!r} label "
+                      f"(and {names[want]!r}) bigger and bolder")
                 return None
-            how = (f"by elimination: the only container {len(placed[k][2])} cameras "
-                   f"placed that no other label claims")
-        elif len({share[want] for share in shares}) > 1:
-            print(f"[VisionSystem] {label!r}: the reads fit more than one container "
-                  f"equally well; refusing to guess")
-            return None
-        elif k is None or votes[k][want] == 0:
-            print(f"[VisionSystem] No camera read {label!r} on the container the "
-                  f"vote left for it")
-            return None
-        else:
-            how = None
+            k = shares[0][want]
+            if not any(row[want] for row in votes):
+                # Nobody read it anywhere. The bench says how many of these there
+                # are, though: if every other label is settled on a container two
+                # or more cameras placed, and exactly one such container is left,
+                # that is this one. On 2026-10-07 two cameras read cup C as "A"
+                # and none read "C EMPTY", with A, B and the beaker all read.
+                k = eliminate(votes, shares, want,
+                              [i for i, (_p, _f, members) in enumerate(placed)
+                               if len(members) >= 2])
+                if k is None:
+                    print(f"[VisionSystem] No camera read {label!r} on any container, "
+                          f"and it cannot be told by elimination")
+                    return None
+                how = (f"by elimination: the only container {len(placed[k][2])} cameras "
+                       f"placed that no other label claims")
+            elif len({share[want] for share in shares}) > 1:
+                # A tie. On 2026-10-20 the pour into C (step 31) saw cup A and
+                # cup C read once each as "A" and "C EMPTY" and refused, though
+                # steps 27-28 had poured into C at that spot. Take the tied
+                # candidate closest to where this container was last seen.
+                tied = sorted({share[want] for share in shares if share[want] is not None})
+                seen = self.last_seen.get(getattr(shape, "name", None))
+                if seen is None or not tied:
+                    print(f"[VisionSystem] {label!r}: the reads fit more than one container "
+                          f"equally well; refusing to guess")
+                    return None
+                k = min(tied, key=lambda c: np.linalg.norm(
+                    np.asarray(placed[c][0])[:2] - np.asarray(seen)))
+                how = (f"vote tie broken by last known position ({seen[0]:.3f}, "
+                       f"{seen[1]:+.3f})")
+                print(f"[VisionSystem] {label!r}: {how}")
+            elif k is None or votes[k][want] == 0:
+                print(f"[VisionSystem] No camera read {label!r} on the container the "
+                      f"vote left for it")
+                return None
+            else:
+                how = None
 
         _point, fix, members = placed[k]
+        self.remember_position(getattr(shape, "name", None), np.asarray(_point)[:2])
         observed = {cam: read_of(cam, idx) for cam, idx in members.items()}
         confidences = {cam: float(instances[cam][idx].get("score") or 0.0)
                        for cam, idx in members.items()}

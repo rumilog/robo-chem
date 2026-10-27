@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from robochem.skills import SKILL_REGISTRY, SkillsExecutor
+from robochem.skills.pacing import (DEFAULT_SPEED, HOME_SECONDS, MOTION_TIME_SCALE,
+                                    speed_time_factor)
 
 
 class InfeasibleSkill(Exception):
@@ -248,6 +250,31 @@ CATALOG: Dict[str, SkillSpec] = {
             Param("source_container", "string",
                   "Where to draw from. Required for 'aspirate' and 'transfer'.",
                   default=None),
+            Param("squeeze_out", "boolean",
+                  "Empty the pipette into the target in one squeeze instead of drops "
+                  "(after pick_pipette).", default=False),
+        ],
+    ),
+    "pick_pipette": SkillSpec(
+        name="pick_pipette",
+        summary="Take the pipette out of its holder by the bulb, squeezed flat, dip its "
+                "tip into a container and release the bulb a little to draw liquid up.",
+        requires=_EMPTY,
+        effect="the gripper holds the pipette with liquid drawn into it; dispense "
+               "(mode 'dispense') then releases it as drops",
+        note="Use this instead of pick_up for the pipette: pick_up grips the stem "
+             "and never squeezes the bulb, so nothing can be drawn.",
+        params=[
+            Param("source_container", "string",
+                  "Container to draw the liquid from.", required=True),
+            Param("object_name", "string",
+                  "How perception finds the pipette.", default="pipette"),
+            Param("release_amount", "number",
+                  "How far the jaws open in the liquid, metres. More draws more, but "
+                  "the jaws never open past the bulb's own width.", default=0.005),
+            Param("dip_depth", "number",
+                  "Tip depth below the rim, metres. Omit it to feel down to the "
+                  "container's floor, which reaches a shallow liquid.", default=None),
         ],
     ),
     "stir": SkillSpec(
@@ -396,6 +423,56 @@ CHAINING_RULES: tuple = (
     "contents. Every later skill that uses the tool needs it. Passing it on is not "
     "optional and guessing a replacement is worse than any value you could guess.",
 )
+
+
+#: What each mark of the 0-100 speed scale is for. The whole call runs at the
+#: one speed, so it is chosen for the call's most delicate moment. 0 is the
+#: pace every skill was tuned at, which the user calls slow (2026-10-27): right
+#: for liquid, needlessly slow for an empty spoon, and the slowest allowed.
+SPEED_GUIDE = {
+    0: "The tuned pace, the slowest there is. Liquid in an open container: "
+       "picking it up, carrying it, pouring from it, putting it back down.",
+    10: "Almost as careful. A container with only a little liquid left in it; "
+        "the pipette, which ends holding liquid (pick_pipette, dispense).",
+    20: "Careful. A scoop or spoon whose bowl carries powder (scoop, "
+        "arc_scoop, dump).",
+    30: "Measured. Stirring: faster circles splash and can drag the cup along "
+        "(stir's circles speed up with the rest); a container just poured "
+        "out that holds only drips.",
+    40: "Moderate. An empty, dry container; putting a tool back into a holder.",
+    50: "Brisk. An empty tool moved close to other objects or into a tight "
+        "spot.",
+    60: "Quick. Picking up, moving or putting down an empty spoon, scoop or "
+        "stirrer.",
+    70: "Fast. An empty tool with clear space around the motion.",
+    80: "Very fast. Nothing in the gripper.",
+    90: "Near the limit. Nothing held and nothing nearby.",
+    100: "The fastest the arm is run at.",
+}
+
+
+def speed_prompt_block() -> str:
+    """The speed scale, with what each mark means in seconds, for an LLM prompt."""
+    move = 3.0 * MOTION_TIME_SCALE
+    lines = [
+        "Speed: every call carries a speed from 0 to 100 that sets how fast the "
+        "arm moves through the WHOLE skill -- the approach, the action and the "
+        "retreat. Holds and waits keep their seconds. Choose it for the most "
+        "delicate moment of the call: a scoop ends carrying powder, a pick_up "
+        "of a cup of liquid ends lifting the liquid. Liquid in an open "
+        "container sloshes and spills when moved fast; an empty spoon does not. "
+        f"{DEFAULT_SPEED} is the pace every skill was tuned at on this bench and "
+        "the slowest there is; it is already slow. Skills that do not move the "
+        "arm ignore it.",
+        f"  (A typical single arm move takes {move:.1f} s at {DEFAULT_SPEED}; "
+        f"the trip home {HOME_SECONDS:.1f} s.)",
+    ]
+    for mark, meaning in SPEED_GUIDE.items():
+        f = speed_time_factor(mark)
+        pace = ("the tuned pace" if abs(f - 1.0) < 1e-9 else
+                f"{1.0 / f:.2f}x the tuned pace")
+        lines.append(f"  {mark:3d} ({pace}; a move {move * f:.1f} s): {meaning}")
+    return "\n".join(lines)
 
 
 def _registry_params(skill_name: str) -> tuple:

@@ -1501,6 +1501,111 @@ def test_stir_stops_descending_on_contact():
           not ok and "force" in result.get("error", ""), f"{result}")
 
 
+class BulbArm(PressArm):
+    """
+    A PressArm holding a squeezable bulb between the jaws.
+
+    A force-limited close stops on the bulb: ``relaxed`` at a light touch,
+    flattened to ``flat`` at 10 N and up. A position move goes where it is
+    sent (the bulb pushes back but cannot move the jaws). ``bulb=False`` is a
+    miss: the jaws shut on nothing.
+    """
+
+    def __init__(self, surface_z, relaxed=0.011, flat=0.002, bulb=True):
+        super().__init__(surface_z)
+        self.gripper_width = 0.08
+        self.relaxed, self.flat, self.bulb = relaxed, flat, bulb
+
+    def goto_gripper(self, width=0.0, grasp=False, force=None, speed=None, block=True):
+        self.gripper_commands.append({"width": width, "grasp": grasp, "force": force})
+        if not grasp:
+            self.gripper_width = float(width)
+        elif not self.bulb:
+            self.gripper_width = 0.0
+        else:
+            squash = min(1.0, max(0.0, (float(force or 0) - 1.0) / 9.0))
+            self.gripper_width = self.relaxed - squash * (self.relaxed - self.flat)
+
+
+def test_pick_pipette_squeezes_dips_and_releases_a_little():
+    """Flat squeeze at the pick, floor-guarded dip, a release short of the bulb."""
+    print("\n[pick_pipette]")
+    from robochem.skills.pick_pipette import PickPipetteSkill
+    # The 2026-10-21 bench: bulb top at z 0.137 over the holder, stem below.
+    rng = np.random.default_rng(1)
+    bulb = np.column_stack([0.441 + rng.normal(0, 0.003, 300),
+                            -0.013 + rng.normal(0, 0.003, 300),
+                            rng.uniform(0.112, 0.137, 300)])
+    stem = np.column_stack([0.441 + rng.normal(0, 0.001, 100),
+                            -0.013 + rng.normal(0, 0.001, 100),
+                            rng.uniform(0.095, 0.112, 100)])
+    pipette = np.vstack([bulb, stem])
+    cup = cylinder_cloud([0.50, 0.10], base_z=0.0, height=0.05, radius=0.033)
+    vision = lambda: FakeVision({"pipette": pipette, "cup": cup})
+    tool = 0.11
+    floor_tip = 0.003                                  # the cup's inside floor
+    opts = {"source_container": "cup", "probe_seconds": 0.0, "draw_seconds": 0.0}
+
+    arm = BulbArm(floor_tip + tool)
+    ok, result = make(PickPipetteSkill, vision(), arm).execute(dict(opts))
+    check("pick, dip and draw succeed", ok, f"{result}")
+    top = float(np.percentile(pipette[:, 2], 99))
+    check("the jaws close on the bulb, 15 mm under the top -- not the centroid",
+          ok and abs(result["grasp_tcp_reached"][2] - (top - 0.015)) < 1e-6,
+          f"{result.get('grasp_tcp_reached')} vs top {top:.4f}")
+    grips = arm.gripper_commands
+    forced = [g["force"] for g in grips if g["grasp"]]
+    check("a light touch, then the full squeeze",
+          forced == [1.0, 20.0], f"{forced}")
+    check("the bulb is squeezed flat before it leaves the holder",
+          ok and abs(result["squeezed_width"] - 0.002) < 1e-6,
+          f"{result.get('squeezed_width')}")
+    check("the descent stops on the floor and backs off 3 mm",
+          ok and result["stopped_by_force"] is True
+          and abs(result["dip_z"] - result["contact_z"] - 0.003) < 1e-6
+          and result["contact_z"] - tool < floor_tip + 0.0025,
+          f"{ {k: result.get(k) for k in ('stopped_by_force', 'contact_z', 'dip_z')} }")
+    check("the release opens release_amount past the squeeze, with the tip down",
+          ok and abs(grips[-1]["width"] - 0.007) < 1e-6 and not grips[-1]["grasp"],
+          f"{grips[-1]}")
+    check("the jaws never open fully once the bulb is held",
+          all(g["width"] < 0.011 for g in grips[2:]), f"{grips}")
+
+    # Asking for more than the bulb has: the release stops short of it.
+    arm = BulbArm(floor_tip + tool)
+    ok, result = make(PickPipetteSkill, vision(), arm).execute(
+        dict(opts, release_amount=0.05))
+    check("a big release_amount is capped at the bulb's width minus the margin",
+          ok and abs(result["release_width"] - 0.008) < 1e-6,
+          f"{result.get('release_width')}")
+
+    # A miss: the jaws shut on nothing.
+    arm = BulbArm(floor_tip + tool, bulb=False)
+    ok, result = make(PickPipetteSkill, vision(), arm).execute(dict(opts))
+    check("closing on nothing fails before squeezing and opens again",
+          not ok and "bulb" in result.get("error", "")
+          and arm.gripper_width >= 0.07
+          and [g["force"] for g in arm.gripper_commands if g["grasp"]] == [1.0],
+          f"{result}")
+
+    # The tip lands on something above the rim.
+    rim_z = make(PickPipetteSkill, vision(), BulbArm(0.0)).locate_container("cup")["top_z"]
+    arm = BulbArm(rim_z + 0.005 + tool)
+    ok, result = make(PickPipetteSkill, vision(), arm).execute(dict(opts))
+    check("contact above the rim is refused without releasing the bulb",
+          not ok and "rim" in result.get("error", "")
+          and arm.gripper_width < 0.003, f"{result}")
+
+    # The executor remembers where it came from, so place can put it back.
+    from robochem.skills import SkillsExecutor
+    ex = SkillsExecutor(BulbArm(floor_tip + tool), vision(), {})
+    ok, _ = ex.execute("pick_pipette", dict(opts))
+    check("the executor notes the pipette as held and where it was picked",
+          ok and ex.held == "pipette" and "pipette" in ex.pick_sites
+          and abs(ex.pick_grasps["pipette"][2] - (top - 0.015)) < 1e-6,
+          f"held={ex.held}, sites={list(ex.pick_sites)}")
+
+
 def test_executor_discards_a_tool_offset_from_the_wrong_end():
     """A measured offset whose x points back along the handle is not used."""
     print("\n[executor: tool_offset sanity against the CAD]")
@@ -2550,6 +2655,7 @@ def test_executor_uses_bench_names():
     from robochem.skills import SkillsExecutor
     from robochem.vision.bench_manifest import (
         BEAKER_GRASP_Z_OFFSET, CLEAR_CUP_GRASP_Z_OFFSET, CUP_A_LATERAL_OFFSET,
+        WATER_CUP_FORWARD_OFFSET,
         DISH_SCOOP_Z_OFFSET, DUMP_FORWARD_OFFSET, DUMP_MIN_TIP_DEG, MAGIC_BEAKER)
 
     class Vision:
@@ -2588,12 +2694,14 @@ def test_executor_uses_bench_names():
     out = ex._bench_defaults("pick_up", ex._bench_names({"object_name": "small scoop"}))
     check("the planner's bare pick of the scoop gets the robot-validated grasp",
           out == {"object_name": "larger spoon", "z_offset": 0.0, "grasp_force": 1.0,
-                  "forward_offset": -0.010}, f"{out}")
+                  "forward_offset": -0.010, "yaw": "auto",
+                  "working_end_distance": 0.042, "right_if_on_side": "warn"}, f"{out}")
     out = ex._bench_defaults("pick_up", {"object_name": "larger spoon", "grasp_force": 0.8})
     check("a value the call passes is kept", out["grasp_force"] == 0.8, f"{out}")
     check("the stirrer gets its validated grasp",
           ex._bench_defaults("pick_up", {"object_name": "stirrer"})
-          == {"object_name": "stirrer", "z_offset": 0.0, "grasp_force": 1.0})
+          == {"object_name": "stirrer", "z_offset": 0.0, "grasp_force": 1.0,
+              "yaw": "auto"})
     check("nothing is invented for an object with nothing measured",
           ex._bench_defaults("pick_up", {"object_name": "citric acid cup"})
           == {"object_name": "citric acid cup"})
@@ -2618,15 +2726,19 @@ def test_executor_uses_bench_names():
           "release_clearance" not in back, f"{back}")
     ex.held = None
     cup_pick = {"slide_in": 0.06, "z_offset": CLEAR_CUP_GRASP_Z_OFFSET, "grip_width": 0.058}
+    # The water cups A and B are taken 6 mm further forward (the user,
+    # 2026-10-20); C is not.
     check("cups B and C are slid into from behind, at the bench z_offset, closed to 58 mm",
           ex._bench_defaults("pick_up", {"object_name": "clear cup b"})
-          == {"object_name": "clear cup b", **cup_pick}
+          == {"object_name": "clear cup b", **cup_pick,
+              "forward_offset": WATER_CUP_FORWARD_OFFSET}
           and ex._bench_defaults("pick_up", {"object_name": "clear cup c"})
           == {"object_name": "clear cup c", **cup_pick})
     check("cup A too, with its own lateral_offset",
           ex._bench_defaults("pick_up", ex._bench_names({"object_name": "cup a"}))
           == {"object_name": "clear cup a", **cup_pick,
-              "lateral_offset": CUP_A_LATERAL_OFFSET})
+              "lateral_offset": CUP_A_LATERAL_OFFSET,
+              "forward_offset": WATER_CUP_FORWARD_OFFSET})
     check("place is not filled", ex._bench_defaults("place", {"target_location":
           "larger spoon"}) == {"target_location": "larger spoon"})
     out = ex._bench_defaults("scoop", ex._bench_names({"powder_source": "CITRIC ACID"}))
@@ -3435,6 +3547,7 @@ def main():
     test_stir_offsets_shift_the_circle_centre()
     test_depth_gate_drops_edge_streaks_not_containers()
     test_stir_stops_descending_on_contact()
+    test_pick_pipette_squeezes_dips_and_releases_a_little()
     test_executor_discards_a_tool_offset_from_the_wrong_end()
     test_executor_puts_things_back_where_they_came_from()
     test_bench_manifest_names_the_real_bench()

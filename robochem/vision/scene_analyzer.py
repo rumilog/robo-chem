@@ -11,6 +11,8 @@ from openai import OpenAI
 import base64
 import json
 
+from ..agents.llm_client import chat_create
+
 
 class SceneAnalyzer:
     """
@@ -145,7 +147,7 @@ If you cannot find the object, return:
 {{"found": false, "confidence": 0.0}}"""
 
         try:
-            response = self.vlm_client.chat.completions.create(
+            response = chat_create(self.vlm_client,
                 model="gpt-4o",
                 messages=[
                     {"role": "system", "content": "You are a precise object detector. Return only valid JSON."},
@@ -243,7 +245,7 @@ Return as JSON with keys:
 - layout: Description of spatial arrangement"""
 
         try:
-            response = self.vlm_client.chat.completions.create(
+            response = chat_create(self.vlm_client,
                 model="gpt-4o",
                 messages=[
                     {"role": "system", "content": "You are analyzing a chemistry workspace. Be precise and thorough."},

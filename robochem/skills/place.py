@@ -81,6 +81,12 @@ class PlaceSkill(BaseSkill):
             # left the arm, which drags a hanging rod through whatever is
             # between there and the holder.
             "vertical_insert": False,
+            # vertical_insert: height (TCP z) to cross the bench at before
+            # going straight down. None crosses at the hover height. Crossing
+            # at the home height (z 0.4865) put the arm at the edge of its
+            # reach over the jellyfish holder at x 0.685, and the move down
+            # to the 0.30 hover never happened (2026-10-21, "off by 186mm").
+            "transit_height": None,
             # The TCP position of the pick this object came from. The executor
             # fills it in when target_location names a remembered pick. With
             # vertical_insert the release is measured from it, not from the
@@ -158,6 +164,15 @@ class PlaceSkill(BaseSkill):
                                          f"it was picked; not placing it like that. Bring the "
                                          f"arm home (reset_joints) first"),
                                "still_holding": True}
+            if picked is not None and tilt > 2.0:
+                # Picked with the wrist tilted (pick_up tilt_away_deg) and now
+                # straight down after a pour's home: set it down at the pick's
+                # tilt, so it stands upright again instead of leaning.
+                y = hold_rotation[:, 1] - (hold_rotation[:, 1] @ ref) * ref
+                y = y / (np.linalg.norm(y) + 1e-9)
+                hold_rotation = np.column_stack([np.cross(y, ref), y, ref])
+                print(f"[Place] Back to the pick's wrist tilt ({tilt:.0f} deg off now) "
+                      f"so it stands upright")
 
         target_pos, surface_z, located = self._resolve_target(params, target)
         if target_pos is None:
@@ -210,11 +225,13 @@ class PlaceSkill(BaseSkill):
         hover = target_pos.copy()
         hover[2] = max(release_z + approach_height, self.safe_height)
         if insert:
-            # Cross at the home height FIRST, so the only motion near the bench
-            # is the straight-down one.
-            here = np.asarray(self.get_current_pose().translation, dtype=float)
+            # Cross high FIRST, so the only motion near the bench is the
+            # straight-down one. The hover height (0.30) already keeps the
+            # hanging rod ~20 cm above the bench; the home height was too far
+            # up at the edge of the reach.
             transit = hover.copy()
-            transit[2] = max(float(here[2]), hover[2])
+            if params.get("transit_height") is not None:
+                transit[2] = max(float(params["transit_height"]), hover[2])
             print(f"[Place] Crossing in XY at z={transit[2]:.4f} to "
                   f"{np.round(transit, 4)}...")
             if not self.goto_pose_rigid(transit, hold_rotation, duration=4.0):

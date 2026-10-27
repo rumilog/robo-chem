@@ -118,6 +118,96 @@ def tool_extent_x(points, grasp_pose):
     return [float(np.percentile(local[:, 0], 1)), float(np.percentile(local[:, 0], 99))]
 
 
+#: Largest wrist turn about world Z a pick makes. Joint 7 sits at +45 deg at
+#: home with a +-166 deg range, so +-120 is clear whichever way it turns.
+MAX_GRASP_YAW_DEG = 120.0
+
+
+def tool_long_axis_yaw(points, end_frac: float = 0.3):
+    """
+    (yaw, info): the direction, in the table plane, from a long tool's handle
+    end to its working end, radians from base +X; or (None, why).
+
+    The long axis is the principal direction of the cloud's XY. Which end is
+    the bowl is decided by width: the points in the outer ``end_frac`` of
+    each end, their spread across the axis. The printed scoop's bowl is
+    20.5 mm across and its handle ~8 mm, so the wider end is the bowl.
+    """
+    P = np.asarray(points, dtype=float)
+    if len(P) < 50:
+        return None, "too few points"
+    xy = P[:, :2] - np.median(P[:, :2], axis=0)
+    w, v = np.linalg.eigh(np.cov(xy.T))
+    u = v[:, int(np.argmax(w))]
+    if w.max() < 4.0 * max(w.min(), 1e-12):
+        return None, f"not elongated (axes {np.sqrt(w.max()) * 1000:.0f}/{np.sqrt(w.min()) * 1000:.0f} mm)"
+    along, across = xy @ u, xy @ np.array([-u[1], u[0]])
+    lo, hi = np.percentile(along, [2, 98])
+    span = hi - lo
+    head = across[along > hi - end_frac * span]
+    tail = across[along < lo + end_frac * span]
+    if len(head) < 10 or len(tail) < 10:
+        return None, "an end has too few points"
+    wh = float(np.percentile(head, 95) - np.percentile(head, 5))
+    wt = float(np.percentile(tail, 95) - np.percentile(tail, 5))
+    if wt > wh:
+        u, wh, wt = -u, wt, wh
+    info = {"length_mm": round(span * 1000, 1), "bowl_width_mm": round(wh * 1000, 1),
+            "handle_width_mm": round(wt * 1000, 1)}
+    if wh < 1.3 * wt:
+        return None, (f"cannot tell the bowl end from the handle "
+                      f"({wh * 1000:.0f} vs {wt * 1000:.0f} mm wide)")
+    # Where the working end is, the way measure_tool_offset reads it after the
+    # pick (the median of the far 30% of the bowl end), and the handle's
+    # centre line. A grasp placed from these does not lean with the
+    # centroid, which moves with how the cameras see the tool.
+    n = np.array([-u[1], u[0]])
+    along, across = xy @ u, xy @ n
+    bowl_side = along[along > 0.0]
+    far = bowl_side[bowl_side >= np.percentile(bowl_side, 70)] if len(bowl_side) >= 10 else bowl_side
+    handle = across[along < np.percentile(along, 30)]
+    origin = np.median(P[:, :2], axis=0)
+    info["working_end_xy"] = (origin + u * float(np.median(far))).tolist()
+    info["handle_line_xy"] = (origin + n * float(np.median(handle))).tolist()
+    info["axis_xy"] = u.tolist()
+    return float(np.arctan2(u[1], u[0])), info
+
+
+def square_top_yaw(points, band: float = 0.006):
+    """
+    (yaw, info): how far a square-topped object is turned about Z, radians in
+    (-45, 45] deg -- the smallest wrist turn that puts the jaws flat on two
+    opposite faces; or (None, why).
+
+    Fitted to the top ``band`` of the cloud (the stirrer's 30 mm cube; the
+    rod and holder below are round, so only the cube's turn matters): the
+    minimum-area rectangle around those points' XY. A rectangle that is far
+    from square, or the wrong size, is refused.
+    """
+    import cv2
+    P = np.asarray(points, dtype=float)
+    if len(P) < 30:
+        return None, "too few points"
+    top = P[P[:, 2] >= np.percentile(P[:, 2], 97) - band]
+    if len(top) < 20:
+        return None, "too few points on the top face"
+    rect = cv2.minAreaRect((top[:, :2] * 1000.0).astype(np.float32))
+    w, h = sorted(rect[1])
+    info = {"top_mm": [round(w, 1), round(h, 1)], "top_points": int(len(top))}
+    if not (20.0 <= h <= 45.0) or h > 1.4 * max(w, 1e-6):
+        return None, f"top is not a square of the cube's size ({w:.0f} x {h:.0f} mm)"
+    box = cv2.boxPoints(rect)
+    edge = box[1] - box[0]
+    yaw = float(np.arctan2(edge[1], edge[0]))
+    yaw = (yaw + np.pi / 4) % (np.pi / 2) - np.pi / 4        # nearest face
+    return yaw, info
+
+
+def yaw_about_z(yaw: float) -> np.ndarray:
+    c, s = np.cos(yaw), np.sin(yaw)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
 def upright_from_pitched(pose: np.ndarray) -> np.ndarray:
     """
     Same XY/closing as a pitched cup grasp, but tool Z straight down.
@@ -201,6 +291,37 @@ class PickUpSkill(BaseSkill):
             # straight down, the 55.5 mm rim leaves ~12 mm a side in the
             # 80 mm opening and a finger could land on it.
             "slide_in": 0.0,
+            # Lean the fingers this many degrees toward +X (away from the
+            # base) at the grasp, the object still standing upright. pour tips
+            # the fingers toward the base, so a cup taken like this is that
+            # much further over than the wrist: 10 deg makes a wrist that
+            # stalls at 80 deg still pour at 90 (the user, 2026-10-21, for the
+            # oil beaker). place sets it back down at this same tilt.
+            "tilt_away_deg": 0.0,
+            # Turn the wrist about world Z before a top grasp. None: as at
+            # home (jaws close along base Y). "auto": along the tool's long
+            # axis, tool X toward its working end, so a spoon lying at any
+            # angle is taken across its handle and sits in the jaws exactly as
+            # one lying straight ahead does -- the skills after the pick home
+            # the wrist and see the same tool. forward_offset/lateral_offset
+            # then run along/across the handle. A number: that many degrees.
+            # Turns past MAX_GRASP_YAW_DEG (a bowl pointing at the base) fall
+            # back to no turn.
+            "yaw": None,
+            # For a long tool picked with yaw "auto": put the jaws this far
+            # from its working end, measured along the handle, on the handle's
+            # centre line -- instead of the centroid plus forward_offset, which
+            # are then not applied. None keeps the centroid. The scoop's
+            # forward_offset -0.010 was tuned on a spoon lying straight ahead;
+            # turned to it (2026-10-23, +81 and +110 deg) the same offset closed
+            # the jaws 8-10 mm nearer the bowl (measured tool offset 32-34 mm
+            # against 41-42 when straight).
+            "working_end_distance": None,
+            # For the scoop: judge from the scan how it lies (no extra scan).
+            # "warn": say so if it is on its side and pick anyway. True: press
+            # it over first (right_spoon) -- tried on the robot 2026-10-23 and
+            # never righted it, so not used. False: no check.
+            "right_if_on_side": False,
             # Close to this width and stop, metres (a position command; no
             # squeezing on). None closes per force_limited. For an object whose
             # width at the jaws is known and which a force-limited close
@@ -225,6 +346,52 @@ class PickUpSkill(BaseSkill):
         """
         return self.validate_params(params)
     
+    @staticmethod
+    def _grasp_yaw(params, object_pc, grasp_type, slide):
+        """(yaw in radians or 0.0, what was decided) for this pick's ``yaw`` param."""
+        want = params.get("yaw")
+        if want is None or grasp_type == "side" or slide > 0:
+            return 0.0, None
+        mode = want.strip().lower() if isinstance(want, str) else None
+        if mode in ("auto", "long", "square"):
+            yaw, info, why = None, None, []
+            if mode in ("auto", "long"):
+                yaw, info = tool_long_axis_yaw(object_pc)
+                if yaw is None:
+                    why.append(f"long axis: {info}")
+            if yaw is None and mode in ("auto", "square"):
+                # Not a long tool: a square top (the stirrer's cube), turned to
+                # the nearest face.
+                yaw, info = square_top_yaw(object_pc)
+                if yaw is None:
+                    why.append(f"square top: {info}")
+                else:
+                    info = {**info, "fit": "square top"}
+                    print(f"[PickUp] Square top {info['top_mm'][0]:.0f} x "
+                          f"{info['top_mm'][1]:.0f} mm ({info['top_points']} points): "
+                          f"its faces are turned {np.degrees(yaw):+.0f}°")
+            if yaw is None:
+                print(f"[PickUp] yaw {mode}: {'; '.join(why)}; grasping as at home")
+                return 0.0, {"yaw_auto": why}
+        else:
+            yaw, info = np.radians(float(want)), {"given_deg": float(want)}
+        yaw = float((yaw + np.pi) % (2 * np.pi) - np.pi)
+        if abs(np.degrees(yaw)) > MAX_GRASP_YAW_DEG:
+            print(f"[PickUp] yaw {np.degrees(yaw):+.0f}° is past "
+                  f"±{MAX_GRASP_YAW_DEG:.0f}° (the tool points back at the base); "
+                  f"grasping as at home -- turn it around for a clean grasp")
+            return 0.0, {**(info if isinstance(info, dict) else {}),
+                         "refused_deg": round(float(np.degrees(yaw)), 1)}
+        what = ("the jaws onto its faces" if isinstance(info, dict) and
+                info.get("fit") == "square top" else
+                f"along the tool's long axis, {np.degrees(yaw):+.0f}° from +X")
+        print(f"[PickUp] Turning the wrist {np.degrees(yaw):+.0f}° about Z: {what}"
+              + (f" ({info['length_mm']:.0f} mm long, bowl {info['bowl_width_mm']:.0f} "
+                 f"/ handle {info['handle_width_mm']:.0f} mm wide)"
+                 if isinstance(info, dict) and "length_mm" in info else ""))
+        return yaw, {**(info if isinstance(info, dict) else {}),
+                     "yaw_deg": round(float(np.degrees(yaw)), 1)}
+
     def execute(self, params: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
         """
         Execute the pick up skill.
@@ -280,7 +447,45 @@ class PickUpSkill(BaseSkill):
         object_pc = located["points"]
         centroid = located["centroid"]
         dimensions = located["dimensions"]
-        
+
+        # 3b. A scoop lying on its side cannot be taken across its handle.
+        # The scan just made says how it lies; only if it is on its side is it
+        # pushed over first (right_spoon) and scanned again.
+        righted = None
+        mode = params.get("right_if_on_side")
+        if mode and object_pc is not None:
+            from .right_spoon import RightSpoonSkill, spoon_pose
+            table = self.config.get("table_z")
+            lies = spoon_pose(object_pc, float(table) if table is not None else 0.0)
+            print(f"[PickUp] How '{object_name}' lies: {lies['pose']} "
+                  f"(end widths {lies.get('width_mm')} mm, heights {lies.get('height_mm')} mm)")
+            if lies["pose"] == "on_side" and mode == "warn":
+                print(f"[PickUp] WARNING: '{object_name}' lies ON ITS SIDE. Set it flat, "
+                      f"mouth up, by hand for a clean grasp; trying the pick anyway")
+            elif lies["pose"] == "on_side":
+                print(f"[PickUp] '{object_name}' is on its side: righting it before the pick")
+                ok, righted = RightSpoonSkill(self.robot, self.vision, self.config).execute(
+                    {"object_name": object_name})
+                if not ok:
+                    return False, {"error": (f"'{object_name}' lies on its side and could not "
+                                             f"be righted: {righted.get('error')}"),
+                                   "righted": righted}
+                self.open_gripper()
+                if not self.clear_cameras(params, tag="PickUp"):
+                    return False, {"error": "Failed to reset_joints after righting",
+                                   "righted": righted}
+                self.vision.clear_cache()
+                located = self.vision.locate(object_name, force_refresh=True)
+                if located is None:
+                    return False, {"error": f"Lost '{object_name}' after righting it",
+                                   "righted": righted}
+                object_pc = located["points"]
+                centroid = located["centroid"]
+                dimensions = located["dimensions"]
+            elif lies["pose"] == "upside_down":
+                print(f"[PickUp] WARNING: '{object_name}' looks upside down; picking it "
+                      f"anyway (righting handles only a scoop on its side)")
+
         confidences = located.get("confidences") or {}
         if confidences:
             print(f"[PickUp] Object segmented with confidence: {max(confidences.values()):.2f}")
@@ -317,26 +522,56 @@ class PickUpSkill(BaseSkill):
         forward_offset = float(params["forward_offset"])
         lateral_offset = float(params["lateral_offset"])
         slide = float(params.get("slide_in") or 0.0)
+        yaw, yaw_info = self._grasp_yaw(params, object_pc, grasp_type, slide)
         grasp_pose = None
         for i, cand in enumerate(candidates):
             pose = cand.copy()
+            if yaw:
+                pose[:3, :3] = yaw_about_z(yaw) @ pose[:3, :3]
             if slide > 0:
                 # Jaws across the slide: they close along base Y, so they
                 # pass either side of the object as the hand moves along X.
                 pose[:3, :3] = np.diag([1.0, -1.0, -1.0])
+            tilt_away = float(params.get("tilt_away_deg") or 0.0)
+            if tilt_away:
+                # About world Y by -tilt: tool Z (fingers) goes from straight
+                # down to down-and-forward (+X).
+                a = np.radians(tilt_away)
+                Ry = np.array([[np.cos(a), 0.0, -np.sin(a)],
+                               [0.0, 1.0, 0.0],
+                               [np.sin(a), 0.0, np.cos(a)]])
+                pose[:3, :3] = Ry @ pose[:3, :3]
             if z_offset:
                 pose[2, 3] = float(np.clip(
                     pose[2, 3] + z_offset,
                     self.workspace_min[2],
                     self.workspace_max[2],
                 ))
-            if forward_offset or lateral_offset:
-                shifted = pose[:3, 3] + np.array(
+            from_end = params.get("working_end_distance")
+            if (yaw and from_end is not None and isinstance(yaw_info, dict)
+                    and yaw_info.get("working_end_xy") is not None):
+                u = np.asarray(yaw_info["axis_xy"], dtype=float)
+                end = np.asarray(yaw_info["working_end_xy"], dtype=float)
+                line_pt = np.asarray(yaw_info["handle_line_xy"], dtype=float)
+                # On the handle's line, from_end back from the working end.
+                along_end = float((end - line_pt) @ u)
+                xy = line_pt + u * (along_end - float(from_end))
+                was = pose[:2, 3].copy()
+                pose[:2, 3] = xy
+                pose[:3, 3] = self._clamp_position(pose[:3, 3])
+                print(f"[PickUp] Grasp {float(from_end) * 1000:.0f}mm back from the working "
+                      f"end, on the handle's line: {np.round(pose[:3, 3], 4)} "
+                      f"({np.linalg.norm(xy - was) * 1000:.0f}mm from the centroid; "
+                      f"forward/lateral_offset not applied)")
+            elif forward_offset or lateral_offset:
+                # Along and across the turned grasp; plain base X/Y at no turn.
+                shifted = pose[:3, 3] + yaw_about_z(yaw or 0.0) @ np.array(
                     [forward_offset, lateral_offset, 0.0], dtype=float
                 )
                 pose[:3, 3] = self._clamp_position(shifted)
-                print(f"[PickUp] Grasp shifted by forward(X)={forward_offset:+.3f}m "
-                      f"lateral(Y)={lateral_offset:+.3f}m -> "
+                axes = ("along the tool" , "across it") if yaw else ("forward(X)", "lateral(Y)")
+                print(f"[PickUp] Grasp shifted by {axes[0]}={forward_offset:+.3f}m "
+                      f"{axes[1]}={lateral_offset:+.3f}m -> "
                       f"{np.round(pose[:3, 3], 4)}")
 
             tip = pose[:3, 2]
@@ -597,6 +832,8 @@ class PickUpSkill(BaseSkill):
             "expected_width": expected,
             "target_width": target_width,
             "grasp_force": grasp_force,
+            "grasp_yaw": yaw_info,
+            "righted": righted,
             "suggested_tool_offset": (None if suggested is None
                                       else [float(v) for v in suggested]),
             "tool_extent_x": tool_extent_x(object_pc, held_frame),

@@ -63,6 +63,14 @@ class DispenseSkill(BaseSkill):
             "lift_height": 0.10,
             "reset_before_scan": True,
             "tool_length": 0.0,         # TCP -> pipette tip offset, metres
+            # Empty the pipette in one go instead of drops: squeeze the bulb
+            # flat (force-limited, as pick_pipette's pick squeeze) over the
+            # target, and keep it squeezed on the way out so nothing is drawn
+            # back. num_drops / squeeze_amount are then unused.
+            "squeeze_out": False,
+            "squeeze_force": 20.0,
+            # SAM category when the target is a written label (as stir).
+            "container_category": None,
             "hover_tol": 0.05,
             "descend_tol": 0.03,
         }
@@ -216,7 +224,8 @@ class DispenseSkill(BaseSkill):
             return False, {"error": "Failed to clear the cameras before scanning"}
 
         self.vision.clear_cache()
-        located = self.locate_container(target, force_refresh=True)
+        located = self.locate_container(target, force_refresh=True,
+                                        category=params.get("container_category"))
         if located is None:
             return False, {"error": f"Cannot locate target '{target}'"}
 
@@ -246,6 +255,30 @@ class DispenseSkill(BaseSkill):
                           f"(off by {err * 1000:.0f}mm); drops would land "
                           f"outside the container"),
             }
+
+        if bool(params.get("squeeze_out")):
+            print(f"[Dispense] Squeezing the bulb flat "
+                  f"({float(params['squeeze_force']):.0f}N) to empty it...")
+            if not self.close_gripper(force=float(params["squeeze_force"]),
+                                      force_limited=True):
+                return False, {"error": "Failed to squeeze the bulb"}
+            self.wait(1.5)
+            width = self.held_width()
+            print(f"[Dispense]   bulb {start_width * 1000:.1f} -> "
+                  f"{width * 1000:.1f}mm")
+            if width < 0.0005:
+                return False, {"error": (f"Jaws shut to {width * 1000:.1f}mm: "
+                                         f"the pipette is gone")}
+            # Lift still squeezed: releasing here would draw back up.
+            lift = dispense_xyz.copy()
+            lift[2] = rim_z + float(params["lift_height"]) + tool_length
+            if not self.goto_pose_rigid(lift, rotation, duration=3.0):
+                print("[Dispense] Warning: failed to lift clear after emptying")
+            self.vision.clear_cache()
+            return True, {"target": target, "squeezed_out": True,
+                          "squeezed_width": width,
+                          "dispense_position": dispense_xyz.tolist(),
+                          "rim_z": rim_z, "volume_measured": False}
 
         print(f"[Dispense] Dispensing {num_drops} drops...")
         drops = 0

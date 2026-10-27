@@ -137,8 +137,12 @@ def get_client(agent: str):
 #: Errors that say nothing about the request, only about getting it there.
 _TRANSIENT = ("APIConnectionError", "APITimeoutError", "RateLimitError",
               "InternalServerError", "ServiceUnavailableError")
-#: Seconds to wait before each retry of a transient failure.
-_BACKOFF = (3, 10, 30, 60)
+#: Seconds to wait before each retry of a transient failure: about 12
+#: minutes in all. It was 3/10/30/60 (under 2 minutes) until 2026-10-19,
+#: when a "Connection error" blocked a real run at sub-task 3 after 103 s;
+#: the API answered again later. Waiting costs nothing but time, while a
+#: blocked run has to be resumed by hand.
+_BACKOFF = (3, 10, 30, 60, 120, 180, 300)
 
 
 def _create(agent: str, client, request: dict):
@@ -148,7 +152,8 @@ def _create(agent: str, client, request: dict):
     A DNS hiccup on 2026-10-02 killed two sim runs outright: the openai
     client's own two quick retries were spent within a second, and the
     APIConnectionError escaped every stage's handler. Now it waits it out
-    for about two minutes, then reports a blocked stage rather than a crash.
+    for about twelve minutes, then reports a blocked stage rather than a
+    crash.
     """
     for attempt, wait in enumerate((0,) + _BACKOFF):
         if wait:
@@ -370,6 +375,31 @@ def _parses(raw: str) -> bool:
         return True
     except (json.JSONDecodeError, TypeError):
         return False
+
+
+def chat_create(client, **request):
+    """
+    ``client.chat.completions.create`` for the direct calls outside this
+    module (instruction sheet, cup labels), with the same model tolerance as
+    :func:`structured_completion`: a rejected ``temperature`` is dropped, and
+    a rejected ``max_tokens`` is dropped too. gpt-5.5 and gpt-6-* accept only
+    the default temperature, and on 2026-10-20 a gpt-6-astra dry run blocked
+    at the goal stage on the instruction parser's ``temperature=0``. The
+    token cap is removed rather than renamed to ``max_completion_tokens``,
+    because on a reasoning model that cap also counts hidden reasoning and a
+    100-token answer can come back empty.
+    """
+    for _ in range(3):
+        try:
+            return client.chat.completions.create(**request)
+        except Exception as exc:
+            if "temperature" in request and _mentions(exc, "temperature"):
+                request.pop("temperature")
+            elif "max_tokens" in request and _mentions(exc, "max_tokens"):
+                request.pop("max_tokens")
+            else:
+                raise
+    return client.chat.completions.create(**request)
 
 
 def _mentions(exc: Exception, word: str) -> bool:

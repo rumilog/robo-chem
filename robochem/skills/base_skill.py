@@ -10,6 +10,8 @@ from typing import Dict, Any, Optional, Tuple, List
 import numpy as np
 import time
 
+from .pacing import PacedArm
+
 try:
     from autolab_core import RigidTransform
 except ImportError:
@@ -139,10 +141,24 @@ def resample_path_eased(path, mats, count: int):
 
     Returns (positions, rotations), lists of ``count``.
     """
+    t = np.linspace(0.0, 1.0, int(count))
+    return _sample_path(path, mats, (t ** 3 * (10.0 - 15.0 * t + 6.0 * t ** 2)) * (len(path) - 1))
+
+
+def resample_path_uniform(path, mats, count: int):
+    """
+    ``count`` setpoints evenly along a path that already carries its timing.
+
+    For a path of one setpoint per tick (stir's circles, dump's twist): its
+    speed profile is kept and the whole of it runs faster or slower.
+    """
+    return _sample_path(path, mats, np.linspace(0.0, len(path) - 1, int(count)))
+
+
+def _sample_path(path, mats, src):
+    """Positions and rotations at fractional waypoint indices ``src``."""
     path = [np.asarray(p, dtype=float) for p in path]
     mats = [np.asarray(m, dtype=float) for m in mats]
-    t = np.linspace(0.0, 1.0, int(count))
-    src = (t ** 3 * (10.0 - 15.0 * t + 6.0 * t ** 2)) * (len(path) - 1)
     xyzs, rots = [], []
     for u in src:
         i = min(int(np.floor(u)), max(len(path) - 2, 0))
@@ -728,6 +744,12 @@ class BaseSkill(ABC):
             cartesian_impedance: leave False for a stiff path; the pour lesson
                 is that impedance quietly under-tracks.
         """
+        # The call's speed (robochem.skills.pacing): a streamed path is
+        # motion like any other. ``asked`` is the time at the validated pace.
+        asked = float(seconds)
+        if isinstance(self.robot, PacedArm):
+            seconds = self.robot.motion_seconds(asked)
+
         # A simulated arm has no ROS and no dynamic mode, but it can run the
         # whole path as one motion, which is the point of this method. Ask it
         # first, so a skill written for the robot previews faithfully.
@@ -782,7 +804,18 @@ class BaseSkill(ABC):
         # as a violent flick instead of a 5s stroke. stir never hit this only
         # because _circle_path already emits seconds*rate_hz points.
         wanted = max(2, int(round(float(seconds) * float(rate_hz))))
-        if len(poses) < wanted:
+        # A path of one setpoint per tick at the validated pace (stir's
+        # circles, dump's twist) has its own timing; at another speed it is
+        # run faster or slower as it is, not eased again.
+        if len(poses) >= int(round(asked * float(rate_hz))):
+            if seconds != asked:
+                count = max(2, int(round(len(poses) * seconds / asked)))
+                xyzs, rots = resample_path_uniform(path, mats, count)
+                print(f"[{tag}] {len(poses)} setpoints run in {count} "
+                      f"({asked:.1f}s at the validated pace, {seconds:.1f}s at "
+                      f"speed {self.robot.speed:.0f})")
+                poses = [as_pose(xyz, R) for xyz, R in zip(xyzs, rots)]
+        elif len(poses) < wanted:
             xyzs, rots = resample_path_eased(path, mats, wanted)
             print(f"[{tag}] Resampled {len(poses)} waypoints to {wanted} "
                   f"setpoints so the path actually takes {seconds:.1f}s "

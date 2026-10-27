@@ -98,6 +98,8 @@ class ObjectLocalizer:
         self._cached_segmentations = {}
         self._cached_pointclouds = {}
         self._cached_centroids = {}
+        #: The most recent all-camera capture (see capture_pointclouds).
+        self.last_capture = None
     
     def capture_images(self) -> List[np.ndarray]:
         """
@@ -124,7 +126,7 @@ class ObjectLocalizer:
         except Exception:
             pass
 
-    def capture_pointclouds(self, warmup: int = 8) -> Dict:
+    def capture_pointclouds(self, warmup: int = 8, cam_ids: List[int] = None) -> Dict:
         """
         Capture colour and depth from each camera, one at a time.
 
@@ -133,7 +135,8 @@ class ObjectLocalizer:
         synchronised snapshot, so each camera is started, warmed up, read,
         and stopped before the next one starts. Persistent CameraClass
         instances (if the caller already opened them) are reused as-is.
-        
+        ``cam_ids`` captures only those cameras (default: all of them).
+
         Returns:
             Dict with 'pointclouds', 'images', 'depth_images', 'intrinsics'
         """
@@ -142,7 +145,7 @@ class ObjectLocalizer:
         depth_images = {}
         intrinsics = {}
         
-        for cam_id in self.camera_ids:
+        for cam_id in (self.camera_ids if cam_ids is None else cam_ids):
             cam, owned = self._open_camera(cam_id)
             try:
                 n = warmup if owned else 1
@@ -162,12 +165,17 @@ class ObjectLocalizer:
                 if owned:
                     self._close_camera(cam)
         
-        return {
+        data = {
             'pointclouds': pointclouds,
             'images': images,
             'depth_images': depth_images,
             'intrinsics': intrinsics
         }
+        if cam_ids is None:
+            # The full scan a locate was made from; VisionSystem keeps it so a
+            # later locate can check that nothing has moved since.
+            self.last_capture = data
+        return data
 
     def _extrinsics(self, cam_id: int):
         if cam_id in self.cameras:

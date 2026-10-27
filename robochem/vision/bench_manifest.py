@@ -320,6 +320,10 @@ CLEAR_CUP_GRASP_Z_OFFSET = 0.0
 #: user measured at about 61 mm (2026-10-08). 61 - 3 mm. Wider if it still
 #: squeezes, narrower if the cup slips.
 CLEAR_CUP_GRIP_WIDTH = 0.058
+#: pick_up's forward_offset for the two water cups, A and B (+ away from
+#: the arm). The user asked for the grasp 6 mm further forward on 2026-10-20.
+#: C (empty) is unchanged. Change this one number to tune it.
+WATER_CUP_FORWARD_OFFSET = 0.006
 _CUP_PICK = (("slide_in", CLEAR_CUP_SLIDE_IN), ("z_offset", CLEAR_CUP_GRASP_Z_OFFSET),
              ("grip_width", CLEAR_CUP_GRIP_WIDTH))
 
@@ -335,9 +339,10 @@ BEAKER_GRASP_Z_OFFSET = 0.0
 
 def _cup(name: str, label: str, aliases: Tuple[str, ...],
          radius: float = CLEAR_CUP_RADIUS, height: float = CLEAR_CUP_HEIGHT,
-         pick: Tuple[Tuple[str, object], ...] = ()) -> BenchObject:
+         pick: Tuple[Tuple[str, object], ...] = (),
+         note: str = "a clear plastic cup") -> BenchObject:
     return BenchObject(name=name, label=label, category="clear plastic cup",
-                       aliases=aliases, note="a clear plastic cup",
+                       aliases=aliases, note=note,
                        transparent=True, radius=radius, height=height, pick=pick)
 
 
@@ -355,8 +360,10 @@ MAGIC_BEAKER = BenchManifest("magic_beaker", [
     _dish("baking soda cup", "baking soda"),
     _dish("red cabbage powder cup", "red cabbage powder"),
     _cup("clear cup a", "a 10 ml water", ("cup a",),
-         pick=_CUP_PICK + (("lateral_offset", CUP_A_LATERAL_OFFSET),)),
-    _cup("clear cup b", "b 10 ml water", ("cup b",), pick=_CUP_PICK),
+         pick=_CUP_PICK + (("lateral_offset", CUP_A_LATERAL_OFFSET),
+                           ("forward_offset", WATER_CUP_FORWARD_OFFSET))),
+    _cup("clear cup b", "b 10 ml water", ("cup b",),
+         pick=_CUP_PICK + (("forward_offset", WATER_CUP_FORWARD_OFFSET),)),
     # The same cup as A and B (the user, 2026-10-07).
     _cup("clear cup c", "c empty", ("cup c", "empty clear cup", "empty cup"),
          pick=_CUP_PICK),
@@ -390,7 +397,14 @@ MAGIC_BEAKER = BenchManifest("magic_beaker", [
         # request, after the recalibration. Back to -0.010 on 2026-10-15: at
         # 0 the jaws closed on the crank (27.1 mm, not grasped), the spoon
         # slid to 8.2 mm in the jaws, and the scoop jammed on the dish floor.
-        pick=(("z_offset", 0.0), ("grasp_force", 1.0), ("forward_offset", -0.010)),
+        # yaw auto: the wrist turns to the spoon's handle, so it can lie at
+        # any angle (robot, 2026-10-23: +81°, picked and put back).
+        # working_end_distance: with yaw auto the jaws go 42 mm back from the
+        # bowl (the tool offset the 2026-10-22 straight picks measured, 41-42,
+        # whose scoops worked); forward_offset is then the fallback's only.
+        pick=(("z_offset", 0.0), ("grasp_force", 1.0), ("forward_offset", -0.010),
+              ("yaw", "auto"), ("working_end_distance", 0.042),
+              ("right_if_on_side", "warn")),
     ),
     BenchObject(
         name="stirrer", prompt="white cube",
@@ -399,7 +413,9 @@ MAGIC_BEAKER = BenchManifest("magic_beaker", [
         note=("a rod with a white cube on top, standing in its holder; the "
               "gripper takes it by the cube"),
         # As the robot-run chain picked "white cube" (2026-09-25, 2026-10-05).
-        pick=(("z_offset", 0.0), ("grasp_force", 1.0)),
+        # yaw auto: the jaws turn to the cube's faces (its top is fitted as a
+        # square); rod and bore are round, so the put-back does not care.
+        pick=(("z_offset", 0.0), ("grasp_force", 1.0), ("yaw", "auto")),
     ),
     BenchObject(
         name="stirrer holder",
@@ -425,5 +441,87 @@ MAGIC_BEAKER = BenchManifest("magic_beaker", [
                              "seconds_per_waypoint": STIR_SECONDS_PER_WAYPOINT}},
 )
 
+#: The booklet's Color-Changing Jellyfish (pages 14-15) as set up on the real
+#: bench on 2026-10-21 (scene_captures/jellyfish_20261021_173701). The same
+#: dishes, cups, scoop and stirrer as the Magic Beaker, on new labels, plus the
+#: pipette standing through the lid of a white paper cup.
+JELLYFISH = BenchManifest("jellyfish", [
+    _dish("baking soda cup", "baking soda"),
+    _dish("red cabbage powder cup", "red cabbage powder"),
+    _cup("first clear cup", "2/3 cup of water",
+         ("clear cup 1", "base cup", "cup of water", "2/3 cup of water"),
+         pick=_CUP_PICK,
+         # 2026-10-21: the planner read sheet step 1 ("fill the first clear
+         # cup 2/3 full of water") as a pour, and poured the OIL beaker in
+         # first, before the baking soda.
+         note=("a clear plastic cup ALREADY filled 2/3 with water: sheet step "
+               "1 is done, nothing needs pouring into it to fill it")),
+    _cup("other clear cup", "20 ml water",
+         ("clear cup 2", "second clear cup", "indicator cup", "20 ml water"),
+         pick=_CUP_PICK,
+         note="a clear plastic cup ALREADY holding the 20 ml of water"),
+    BenchObject(
+        name="beaker", label="vegetable oil", category="clear plastic cup",
+        aliases=("plastic beaker", "oil beaker", "vegetable oil"),
+        note=("a small clear measuring beaker holding ONLY the 10 ml of "
+              "vegetable oil, already measured. It is not water. Pour it into "
+              "the first clear cup only at sheet step 3, AFTER the baking "
+              "soda has been added and stirred in"),
+        # NOT MEASURED: the Magic Beaker's beaker numbers.
+        transparent=True, radius=0.022, height=0.060,
+        pick=(("z_offset", BEAKER_GRASP_Z_OFFSET), ("tilt_away_deg", 10.0)),
+    ),
+    BenchObject(
+        name="pipette", prompt="pipette",
+        aliases=("dropper", "transfer pipette", "plastic pipette"),
+        note=("a clear plastic transfer pipette standing upright through the "
+              "lid of a white paper cup, bulb up; take it with pick_pipette, "
+              "which also draws liquid into it"),
+    ),
+    BenchObject(
+        name="pipette cup",
+        aliases=("pipette holder", "lidded cup", "white paper cup"),
+        note=("the lidded white paper cup the pipette stands in; it holds no "
+              "reagent and is not one of the kit's clear cups"),
+    ),
+    BenchObject(
+        name="larger spoon", prompt="white plastic tool",
+        aliases=("big scoop", "big spoon", "large spoon", "scoop",
+                 "small scoop", "small spoon", "medium scoop", "medium spoon",
+                 "smaller spoon", "smaller scoop", "white plastic tool"),
+        note=("a white plastic scoop lying flat on the bench, and the ONLY "
+              "scoop here: use it wherever the instructions call for the "
+              "small or the medium scoop"),
+        # yaw auto: the wrist turns to the spoon's handle, so it can lie at
+        # any angle (robot, 2026-10-23: +81°, picked and put back).
+        # working_end_distance: with yaw auto the jaws go 42 mm back from the
+        # bowl (the tool offset the 2026-10-22 straight picks measured, 41-42,
+        # whose scoops worked); forward_offset is then the fallback's only.
+        pick=(("z_offset", 0.0), ("grasp_force", 1.0), ("forward_offset", -0.010),
+              ("yaw", "auto"), ("working_end_distance", 0.042),
+              ("right_if_on_side", "warn")),
+    ),
+    BenchObject(
+        name="stirrer", prompt="white cube",
+        aliases=("stirring rod", "stir rod", "stirring stick", "stir stick",
+                 "white cube"),
+        note=("a rod with a white cube on top, standing in its holder; the "
+              "gripper takes it by the cube"),
+        # yaw auto: the jaws turn to the cube's faces (its top is fitted as a
+        # square); rod and bore are round, so the put-back does not care.
+        pick=(("z_offset", 0.0), ("grasp_force", 1.0), ("yaw", "auto")),
+    ),
+    BenchObject(
+        name="stirrer holder",
+        aliases=("holder", "stirrer stand", "stir holder", "tool holder"),
+        note=("the dark block the stirrer stands in; the stirrer goes back "
+              "into it and nothing else does"),
+    ),
+],
+    measured_tool_offset=True,
+    skill_defaults=MAGIC_BEAKER.skill_defaults,
+)
+
 #: Benches selectable with ``run_experiment.py --bench``.
-BENCHES: Dict[str, BenchManifest] = {MAGIC_BEAKER.name: MAGIC_BEAKER}
+BENCHES: Dict[str, BenchManifest] = {MAGIC_BEAKER.name: MAGIC_BEAKER,
+                                     JELLYFISH.name: JELLYFISH}

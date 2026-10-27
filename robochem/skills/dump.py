@@ -84,6 +84,39 @@ def _wrist_reach(tcp: np.ndarray, rotation: np.ndarray) -> float:
     return float(np.hypot(along, across - PANDA_J6_OFFSET))
 
 
+def reachable_tip_deg(site_xy, rim_z: float, tool_offset, bowl=(0.0275, 0.0205, 0.0115),
+                      heading: float = 0.0, params: Dict[str, Any] = None) -> float:
+    """
+    How far a dump can tip over ``site_xy`` before the arm runs out of reach,
+    degrees -- the check ``DumpSkill.execute`` makes, done here without the
+    robot, for planning ahead. ``heading`` is the bowl's direction (0 at
+    home, where every dump starts). ``bowl`` is (length, width, depth).
+    """
+    p = {**DumpSkill.optional_params.fget(None), **(params or {})}
+    carry, dump_angle = float(p["carry_tilt_deg"]), float(p["dump_angle_deg"])
+    clearance = float(p["rim_clearance"])
+    reach_limit = PANDA_REACH - float(p["reach_margin"])
+    length, width, depth = (max(0.0, float(v)) for v in bowl)
+    bottom = np.asarray(tool_offset, dtype=float)
+    centre_tool = bottom - np.array([0.0, 0.0, depth / 2])
+    corners = np.array([[bottom[0] + sx * length / 2, bottom[1] + sy * width / 2, bottom[2] - dz]
+                        for sx in (-1, 1) for sy in (-1, 1) for dz in (0.0, depth)])
+    site = np.asarray(site_xy, dtype=float)[:2]
+
+    def pose_at(tilt):
+        R = _orthonormalize(_level(heading) @ tool_y_delta(-float(tilt)))
+        below = float(min((R @ c)[2] for c in corners) - (R @ centre_tool)[2])
+        centre = np.array([site[0], site[1], float(rim_z) + clearance - below])
+        return centre - R @ centre_tool, R
+
+    tip = carry
+    for a in np.arange(carry, dump_angle + 1e-6, 1.0):
+        if _wrist_reach(*pose_at(float(a))) > reach_limit:
+            break
+        tip = float(a)
+    return tip
+
+
 class DumpSkill(BaseSkill):
     """
     Tip a loaded scoop out into a target container.
@@ -141,6 +174,14 @@ class DumpSkill(BaseSkill):
             "shakes": 2,
             "shake_deg": 12.0,
             "shake_seconds": 0.6,       # per half swing
+            # Then twist the wrist about its own axis (tool Z), left and right
+            # of where it is, in fast succession: +twist_deg, back through 0
+            # to -twist_deg, back to 0, ``twists`` times. The bowl centre is
+            # held over the cup while it turns. 0 turns it off. (The user,
+            # 2026-10-22.)
+            "twist_deg": 15.0,
+            "twists": 2,
+            "twist_seconds": 1.0,       # per full left-right cycle
             "return_seconds": 3.0,
             # Final lift: the spoon's lowest point this far above the rim.
             "lift_height": 0.10,
@@ -524,6 +565,36 @@ class DumpSkill(BaseSkill):
                         "residual_tilt": residual,
                     }
                 homed = True
+
+        twist = abs(float(params.get("twist_deg") or 0.0))
+        twists = max(0, int(params.get("twists") or 0))
+        if twist > 0.5 and twists and not homed:
+            centre, R0 = bowl_now()
+            R0 = _orthonormalize(R0)
+            cycle = max(0.4, float(params["twist_seconds"]))
+            n = max(8, int(round(cycle * twists * 50)))
+            tcps, rots = [], []
+            for i in range(n + 1):
+                # One sine per cycle: +twist, 0, -twist, 0. Smooth at both ends.
+                a = np.radians(twist) * np.sin(2 * np.pi * twists * i / n)
+                c, sn = np.cos(a), np.sin(a)
+                R = R0 @ np.array([[c, -sn, 0.0], [sn, c, 0.0], [0.0, 0.0, 1.0]])
+                rots.append(R)
+                tcps.append(centre - R @ centre_tool)
+            print(f"[Dump] Twisting the wrist ±{twist:.0f}° {twists}x "
+                  f"({cycle:.1f}s each), bowl held over the cup...")
+            ok, why = self.stream_pose_path(tcps, rots, seconds=cycle * twists,
+                                            tag="Dump")
+            if not ok:
+                print(f"[Dump]   continuous twist unavailable ({why}); stepping")
+                quarter = n // (4 * twists)
+                for i in [k * quarter for k in range(1, 4 * twists + 1)]:
+                    i = min(i, n)
+                    if not self.goto_pose_rigid(tcps[i], rots[i],
+                                                duration=max(0.3, cycle / 4)):
+                        print("[Dump]   twist failed; carrying on")
+                        break
+            record("twisted")
 
         # 6. Unwind the same way, in steps, and CHECK. One cartesian goto from
         # the stalled pose back to level was accepted on 2026-09-25 and left

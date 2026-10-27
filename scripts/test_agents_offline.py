@@ -186,11 +186,14 @@ def corrective_response(subtasks, *, diagnosis="the scoop came up empty", **kwar
     return payload
 
 
-def call_response(skill, params, *, feasible=True, reason=""):
-    return {"feasible": feasible, "infeasible_reason": reason, "skill": skill,
-            "params": [{"name": k, "value": json.dumps(v)} for k, v in params.items()],
-            "rationale": f"{skill} realises this sub-task",
-            "expected_outcome": "as planned"}
+def call_response(skill, params, *, feasible=True, reason="", speed=None):
+    response = {"feasible": feasible, "infeasible_reason": reason, "skill": skill,
+                "params": [{"name": k, "value": json.dumps(v)} for k, v in params.items()],
+                "rationale": f"{skill} realises this sub-task",
+                "expected_outcome": "as planned"}
+    if speed is not None:
+        response.update(speed=speed, speed_reason="chosen for the test")
+    return response
 
 
 #: The scoop-and-dump run, which is the one the sim exercises.
@@ -442,7 +445,8 @@ def test_skill_agent_is_told_the_real_gripper_state():
 
     scene = Scene(objects=[SceneObject("larger spoon", "tool", True, "empty", True)])
     llm = FakeLLM({"skill_call": call_response("scoop",
-                                               {"powder_source": "citric acid cup"})})
+                                               {"powder_source": "citric acid cup"},
+                                               speed=35)})
     history = [skill_planner.StepOutcome(
         skill_planner.SkillCall("pick_up", {"object_name": "larger spoon"}),
         False, "could not find it")]
@@ -456,9 +460,34 @@ def test_skill_agent_is_told_the_real_gripper_state():
           "jaws read 78 mm" in prompt)
     check("what actually happened is in the prompt, not an assumption of success",
           "FAILED" in prompt and "could not find it" in prompt, prompt[-300:])
-    check("the call comes back executable",
-          (call.skill, call.params) == ("scoop", {"powder_source": "citric acid cup"}),
+    check("the call comes back executable, at the speed the model chose",
+          (call.skill, call.params) == ("scoop", {"powder_source": "citric acid cup",
+                                                  "speed": 35}),
           f"{call.as_dict()}")
+    check("the speed scale is in the system prompt",
+          "Speed: every call carries a speed" in llm.calls[0]["system"])
+
+
+def test_speed_is_carried_only_where_the_arm_moves():
+    print("\n[skill call: speed]")
+    from robochem.agents import skill_planner
+    from robochem.agents.planner import SubTask
+    from robochem.agents.scene import Scene
+    from robochem.skills.pacing import DEFAULT_SPEED
+
+    def plan(response):
+        return skill_planner.plan_skill_call(
+            SubTask(1, "step"), Scene(), client=FakeLLM({"skill_call": response}))
+
+    call = plan(call_response("pick_up", {"object_name": "larger spoon"}))
+    check("no speed from the model: the tuned pace",
+          call.params.get("speed") == DEFAULT_SPEED, f"{call.params}")
+    call = plan(call_response("pick_up", {"object_name": "larger spoon"}, speed=140))
+    check("an out-of-range speed is clamped to 100", call.params.get("speed") == 100,
+          f"{call.params}")
+    call = plan(call_response("wait", {"duration": 5}, speed=80))
+    check("a skill that does not move the arm carries no speed",
+          "speed" not in call.params, f"{call.params}")
 
 
 def test_infeasible_is_reported_not_approximated():
@@ -500,7 +529,7 @@ def test_happy_path():
           [c[0] for c in skills.calls] == [c[0] for c in SCOOP_CALLS],
           f"{[c[0] for c in skills.calls]}")
     check("the parameters reached the executor unchanged",
-          skills.calls[1][1] == {"powder_source": "citric acid cup"},
+          skills.calls[1][1] == {"powder_source": "citric acid cup", "speed": 0},
           f"{skills.calls[1][1]}")
     check("the stages ran in order",
           [c["schema"] for c in llm.calls][:2] == ["scene_description", "subtask_plan"],
@@ -1205,6 +1234,7 @@ def main():
     test_scene_agent_on_the_real_bench()
     test_skill_agent_is_told_the_real_gripper_state()
     test_infeasible_is_reported_not_approximated()
+    test_speed_is_carried_only_where_the_arm_moves()
     test_happy_path()
     test_a_pour_that_is_not_the_last_keeps_some()
     test_a_container_put_down_between_its_pours_still_keeps_some()

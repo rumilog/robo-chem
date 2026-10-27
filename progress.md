@@ -1,6 +1,6 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-10-15
+Last updated: 2026-10-27
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
@@ -3944,3 +3944,1152 @@ only; not yet run on the robot.
     `s24_pour_cam3.jpg`.
 - Not seen on the robot: how long the extra capture takes per pour. The
   skills' own scans open the four cameras in a few seconds.
+
+**Robot runs 2026-10-19 (read back from the records and
+`experiments/pipeline_20261015.log` on 2026-10-20).**
+- **16:22 (`agent_run_20261019_163229.json`, 24-step plan):** 1-2 ok, then
+  blocked at sub-task 3's skill call. The error was "SkillCallAgent: could
+  not reach the model after 4 retries: Connection error."
+  - Not the key: on 2026-10-20 the same key answered a gpt-4.1 call in
+    4.2 s.
+  - A missing key raises `MissingAPIKeyError`, and a bad key a 401; neither
+    is retried.
+  - "Connection error" is the network, and the old retries gave up after
+    103 s.
+- **16:35 (`agent_run_20261019_165344.json`, 31-step plan, no needless
+  regrasp to drop):** 1-14 ok, then 15 (pick the larger spoon) failed with
+  "Failed to lift object".
+  - It closed 12.6 mm from the commanded grasp, at 16.7 mm
+    (`gripper_is_grasped=False`).
+  - The lift stalled at z 0.0756 against 0.1564 commanded (81 mm short,
+    tol 35).
+  - The spoon was at (0.725, -0.128), the farthest object on the bench, at
+    the edge of the reach. The same pick at (0.728, -0.123) worked on the
+    resume.
+- **Resume from 15, about 16:54, pointed at the 10-15 record:**
+  - The log says "the plan of 2026-10-15 18:19:28 ... running 15-33", so it
+    ran that day's 33-step plan (with the needless put-down at 24-25), not
+    the 31-step plan of the run it continued.
+  - Sub-tasks 15-32 all ran.
+  - Pours: 60 / 90 / 65 / 90 with `[adjusted]` notes, and 16 photos in
+    `photos_20261019_165442/` (s23, s26, s29, s32 x cams 2-5).
+  - **It ended at the step 33 prompt and wrote no record**, probably on
+    Ctrl-C. So the report cannot see 15-32 or the photos.
+- **Fixes (2026-10-20):**
+  - `llm_client._BACKOFF` is 3/10/30/60/120/180/300 s, about 12 min in all,
+    before a stage is reported blocked.
+  - Ctrl-C at the `--step` prompt is a stop like q, so the record is
+    written.
+  - `--resume latest` takes the newest record in `--log-dir` that moved the
+    robot (`reporter.latest_record`). It prints the record and the
+    sub-tasks done there.
+  - `test_agents_offline.py` 133/133 in both venvs. A patched `input`
+    raising KeyboardInterrupt made `confirm_step` return False.
+- **Full run, as of 2026-10-20** (agent pipeline; the scene agent reads the
+  bench photos and the sheet with gpt-4.1):
+  `python scripts/run_experiment.py --workspace-min 0.25 -0.40 -0.13
+  --instruction-image instructions/magic_beaker.png --follow-steps
+  --no-verify --max-retries 0 --reset --step 2>&1 | tee -a
+  experiments/pipeline_<date>.log`
+  - After a stop: the same command without `--reset`, plus `--resume latest
+    --from-step N`.
+  - `--legacy-planner` (the single-prompt `VLMOrchestrator`) is not the
+    path that has run the Magic Beaker on the robot.
+
+**OpenAI models available to this key (probed 2026-10-20).** Tiers come
+from `.env` / env vars: `ROBOCHEM_MODEL_STRONG` (planner, skill-call agent,
+report writer; default `gpt-4.1`) and `ROBOCHEM_MODEL_CHEAP` (scene agent;
+default `gpt-4.1-mini`). No code change is needed to switch.
+- `models.list()` returns 135 ids. The chat models include gpt-4.1/-mini/
+  -nano, gpt-4o (API shutdown 2026-10-23), gpt-5, gpt-5-mini, 5.1, 5.2, 5.4
+  (and -mini), 5.5, 5.6-sol/-terra/-luna, gpt-6-sol/-luna/-astra,
+  gpt-6.1-sol, o3, and o4-mini.
+- Probe (scratchpad `probe_models.py`): the sheet image plus a strict
+  json_schema, then one strict-schema call with a function tool. Times are
+  for the sheet call; "steps" is how many the model read (the sheet has 7).
+
+  | model | temperature | time | steps | tools in chat.completions |
+  |---|---|---|---|---|
+  | gpt-4.1 | ok | 4.8 s | 7 | ok |
+  | gpt-5.4 | ok | 5.6 s | 7 | ok |
+  | gpt-5.5 | rejected | 11.9 s | 7 | ok |
+  | gpt-6-astra | rejected | 14.7 s | **8** | **400: use /v1/responses** |
+  | gpt-6.1-sol | rejected | 11.0 s | 8 | 400 |
+
+  - gpt-5.6-* and gpt-6-* all refuse function tools on chat.completions.
+    `reasoning_effort` 'none' and 'minimal' are not accepted (only
+    low..xhigh), and 'low' is still refused.
+  - The Responses API does return a `function_call` for gpt-6.1-sol.
+  - A rejected temperature is harmless: `llm_client` drops it and retries.
+- **gpt-6-astra (the user asked about it):**
+  - Usable for the planner and skill calls (structured output, no tools):
+    `ROBOCHEM_MODEL_STRONG=gpt-6-astra` in `.env`.
+  - **`write_report.py` will fail on it** (tool loop on chat.completions).
+    Until `llm_client.tool_completion` is ported to `/v1/responses`, run
+    `ROBOCHEM_MODEL_STRONG=gpt-4.1 python scripts/write_report.py`.
+  - About 3x slower per call than gpt-4.1, so roughly +5 min over ~33
+    calls.
+  - Plan quality vs gpt-4.1 is **untested**. A real-planner comparison
+    script was written but not run (the user stopped it).
+  - Suggested check before a robot run: the full command with `--dry-run`
+    instead of `--step` (plans every step, no motion; still opens the
+    cameras).
+
+**gpt-6-astra real-cell dry run (2026-10-20): planned nothing.**
+`ROBOCHEM_MODEL_STRONG=gpt-6-astra python scripts/run_experiment.py
+--workspace-min 0.25 -0.40 -0.13 --instruction-image
+instructions/magic_beaker.png --follow-steps --no-verify --dry-run`
+- Run 1 (`agent_run_20261020_114231.json`): blocked at the goal stage.
+  `InstructionParser` called chat.completions directly with `temperature=0`
+  and got a 400; the `llm_client` temperature fallback never saw it.
+  - Fix: `llm_client.chat_create(client, **request)` drops a rejected
+    `temperature` or `max_tokens` and retries. `instruction_parser`,
+    `label_resolver` (both calls) and `scene_analyzer` (both calls) use it
+    now. The token cap is dropped rather than renamed, since on a
+    reasoning model it also counts hidden reasoning. 133/133 offline.
+- Run 2 (`agent_run_20261020_114405.json`): goal read (all 7 sheet steps),
+  scene found all 10 objects, then **the planner returned 0 sub-tasks**,
+  outcome `failed`. Its reason: no small scoop, no water warming, no speech
+  skill, and "one large scoop each ... does not establish neutralizing
+  proportions", so it would not claim the purple endpoint.
+  - gpt-4.1 plans the same goal as 31-33 steps and has run it on the
+    robot. gpt-6-astra is too literal for `--follow-steps` as the prompt
+    stands. Stay on gpt-4.1 unless the planner prompt is told to
+    approximate unmet details (doses, warming, speech) instead of refusing.
+- **Planner prompt relaxed (2026-10-20, per the user):** a new autonomy
+  rule in `planner._PLAN_PROMPT` — "approximate rather than refuse". It
+  drops non-manipulation steps (speaking, the audience, presentation),
+  assumes bench liquids are already at the sheet's temperature (the water
+  counts as warm), uses the closest tool for a missing one or dose (one
+  scoop with the larger spoon, big or small), and does not refuse because
+  the amounts might not give the stated result. `feasible=false` only when
+  an object the procedure needs is absent. 133/133 offline.
+  - **Not yet tested on a model.** The rerun
+    (`agent_run_20261020_115314.json`) hit a 429 `credit_balance_exhausted`
+    at the instruction parser: the OpenAI account is out of credits. Rerun
+    the astra dry run above once billing is topped up, and check that
+    gpt-4.1 still plans the full sheet. (Done the same day, below.)
+- **Run 3, credits added (`agent_run_20261020_120603.json`):** the relaxed
+  prompt worked: astra planned 31 steps. Then sub-task 2 (scoop) came back
+  INFEASIBLE: "the preceding pickup did not report suggested_tool_offset".
+  A dry run never grasps, so nothing is measured. It replanned into 12
+  sub-tasks with several skills each ("Run place ... Then run pick_up ..."),
+  and the skill-call agent took one skill from each, so the calls were
+  wrong (e.g. `place target_location 'larger spoon'` while the stirrer was in hand).
+  - Fix: in a dry run `_with_offset` says "DRY RUN: nothing was grasped,
+    no tool_offset measured, leave it out; on the robot the pick_up
+    supplies it". The real path is unchanged.
+- **Run 4 (`agent_run_20261020_121117.json`): success, 31 steps, 0
+  replans.** 3x scoop/dump/stir and 4 pours, the same shape as gpt-4.1.
+  Pours were adjusted by the existing logic (23: 80 -> 60, 27: 90 -> 65).
+  It expects red in cup a, blue in b, and purple + fizz in c.
+- **gpt-4.1 with the new prompt (`agent_run_20261020_121256.json`):**
+  success, 31 steps, 0 replans. Skills: 9 pick_up, 9 place, 3 scoop,
+  3 dump, 3 stir, 4 pour. So the prompt change did not hurt it.
+- Neither model has run this on the robot with the new prompt yet. To try
+  astra for real: `ROBOCHEM_MODEL_STRONG=gpt-6-astra` plus the full-run
+  command with `--step`.
+- Open items for the next session:
+  - port `tool_completion` to the Responses API if gpt-6 models are kept;
+  - first robot run with the 2026-10-15/20 changes (60/90/65/90 pours, the
+    needless put-down dropped, photos after pours, `--resume latest`);
+  - consider moving the spoon 3-5 cm toward the base (it stalled lifting
+    at x 0.725).
+
+**2026-10-20, robot run `agent_run_20261020_123353.json` (gpt-4.1, 27-step plan).**
+- 1-4 ok (citric acid into A, then scoop baking soda). 5, dump into
+  clear cup B: "Cannot locate 'clear cup b'" from the scan with the arm over
+  the bench. A camera-only check from home a few minutes later found all
+  three cups: B at (0.458, +0.125), read B by 3 of 4 cameras. The plastic
+  beaker at (0.573, +0.018) was read "A 10 ML WATER" by 3 cameras but stayed
+  unassigned.
+- The user's first resume pointed `--resume` at the 10-15 record. That
+  plan's step 5 is "pick up the stirrer" while the spoon was still in hand.
+  Flagged to the user to stop it at the `--step` prompt. Use `--resume latest` or the record of the run being continued.
+- `scripts/check_bench_layout.py` (camera-only identification, no arm) now
+  loads `.env` itself. Without `source scripts/env.sh` it had died in
+  `OpenAI()` with no API key.
+- **Water cups grasped 6 mm further forward (user, 2026-10-20):**
+  `bench_manifest.WATER_CUP_FORWARD_OFFSET = 0.006` is pick_up's
+  `forward_offset` for clear cups A and B (C and the beaker unchanged).
+  Checked in the manifest: A and B carry `forward_offset 0.006`. Not yet
+  seen on the robot. `test_agents_offline.py` 133/133.
+  `test_skills_offline.py` crashes on `FakePose` (`float()` of a fake pose)
+  with or without this change, from earlier work. Not investigated.
+- **Step 31 (pour B into C) refused twice:** "Cannot locate 'clear cup c'"
+  (`agent_run_20261020_142834.json`, then the resume
+  `agent_run_20261020_143135.json`). Scanned from home: cup A at
+  (0.379, -0.111) read [A x1, C EMPTY x1, 50 ML x1]; cup C at
+  (0.427, -0.024) read [A x1, C EMPTY x1]. Two share-outs tie, so the vote
+  refused. C held red liquid by then.
+  - Fix, `VisionSystem.last_seen` (bench name -> xy): set on every resolved
+    vote. On a tie, take the tied candidate **closest** to the last-seen
+    spot (the user's choice: closest, no distance threshold). With no
+    last-seen spot, it still refuses. A resume seeds it from the record:
+    pour `lip_xy` -> target, place `place_position` -> the placed object.
+    Replaying `_143135` gives C (0.412, -0.025): 15 mm from the C candidate
+    and ~100 mm from A's. 133/133 offline. Not yet seen on the robot.
+  - Gap: a live (non-resume) run puts only vote results in `last_seen`,
+    not place positions.
+
+**`pick_pipette` skill (2026-10-21, `robochem/skills/pick_pipette.py`). Not yet run on the robot.**
+- One skill: grasp the clear transfer pipette by its bulb (standing in the
+  stirrer's black holder), 1 N touch to measure the bulb's relaxed width,
+  squeeze flat at `squeeze_force` 20 N, lift 15 cm straight out of the
+  holder, home, scan the source, feel down to its floor (stir's
+  force-guarded descent; or `dip_depth` below the rim), back off 3 mm, open
+  the jaws `release_amount` (5 mm) but never past relaxed width −
+  `hold_margin` (3 mm), wait `draw_seconds`, lift clear. `dispense`
+  (mode "dispense") then squeezes drops relative to that width.
+- **Perception, camera-only (`scene_captures/pipette_20261021_164147`,
+  overlays `diag_out/pipette_prompts/`):** SAM 3 `"pipette"` 4/4 cams (0.77),
+  `"dropper"` 4/4 (0.82), `"plastic dropper"` 0.78, `"straw"` 0.64; `"bulb"`,
+  `"pipette bulb"`, `"rubber bulb"` found nothing. Masks are the bulb +
+  exposed stem, stopping at the holder mouth. **Clear plastic: cams 2 and 5
+  read the table through it** (z ≈ −0.005, 200+ mm off); `VisionSystem.locate`
+  consensus rejects them and keeps cams 3+4 (7 mm apart). Centroid
+  (0.441, −0.013, 0.111), top z 0.137. Width profile: stem 2-7 mm at z
+  0.100-0.110, bulb 9-15 mm from 0.112 to 0.137 — so the grasp is
+  `top − grip_below_top` (15 mm), not the centroid (which is stem).
+- **`tool_length` 0.11 is a guess** (top 0.137 standing on a bore floor near
+  the table, TCP 15 mm under the top). Measure the pipette with a ruler.
+  `fine_zone` is 35 mm so a longer real pipette still meets the floor during
+  2 mm steps.
+- Once released the jaws are in position mode, so a pipette that slid out
+  is NOT detectable by width (`volume_measured` false). While squeezed (force
+  mode) a drop shows as jaws shutting and is caught.
+- Executor: pick site / held / pick_grasps recorded under `"pipette"`, so
+  `place {"target_location":"pipette","vertical_insert":true}` should aim
+  back at the holder (untested). Catalog entry added.
+- Offline: `test_pick_pipette_squeezes_dips_and_releases_a_little` 11/11.
+  Full suites not re-run (user: go to the robot). `test_skills_offline.py`
+  currently dies in `test_transparent_cups_are_placed_by_silhouette`:
+  `VisionSystem` has no `last_seen` (from the 2026-10-20 work), unrelated.
+
+```bash
+python scripts/run_experiment.py \
+  --skill pick_pipette --params '{"source_container":"b 10 ml water","container_category":"clear plastic cup"}'
+```
+- **First robot run (2026-10-21), `pick_pipette` into `"a 10 ml water"`:
+  success.** Cams 2+5 kept this time (3 rejected see-through, 4 score 0.29).
+  Top z 0.1416, grasp 0.1266 (reached within 0.1 mm). Bulb **16.4 mm** at 1 N,
+  squeezed to **1.9 mm** at 20 N. Cup A rim z 0.036; contact at TCP 0.1161
+  (−4.35 N vs −3.15 N baseline), released 1.9 → 6.9 mm, held 6.8 mm.
+  - User: it **lifted before the bulb had finished drawing**. Fix: poll the
+    jaws until they reach `release_width` (≤5 s), then `draw_seconds` 3.0
+    (was 1.5). Not yet re-run.
+- **`dispense` `squeeze_out` (2026-10-21):** squeezes the bulb flat
+  (force-limited, `squeeze_force` 20 N) over the target, tip
+  `dispense_height` above the rim, and lifts still squeezed so nothing is
+  drawn back. `container_category` added to dispense. The executor passes
+  pick_pipette's `tool_length` to dispense (whose default 0.0 would put the
+  tip at the jaws, i.e. 11 cm into the cup). Not yet run.
+
+```bash
+python -u scripts/run_experiment.py \
+  --skill pick_pipette --params '{"source_container":"a 10 ml water","container_category":"clear plastic cup"}' \
+  --skill dispense     --params '{"target_container":"b 10 ml water","container_category":"clear plastic cup","squeeze_out":true}'
+```
+
+**Jellyfish sheet (2026-10-21, `instructions/jellyfish.jpg` = `IMG_5545.jpg`, `--bench jellyfish`).**
+- New manifest `JELLYFISH` in `bench_manifest.py` from
+  `scene_captures/jellyfish_20261021_173701`: dishes baking soda / red
+  cabbage powder, clear cups "2/3 cup of water" (`first clear cup`) and
+  "20 ml water" (`other clear cup`), `beaker` on "vegetable oil" (dims NOT
+  measured, Magic Beaker's), `pipette` standing through the lid of a white
+  paper cup (`pipette cup`), larger spoon (also "medium scoop"), stirrer +
+  holder. Skill defaults shared with Magic Beaker.
+- Camera-only: `"pipette"` in the lidded cup found on **4/4** cameras (the
+  white cup behind it gives real depth), centroid (0.658, 0.074), top z
+  0.141; cup lid top z ≈ 0.085, so the grasp (TCP ~0.126) is 41 mm above the
+  lid.
+- Dry run (`experiments/jellyfish_dryrun_20261021.log`, gpt-4.1): 21
+  sub-tasks; 18 = `pick_pipette` from `other clear cup`, 19-21 = `dispense`
+  3 drops each into `first clear cup`. Failed at 20 only because a dry run
+  never marks the pipette held (the scene still shows it in its cup). Not a
+  real-run blocker.
+- **First real run planned the oil first (`agent_run_20261021_173954.json`,
+  gpt-4.1):** 1-3 pick beaker / pour into first clear cup / place, THEN the
+  baking soda. The goal text it read listed the steps in the right order.
+  Two causes: (a) the planner prompt said "reason about which reagents, and
+  in which order" and "nobody will second-guess your chemistry", which
+  outranks `--follow-steps`' "in order" inside the goal; (b) nothing said the
+  "2/3 cup of water" cup was already filled, so step 1 ("fill the cup")
+  became a pour, and the beaker was the only pouring vessel.
+  - Fixes: planner autonomy rule "numbered steps keep their order exactly;
+    a step the scene shows done gets no sub-tasks"; JELLYFISH notes say both
+    clear cups ALREADY hold their water and the beaker holds ONLY the oil,
+    poured at step 3 after the baking soda. Not re-run yet.
+  - gpt-6-astra not tried: on 2026-10-20 it planned 0 sub-tasks, and
+    `tool_completion` is not ported to the Responses API (skill-call agent).
+- **Stirrer put-back failed in the jellyfish run (`pipeline_20261021.log`
+  l.872-882):** holder at (0.688, −0.193). `vertical_insert` crossed in XY at
+  the home height z 0.4865, then "Hover ... unreachable (off by 186mm)" —
+  exactly 0.4865 − 0.30, so the arm never came down from the crossing at
+  that reach. The pick's 0.30 hover over the same holder worked. Fix (user's
+  request): `place` now crosses at the hover height (`safe_height` 0.30)
+  by default; `transit_height` overrides. Not yet re-run. Test chain:
+  `--skill pick_up stirrer` + `--skill place {"target_location":"stirrer","vertical_insert":true,"release_clearance":0.0,"stop_force_n":1.0}`.
+- **Beaker picked with the fingers 10° away from the base (user, 2026-10-21).**
+  `pick_up` `tilt_away_deg`: rotates the grasp about world Y so tool Z goes
+  from straight down to down-and-+X; the beaker stays upright. pour's
+  `_rotation_lean` leans tool Z toward the base (−X) by the pour angle, so
+  the beaker ends up pour_angle + 10° over: a wrist that stalls at 80° still
+  pours 90°. JELLYFISH `beaker` pick carries `("tilt_away_deg", 10.0)`
+  (Magic Beaker unchanged). First sign was wrong (tool Z [−0.174, 0, −0.985]);
+  caught by a one-line check, fixed to [+0.174, 0, −0.985].
+  - `place` (non-insert): when the pick's tool axis (`pick_tool_z`) differs
+    by >2° from the current wrist (pour leaves it straight down at home), it
+    goes back to the pick's tilt so the beaker is set down upright. Neither
+    is robot-tested.
+- **Pipette put-back refused (`agent_run_20261021_184009.json`, step 20):**
+  "holding an unidentified object, not the pipette". The orchestrator's
+  `_apply_effect` set `held_object` only for `pick_up`, so after
+  `pick_pipette` + `dispense` it described the jaws as "something
+  unidentified (jaws at 7 mm)". Fixed: `pick_pipette` sets `held_object`
+  (also on `--resume`, which replays through `_apply_effect`). Resume that
+  run with `--resume latest --from-step 20`.
+
+**Dump: wrist twist after the shake (user, 2026-10-22).** New `dump` params
+`twist_deg` 15, `twists` 2, `twist_seconds` 1.0 per cycle: after the tip-back
+shake, at the dump angle, the wrist rolls about tool Z by
+15°·sin(2π·twists·t/T) — +15, 0, −15, 0, twice in 2 s — as one streamed path
+at 50 Hz, the TCP moved so the bowl centre stays fixed over the cup (the bowl
+is ~44 mm out along tool X, so a roll about the TCP would swing it ~11 mm).
+Falls back to quarter-cycle blocking poses; a failed twist carries on. Skipped
+if the shake already sent the arm home. `twist_deg` 0 turns it off. Logged as
+`bowl_drift_mm["twisted"]`. Not yet run on the robot (joint 7 may be near
+its limit at the dump pose; watch for a refused stream).
+
+**Stir: one continuous stream, faster (user, 2026-10-22).** The smooth path
+streamed each revolution as its own min-jerk skill, so the rod eased to a
+stop after every circle (2026-10-21 jellyfish: 3 × 4.0 s, 226 setpoints
+each). Now `_continuous_circle_path` puts all revolutions in ONE streamed
+path: angular speed eases up over the first 0.4 rev (spread over the
+revolutions), holds, eases down at the end, and ends exactly at the start
+angle. `seconds_per_revolution` 4.0 → **2.5** (steady pace ~2.2 s/rev; 3 rev
+= 7.5 s, 376 setpoints at 50 Hz). The hold check now runs once after the
+stream, not per revolution. Bench stiffness `[600, 600, 2000, 50, 50, 50]`
+unchanged. Not yet run on the robot: at 1.6× the speed watch for the cup
+being dragged or z drift (the 2026-10-10 rod-touch issue).
+
+**Scans reused when nothing moved; pour/dump checked afterwards (2026-10-22). Not yet run on the robot.**
+- **Label reads run in parallel** (`LabelResolver.read_all`, 8 at once).
+  Measured offline on `scene_captures/jellyfish_20261021_173701` with
+  gpt-4.1: 25 clear-cup instances took **25.5 s** one after another and
+  **3.0 s** in parallel, with the same label on 24 of 25. SAM on 4 cameras
+  took 1.4 s, so the label reads were most of a labelled-container scan.
+  Every pick, pour, dump, stir and scoop of a labelled container saves about
+  22 s.
+- **Scan reuse** (`VisionSystem.scans`, `_reuse_scan`, `forget_scans`).
+  - A full locate keeps the frames it came from, plus the object's box in
+    each camera (its cloud's 2-98% corners projected).
+  - The next locate of the same object first takes ONE frame from the
+    camera that sees it biggest. If `region_change` in the box is at most
+    `reuse_max_change` 0.05, the kept result is returned. Otherwise it
+    rescans.
+  - `region_change` is the fraction of pixels whose grey level moved by
+    more than 25 after each crop's mean is removed.
+  - `SkillsExecutor._forget_touched` drops the scans of what a skill
+    handled (`_TOUCHES`):
+    - pick_up / pick_pipette: the object, and pick_pipette's source.
+    - place: the held object and `target_location`.
+    - scoop / arc_scoop: the source.
+    - stir: the target.
+    - dispense: source and target.
+  - A failed step, or a skill not in the table, forgets every kept scan.
+  - pour and dump touch nothing, but the target looks different afterwards,
+    so the frame check rescans it (unless the step check below refreshed
+    the reference).
+  - Each full scan now prints its own time (`full scan for 'x': N s`) so
+    the next run shows where the time goes.
+  - Turn it off with `--rescan-always`.
+- **Threshold evidence.**
+  - Offline, cam 3 of the jellyfish capture: Gaussian noise σ=3 → 0.000;
+    the whole frame 20 levels brighter → 0.000; shifted 3 / 5 / 10 px →
+    0.098 / 0.146 / 0.241.
+  - Real frames minutes apart (`photos_20261019_165442`, s23 vs s26 cam 3):
+    the untouched middle cup scored **0.001**, and the cup that was filled
+    in between scored 0.864.
+  - The 0.05 threshold has not been checked on the bench against a cup
+    nudged by 5 mm.
+- **Step check after pour and dump** (`orchestrator/step_checks.py`,
+  `StepChecker`).
+  - The "before" is the kept scan's frame. The "after" is one new frame
+    from the same camera.
+  - A dump that did not end at home is homed first.
+  - Both crops are shown to the strong model, which answers
+    `contents_changed` and `container_moved_or_tipped`.
+  - Verdicts: `ok`, `suspect` (no change or moved), `unclear`, `skipped`.
+  - Each verdict is printed as `[check]` and stored as the step record's
+    `check`. The side-by-side photo is written to
+    `experiments/checks_<time>/`.
+  - Default is report-only (keep the run going). `--strict-checks` makes
+    `suspect` fail the step; `--no-step-checks` turns the check off.
+  - A cup that did not move gets the after frame as its new reference, so
+    the stir that follows a dump can reuse the scan.
+  - On the s23/s26 photos: the back cup that turned purple → `ok` (2.2 s);
+    the untouched middle cup → `suspect` (1.1 s).
+- Offline: `test_agents_offline.py` 133/133. All changed files compile
+  under py3.8. A scratchpad test with a fake camera checked the
+  reuse / move / touch / failure flow. `test_skills_offline.py` was not run
+  (user: go to the robot; it was already crashing on `last_seen` before
+  this change).
+- **To watch on the first run:**
+  - Do `unchanged ... reusing it` lines appear for the second skill on the
+    same cup?
+  - Does a hand-moved cup print `changed ... full scan`?
+  - Does a dump of white baking soda into clear water read as
+    `contents_changed: yes` from one camera?
+
+**Four-item chain, first try (2026-10-22 16:3x, `experiments/chain_fast_20261022.log`, `--bench jellyfish`).**
+- Bench: larger spoon, baking soda dish, `other clear cup` ("20 ML WATER",
+  red cabbage water), stirrer in its holder. Capture
+  `scene_captures/four_items_20261022_162033`.
+  - `capture_scene.py` (15 warm-up frames per camera, process start
+    included) took 29.5 s for four cameras.
+- Timing:
+  - pick_up spoon: 57.1 s (full scan 11.6 s).
+  - scoop baking soda: 68.0 s (full scan 15.3 s). It was 80-86 s in the
+    10-21/10-22 agent runs, which also include the skill-call model time.
+  - dump: full scan 13.7 s, with 19 clear-cup instances across 4 cameras
+    and parallel label reads. 4/4 cameras read the cup as `20 ML WATER`.
+- **The dump stopped at step 3.** The cup was at (0.663, −0.009), and
+  straight ahead the arm reached only 39°, short of `min_tip_deg` 45. The
+  error itself named the fix (`dump_heading_deg` 60).
+  - Fix: `dump` now tries `auto_headings_deg` [60, −60, 90, −90, 30, −30]
+    when straight ahead cannot reach `dump_angle_deg` and no heading was
+    given. It takes the first heading that reaches the full angle, or else
+    the best one. Each is printed as `[Dump] sideways +60°: can tip to N°`.
+  - `rotation_at` now reads `heading` at call time; its default used to be
+    frozen at definition.
+  - **A sideways dump has never run on the robot.** The wrist turns ~60° on
+    the way over at 0.66 m: watch for a joint-limit fault.
+- **`--holding NAME [--held-offset X Y Z] [--picked-at X Y Z]`** on
+  `run_experiment.py` seeds the executor (held tool, pick's measured
+  offset, pick site) so a stopped `--skill` chain can go on with the tool
+  still in the jaws. Restarting from `pick_up` opens the jaws and drops it.
+- The `--skill` chain now runs the step check after pour/dump and prints a
+  per-step timing table at the end (also when it stops).
+
+**Preflight: check every target's reach before the arm starts, move cups that fail (2026-10-22). Not yet run on the robot.**
+- User's decisions:
+  - Do NOT change how dump dumps. The auto-sideways heading added earlier
+    the same day was reverted; `dump.py`'s motion is as before (the
+    wrist-twist change stays).
+  - Move a cup that is out of reach, without asking, even with liquid in it.
+  - Do not put moved things back.
+- `robochem/orchestrator/preflight.py` `Preflight`. It runs before step 1,
+  with the gripper empty, in both the `--skill` chain and the agent
+  pipeline (`record["preflight"]`). Turn it off with `--no-preflight`.
+  1. Homes, then scans every target the steps name. The scans are kept, so
+     the skills that use them reuse them.
+  2. Checks each target the way its step will use it:
+     - dump: `dump.reachable_tip_deg`, a pure copy of the dump's own reach
+       check;
+     - pour / stir / dispense: distance from the base in `TARGET_REACH`
+       0.30-0.60 (a guess);
+     - scoop dish: report only. 102 mm is wider than the jaws open.
+  3. A failing cup (manifest radius <= 40 mm, "cup" category, gripper empty)
+     gets `pick_up`, then `place` at the nearest free spot:
+     - 0.35-0.50 m from the base, x >= 0.30;
+     - dump reach >= 75° there (for a dump target);
+     - >= radius + 60 mm from every occupied 1 cm cell of the last full
+       capture's depth (>= 4 points, z 8 mm-0.35 m above the table);
+     - >= 2·radius + 60 mm from every clear cup a label vote placed
+       (`VisionSystem.seen_containers`; depth misses clear cups);
+     - >= 0.18 m from any dish the run scoops from.
+
+     The pick site and the pick grasp TCP are shifted to the new spot
+     before `place`, because place puts a slid-in cup down at the held TCP.
+- **`reachable_tip_deg` matches the robot.** For the 2026-10-22 cup
+  (0.6635, −0.009, rim z 0.0361, offset [0.0406, −0.0037, 0.0294]) it gives
+  **39.0°**, which the dump measured.
+  - With offset [0.045, 0, 0.0294] it gives: r 0.40/0.45 → 79,
+    0.50 → 78, 0.54 → 68, 0.58 → 58, 0.62 → 48.
+- **Offline run on the real capture** `scene_captures/four_items_20261022_162033`
+  (live intrinsics, real SAM 3 and label reads; homing and the move were
+  stubbed):
+  - 2 targets, 7.7 s.
+  - Baking soda dish at 0.50 m: ok.
+  - `other clear cup` at 0.663 m: "a dump can tip only 39°; 0.66 m from the
+    base", so it is moved to (0.440, +0.230), 33 cm away.
+  - Occupancy: 559 cells. They are the dish, the spoon, the stirrer holder,
+    two cage rails at y ≈ ±0.5, and the far bench items. The dish's 18 cm
+    ring pushes the spot to its side.
+  - The vote also placed a "clear cup" on the dish; it only adds an
+    obstacle.
+- `SkillsExecutor.skill_instance(name)` was factored out of `execute`.
+  `go_home` uses it.
+- `test_agents_offline.py` 133/133; py3.8 compile ok.
+- **To watch on the robot:**
+  - Does `pick_up` of the full 20 ml cup and `place` 33 cm away spill?
+  - Does it land where the `[preflight] free spot` line says?
+  - Does the dump then print a full tip with no "can only tip" NOTE?
+
+**USB wedge again, at the first preflight run (2026-10-22 ~16:43, pid 4062678).**
+- All four cameras: `RuntimeError: Frame didn't arrive within 5000`.
+  `dmesg`: `uvcvideo 2-3/2-4/2-5/2-6 ... Non-zero status (-71) in video
+  completion handler` and `Failed to query (GET_CUR) UVC control 1 ... -32`.
+  `lsusb` still listed all four D415s (bus 2). This is the shared-controller
+  wedge from Known issues: the fourth time.
+- Earlier the same afternoon the cameras had worked:
+  - `capture_scene.py` at 16:20;
+  - the first chain run at ~16:3x;
+  - a live-intrinsics read (open, one frame, stop each camera) shortly
+    before this run.
+- The arm only homed (the preflight's go_home). Nothing was moved.
+- `Preflight.run` now stops (`blocked`) when a target is not found and the
+  capture had no frames at all. Before, it would go on to step 1, which
+  could not see either.
+- Fix: replug the camera hub, ideally onto the unused ASMedia (`04:00.0`)
+  or NVIDIA (`01:00.2`) controller ports.
+
+**Preflight on the robot, second try (2026-10-22 ~16:47, `experiments/chain_preflight_20261022.log`).**
+- The cameras were back after the replug.
+- Baking soda dish (0.494, −0.012): read 4/4, ok.
+- **The 20 ml cup was misidentified.**
+  - The `20 ML WATER` paper was no longer under the purple cup. It was on
+    the next table, under another cup at about (0.99, −0.37), as seen in
+    `scene_captures/label_check_20261022_164817` cam 5.
+  - The near cup (0.632, −0.009) was placed by 4/4 cameras with no reads.
+  - The vote gave `20 ML WATER` to the far cup, which only cam 5 placed. The
+    preflight then judged it out of reach (1.06 m) and tried to fetch it.
+  - The hover was clamped to x 0.75 and missed by 102 mm. pick_up gave up,
+    and the preflight blocked with the arm left over the bench at about
+    (0.67, −0.31, 0.31).
+- Fixes:
+  - `VisionSystem.on_bench`: x >= 0.15 and r <= `BENCH_MAX_REACH` 0.82.
+    `_locate_by_vote` drops containers placed outside it before the vote
+    (printed as `ignoring N ... beyond the arm's reach`).
+  - Preflight does not fetch beyond `MAX_FETCH_REACH` 0.72 m. It homes
+    after a failed move, and blocks before the arm starts when a target is
+    not found, naming the label to check.
+  - Offline on `label_check_20261022_164817`: 9 bowls and 7 clear cups
+    ignored, baking soda ok, `other clear cup` not found, 7.5 s.
+
+**A cup the arm moved is found where the arm put it, not by its label (2026-10-22).**
+- The user's point: the preflight moves a cup, and its paper label stays
+  where it was. Found by label afterwards, the "cup" would be the old paper.
+- `VisionSystem.tracked` (bench name -> xy):
+  - `SkillsExecutor._forget_touched` sets it from `place`'s
+    `place_position` for the object that was held, and clears it on
+    `pick_up` / `pick_pipette`.
+  - `_locate_by_vote` first takes the placed container within
+    `track_tolerance` 50 mm of that spot, with no label reads.
+  - With nothing there (moved by hand?) it prints a warning and reads
+    labels as before.
+- Offline on `label_check_20261022_164817` (no paper under the cup):
+  - Tracked at (0.632, −0.009): found by position, 0 mm off, **1.4 s**
+    (a labelled scan was ~13 s).
+  - Tracked at an empty spot: fell back to labels, and not found.
+- The FIRST time a run looks for a labelled cup, it still needs its paper.
+  A "the only cup of its kind within reach" rule was offered to the user,
+  not added.
+- `test_agents_offline.py` 133/133.
+
+**Preflight moved the cup; the dump then failed on the carry (2026-10-22 ~17:0x, `experiments/chain_preflight_20261022.log`).**
+- Before this run: the arm had been parked in franka-interface's virtual
+  walls by the earlier failed fetch. The user guided it out by hand.
+- Preflight (118.9 s):
+  - The cup was at (0.674, −0.011), with a 37° reach.
+  - pick_up → place at (0.428, +0.233).
+  - Tracking worked: the dump found the cup "where the arm set it down,
+    1 mm off; labels not read".
+- pick_up spoon 57.3 s; scoop 58.8 s, ok.
+- **dump: "Could not bring the bowl over 'other clear cup' (off by 28mm)".**
+  The carry ended 25 mm high and 8° off. Error flags were already cleared
+  by the reset_joints afterwards. Arm home, joints
+  [0, −45, 0, −135, 0, 90, 45]°.
+- **Why: the chosen spot was to the side.** Every real dump record
+  (`agent_run_202610*.json`):
+  - 13 full dumps (76°) stood at x 0.388-0.458, |y| <= 0.138.
+  - 2 more at (0.57, 0.02-0.05) were capped at 56-58°.
+  - Both side targets failed on the carry: (0.305, −0.207) on 10-07 with
+    joint_position_limits_violation, and today's (0.428, +0.233).
+  - `reachable_tip_deg` checks wrist reach only, not joint limits.
+- Fixes:
+  - A moved dump target must stand in `DUMP_SPOT_X` 0.39-0.46,
+    `|y| <= DUMP_SPOT_MAX_ABS_Y` 0.14.
+  - `DISH_CLEARANCE` 0.18 → 0.17 (sim: hits at 144-161 mm, clear at 172).
+  - If no spot is free and the dump would refuse (< 45°), the preflight
+    blocks before the arm starts and says to make room by hand.
+  - A failed home in the preflight now blocks. It used to let the chain go
+    on to a pick_up that was refused the same way.
+- Offline on `four_items_20261022_162033` (same layout): blocked, "no free
+  spot in the dump box". The box is crowded by the dish in the middle
+  (17 cm ring), the spoon at (0.47, +0.10) and the stirrer holder on the
+  other side.
+
+**Scoop jammed with the dish pushed out to x 0.642 (2026-10-22 ~17:2x, `chain_preflight_20261022.log`).**
+- The user moved the dish out on my advice ("~60 cm"), to make room for
+  the dump box. Preflight then moved the cup from (0.614, +0.197) (45°) to
+  (0.439, −0.005), inside the dump box: that part worked. 118.6 s.
+- scoop: jammed twice at +55°, "TCP 35/32 mm from its waypoint",
+  `cartesian_motion_generator_joint_velocity_discontinuity`. The arm was
+  left 60 mm above the dish, holding the empty spoon.
+- From the logs (`experiments/*.log`, dish centre against the outcome):
+  - 12 scoops worked with the dish at x 0.500-0.602 (r up to 0.63).
+  - Both jams were at (0.604, 0.183) on 10-21 and (0.642, −0.028) today.
+  - The "~60 cm" advice was 4 cm too far.
+- Preflight: `SCOOP_MAX_X` 0.60 for a dish being scooped, which blocks
+  before the arm starts (a dish cannot be moved by the arm). The old
+  check was r within 0.30-0.65, and it passed this dish.
+- **Why the zones are tight:**
+  - Scoop (60° nose-down) and dump (79°) need the wrist past the target,
+    so the tilted reach ends near 0.60 m, against the arm's 0.85.
+  - Both skills keep the wrist heading as at home (straight ahead). A
+    target well to the side asks a joint for more than it has. Turning the
+    heading toward the target would widen this, but that changes the
+    dump/scoop motion, which the user does not want.
+
+**Can the cell see the powder surface? Not used today, but the data has it (2026-10-22, offline).**
+- **Today's scoop ignores the powder.**
+  - `surface_z` is the dish cloud's 97th-percentile z, i.e. the rim (the
+    scoop's own comment says so).
+  - The default depth mode is `tip_floor_gap`: the tip goes 3 mm over the
+    inside floor whatever the bed. A falling surface therefore matters
+    less than the fixed stroke line. Every scoop runs the same x −29 →
+    +22 mm through the dish centre, so it digs one trench, and powder left
+    to the sides is never reached.
+- **Measured from the dish's located points** (`powder_surface.py` /
+  `powder_map.py` in that session's scratchpad, live intrinsics,
+  baking-soda dish, 29 mm tall, nearly full):
+  - `four_items_20261022_162033`, before any scoop, cams 2/4/5: median
+    height per 5 mm ring from the centre is 21.5-24.5 mm above the table
+    at every radius 0-55 mm. The bed is flat to ±1.5 mm. Single points
+    spread ±4 mm (p10-p90 ~8 mm).
+  - Against `label_check_20261022_164817`, after one scoop (cams 2-5, cam
+    3 partly behind the arm), on 1 cm cells:
+    - −3 to −6 mm in a patch through the middle (the stroke);
+    - +4.7 to +5.5 mm just beyond its far end (powder pushed forward);
+    - ±2-3.5 mm elsewhere, which is noise plus a 9 mm difference in the
+      centre between the two captures.
+  - One scoop shows at about 2× the noise.
+- **Not built.** Next would be a dish heightmap at every scan, the stroke
+  placed on the highest/fullest strip (lateral offset across the dish),
+  and maybe the depth set from the measured surface.
+
+**Scoop picks the fullest line through the dish (`stroke_across`, 2026-10-22). Not yet run on the robot.**
+- User asked for the scoop to follow the powder. Agreed scope: move only
+  WHICH LINE the stroke runs on. The bite angle, the roll, the 3 mm floor
+  gap and the push are unchanged.
+- New params:
+  - `stroke_across` (default `"auto"`, or metres): moves the stroke across
+    its direction. The wall check (`room()`) adds it to every corner's
+    across coordinate, so an off-centre line gets the shorter chord. Old
+    `lateral_offset` still moves the whole dish model, as before.
+  - `stroke_across_step` 6 mm.
+  - `stroke_min_travel_frac` 0.75 (a line must keep 75% of the centre
+    travel).
+  - `stroke_prefer_fuller` 2 mm.
+- **How auto chooses** (`ScoopSkill._choose_line`). For each line the bowl
+  fits, it takes the median z of this scan's dish points:
+  - in a strip the bowl's width + 3 mm each side,
+  - inside `reach_limit`,
+  - and only along the bite zone (entry − 10 mm to 60% of the travel).
+
+  The whole-line median was tried first and lost. On the real
+  before/after pair it read the trench as flat: the stroke shoves powder
+  forward and heaps it at the far end, which cancels the dip. The fullest
+  line wins only if it is >= 2 mm above the centre; otherwise the
+  validated centre line runs.
+- After a scoop the executor forgets the dish scan (scoop touches it), so
+  the next scoop rescans and sees its own trench.
+- Offline, the synthetic dish (`test_scoop_line.py`, scratchpad): 45.5 mm,
+  bed 22 mm, ±3 mm noise.
+  - Flat bed: centre, lines within ±0.1 mm.
+  - 8 mm trench along the centre: line −12 mm, 3.9 mm fuller, travel
+    40 mm (centre 52).
+  - Forced +6/+12/+18 mm: travel 47/40/29 mm, all 8 mm from the wall.
+  - Forced +30 mm: refused (does not fit).
+- Offline on real dish clouds (live intrinsics):
+  - `four_items` (before the 16:3x scoop; the dish had been scooped in the
+    14:52 run): +12 mm is 3.6 mm fuller, so line +12.
+  - `label_check` (after one more scoop): all lines within 1.2 mm, so the
+    centre.
+  - The two scans' dish centres differ by ~9 mm (perception's centre leans
+    toward the cameras), which is the size of a one-scoop trench. So this
+    pair cannot confirm or refute the choice; several scoops on the robot
+    will.
+- The log's "comes within N mm of the inside wall" now includes the line
+  offset.
+- Existing scoop tests: all pass except "scoop refuses a dig depth below
+  the workspace floor" (+ its message check). That one fails identically
+  with HEAD's scoop.py: the old pair.
+- Watch on the robot: the `[Scoop] Powder on each line ...` and `Stroke
+  line ...` lines, and whether an off-centre stroke jams (it runs nearer a
+  side wall).
+
+**pick_up turns the wrist to a spoon lying at any angle (`yaw`, robot-tested 2026-10-23, `experiments/yaw_test_20261023.log`).**
+- Before this, every top grasp used the home rotation
+  `diag(1, −1, −1)` (`grasp_analyzer._compute_top_grasp`): the jaws always
+  closed along base Y. `forward_offset` −0.010, which moves the jaws off
+  the crank, ran along base X, i.e. not along the handle unless the spoon
+  lay straight ahead.
+- **New `pick_up` param `yaw`.**
+  - `None`: as before.
+  - `"auto"`: `tool_long_axis_yaw()` takes the principal axis of the
+    cloud's XY. The bowl end is the wider of the two outer 30% ends (95−5
+    percentile across the axis). It refuses when the cloud is not
+    elongated (axes < 2:1) or the ends are within 1.3× in width.
+  - A number: that many degrees.
+  - The grasp rotation becomes Rz(yaw)·home, so tool X points at the bowl.
+    Once homed, the spoon sits in the jaws exactly as a straight-ahead one
+    does, and scoop/dump need nothing new.
+  - `forward_offset` / `lateral_offset` are rotated with it (along / across
+    the tool).
+  - Turns past `MAX_GRASP_YAW_DEG` 120 (bowl toward the base) fall back to
+    no turn, keeping joint 7 (45° at home, ±166°) clear.
+  - Not used for side or slide-in grasps. The result reports `grasp_yaw`.
+- **Robot run:**
+  - The spoon was at (0.6133, −0.1216). The log read "Turning the wrist
+    +81°: 73 mm long, bowl 26 / handle 17 mm wide". The user confirmed the
+    direction is right and it picked up.
+  - The jaws moved by (−1.7, −9.9) mm, i.e. 10 mm along the handle.
+  - Held at 20.5 mm (8.2 mm at the place).
+  - Measured tool offset [0.034, 0.007, 0.022]. x is positive (bowl on +tool
+    X, like every earlier pick) but shorter than the usual 41-47 mm: the
+    jaws closed nearer the bowl this time.
+  - place put it back. pick_up 55.6 s, place 26.8 s.
+  - Offline first: on `four_items_20261022_162033` the spoon read +1°
+    (bowl 27 / handle 19 mm), the arrow on the bowl end.
+- **Now the bench default:** both `magic_beaker` and `jellyfish`
+  `larger spoon` picks carry `("yaw", "auto")`.
+  - `test_executor_uses_bench_names` now expects it. Its two clear-cup
+    checks had been failing since the 2026-10-20 `WATER_CUP_FORWARD_OFFSET`
+    change; they now expect that too. 25/25 pass.
+  - `test_agents_offline.py` 133/133.
+- Not yet run: a scoop/dump after a turned pick. The tool frame is the
+  same, so none is expected to differ, but the shorter measured x offset
+  feeds scoop's depth geometry.
+
+**ROS master would not come up for `start_control_pc.sh` (2026-10-23 20:26).**
+- The script launches roscore, sleeps 3 s, then ssh-starts franka-interface
+  on the Alienware. That side failed with "unable to contact ROS master at
+  http://remote-franka:11311".
+- `~/.ros/log` was 1.7 GB in 402 runs. roscore spent ~16 s on "Checking log
+  directory for disk usage" (warns over 1 GB) before the master listened.
+  The first attempt was then shut down (SIGINT at 20:27:01).
+- The second attempt came up: roscore, franka-interface, ros-interface
+  and gripper nodes all present.
+- `rosclean purge -y` (or deleting old run folders in `~/.ros/log`) should
+  stop the stall.
+- Note: every roslaunch log there dumps the full environment, including
+  the OpenAI API key in plain text.
+- The script must be run from `/home/rumi/frankapy` (relative paths): from
+  elsewhere it is "No such file".
+
+**Scoop chooses its heading and depth from the powder map; refuses to sweep in air (2026-10-23). Not yet run on the robot.**
+- The user's spec: pick_up turns to the spoon (done, see above). scoop
+  enters from the angle where the map is highest, digs to a depth set by
+  the map, and must be in the powder before it moves. Return home facing
+  ahead. dump may have rotation as an option.
+- **Heading.** `stroke_heading` (default `"auto"`) searches
+  `stroke_headings_deg` [0, ±20, ±40] together with `stroke_across` lines.
+  - Each (heading, line) is scored by the median z of the dish points in
+    a bowl-wide strip along its bite (entry − 10 mm to 60% of the travel).
+  - Fit in the dish is heading-independent: the bowl corners are taken
+    along/across the stroke. So each line's fit is computed once.
+  - Each heading is checked with dump's `_wrist_reach` at the bite and at
+    the end. The best must beat the default (0°, centre) by 2 mm.
+  - The chosen turn is applied to `level_rotation`, `forward` and
+    `across_axis`, which every planning closure reads at call time.
+  - The lift-out now uses the final waypoint's x and y (it had assumed
+    forward = +X).
+  - After a turned stroke the scoop homes (`reset_joints`), so the wrist
+    faces ahead for the next skill. A coordinate `place` does not home by
+    itself.
+- **Depth.** `depth_from_map` (default True): `surface_z` = the chosen
+  bite's median z + `lift` (rim before). The tip goes `map_tip_depth`
+  16 mm under it, but never nearer the floor than `tip_floor_gap`.
+  - On the bench's usual bed (map: 13-20 mm over the inside floor) the
+    floor gap binds. The tip therefore lands where the validated floor rule
+    put it.
+  - Refused before any motion when the bed under the bite is less than
+    `map_min_bed` 6 mm above the floor gap ("Too little powder ...").
+  - Off when the call sets `tip_floor_gap` or `powder_surface_z`.
+- **In the powder before sweeping** (step 8c). After the descent and its
+  sag correction, it computes the tip's actual z (plan + where the TCP
+  stopped − where it was sent) against the mapped surface.
+  - Under `min_immersion` 4 mm it lowers once more (never below
+    floor + clearance).
+  - Still short: it lifts out and fails ("did not sweep").
+  - A force check was not used: powder resists too little, and stir's 1 N
+    guard already false-triggered in free air (2026-10-15).
+- Offline, synthetic dish (`test_scoop_heading.py` in that session's
+  scratchpad):
+  - Flat bed: default, floor-limited 11 mm.
+  - Centre trench: −40°, +12 mm, 6.8 mm fuller, homes afterwards.
+  - 10 mm mound behind-right: 0°, −12 mm (its bite covers the mound).
+  - 1.5 mm bed: refused.
+  - `stroke_heading=0, stroke_across=0`: the old floor mode exactly
+    (depth 16.8, stroke −29/+22).
+  - All strokes stay 8 mm from the wall.
+- **The reach model is conservative for scoop.** It flags the default
+  stroke at dish (0.60, −0.07), which scooped fine on the robot, as well
+  as the jams at (0.642, −0.028) and (0.604, 0.183). So:
+  - the default stroke still runs there, with a NOTE;
+  - turned strokes are only allowed nearer, e.g. all of ±40° at
+    (0.50, 0).
+- Real clouds:
+  - `four_items` → −40°, +12 mm, 5.5 mm fuller. Map surface 19.5 mm over
+    the floor, tip 16.0 mm under it, 3.5 mm over the floor.
+  - `label_check` → default. Surface 13.2 mm over the floor, tip
+    floor-limited at 10.2 mm.
+- Existing scoop tests 41 pass, 2 fail (the old workspace-floor pair, as
+  at HEAD).
+- dump's rotation option already exists: `dump_heading_deg` (degrees from
+  the base→target radial), default None = straight ahead as before; never
+  run on the robot.
+
+**Stirrer: the jaws turn to the cube's faces (`yaw` "auto" square fit, 2026-10-23). Not yet run on the robot.**
+- `square_top_yaw()`: fits the minimum-area rectangle (`cv2.minAreaRect`)
+  to the top 6 mm of the cloud. It must be 20-45 mm and within 1.4:1. The
+  turn is taken to the nearest face, in (−45°, 45°].
+- `"auto"` tries the long axis first (spoon). An object that is not
+  elongated falls through to the square fit.
+- **Put-back does not care about the turn.** From the STLs, the rod is round
+  (r 5.0 mm, 59 vertex angles) and the holder's bore is round (r 6.0 mm,
+  10-65.7 mm up). The r ≈ 15 mm feature is a round chamfer in the top 1 mm,
+  not a square pocket.
+- Real captures (live intrinsics):
+  - `four_items` +0.3° (top 30.9 × 34.8 mm, 2202 points).
+  - `label_check` +5.4°.
+  - `jellyfish_20261021` +2.7°.
+  - The overlay square sits on the cube in cams 3 and 5.
+- The `four_items` cube cloud rotated by +10…+44, −15, −35, +60, +80°
+  came back exact (+60 → −30, nearest face).
+- Both stirrer picks carry `("yaw", "auto")`. The bench test expects it;
+  25/25 pass.
+
+**Turned spoon picks closed nearer the bowl; the grasp is now placed from the bowl end (2026-10-23).**
+- User: "pick up the spoon sometimes is in the wrong place, too far
+  forward". The logs agree:
+  - straight picks (10-22 `chain_fast`, `chain_preflight`) measured tool
+    offset x 41 / 42 mm;
+  - turned picks (10-23 `yaw_test` +81°, `scoop_heading` +110°) measured
+    34 / 32 mm.
+- Cause: `forward_offset` −0.010 from the centroid was tuned on a spoon
+  lying straight ahead.
+  - On the same cloud, rotated to any angle, centroid − 10 mm gives a
+    geometric offset of 36.5 mm.
+  - On the robot, the straight picks landed ~5 mm further back (a world-X
+    bias: centroid lean / the TCP drifting while closing). A turned spoon
+    does not get that bias along its handle.
+- Fix: new `pick_up` param `working_end_distance`. With yaw auto on a long
+  tool, the jaws go that far back from the working end (the median of the
+  bowl end's far 30%, as `measure_tool_offset` reads it), on the handle's
+  centre line. forward/lateral_offset are then not applied; the no-turn
+  fallback still uses them.
+  - Spoon picks carry `("working_end_distance", 0.042)`.
+- Check on the `four_items` spoon cloud rotated 0/81/110/−60°: the
+  predicted measured offset is 41.7-41.9 mm at every angle (old method
+  36.5).
+- On the robot, the close itself still moves the TCP (8.8 mm on 10-23):
+  watch `[PickUp] Measured tool offset` after a pick. It should read
+  ~0.040-0.044 whichever way the spoon lies.
+
+**First robot run of the turned scoop, and why its choice leaned to the wall (2026-10-23 20:4x-20:5x, `experiments/chain_yaw_20261023.log`).**
+- Chain: pick_up spoon → scoop → place → pick_up stirrer → place stirrer.
+  - Spoon: grasp 42 mm back from the bowl. Measured tool offset
+    **[0.039, 0.005, 0.019]**, against 32-34 for the turned picks before
+    the fix; on target.
+  - Stirrer: "Square top 32 × 34 mm: faces turned −37°". The wrist turned
+    −37° and held at 30.7 mm.
+  - Scoop: the dish at (0.5188, 0.0402) used the median-fallback centre.
+    It chose **+40°, −12 mm across, "6.4 mm fuller"**. Map surface 17.1 mm
+    over the floor, tip planned 14.1 mm under it, "In the powder: tip
+    9.8 mm under ... 7.3 mm over the floor" (the descent stopped 4.3 mm
+    high). Success, then homed.
+- The user: the scoop still does not find where the powder is.
+- **Analysis** of a capture right after (`scene_captures/dish_after_scoop_20261023_205347`).
+  - Mistake: taken while the chain was still running (the stirrer scan).
+    Both captures succeeded, but do not open cameras during a run.
+  - The centre was fine: a circle through the rim points lands 2.4 mm from
+    the scoop's centre.
+  - Of the points inside the 37.5 mm reach circle, **22% were within 4 mm
+    of the rim**. The chosen strip had 26% such points (median 23.8 mm over
+    the table), the centre strip 1% (18.5 mm).
+  - The scored strip was the bowl width + 3 mm a side and started 10 mm
+    before the entry, so it reached the wall bank the bowl (8 mm off the
+    wall) never digs.
+- **Fix:**
+  - The map is now 4 mm cells (median per cell, >= 3 points), without
+    points within `map_rim_band` 3 mm of the rim.
+  - A stroke scores the MEAN of the cells its bowl sweeps (entry to 60% of
+    the travel, exactly bowl-wide).
+  - Every scoop writes `diag_out/scoop_maps/scoop_map_<time>.png`: the
+    cells, the reach circle, every candidate (grey), default (white),
+    chosen (orange); top = away from the base, left = the robot's left.
+- On the after-scoop cloud it still chooses +40/−12 (+5.1 mm). The new
+  map shows:
+  - a dark trench under the default line (earlier straight scoops);
+  - the high ground on the far side and the robot's right, toward the wall.
+- The camera crops cannot settle whether that bank is powder: white
+  powder in a white dish shows no relief. Ask the user where the powder
+  actually is, against the saved map.
+  - `four_items` now: −40/+12 (+2.8).
+  - `label_check`: default.
+  - Synthetic cases unchanged.
+- **User (2026-10-23): the powder is in the right half**, which matches the
+  map's high ground (the robot's right, −y).
+  - The chosen +40/−12 bite sat half on the centre: lines were capped at
+    ±12 mm by `stroke_min_travel_frac` 0.75.
+  - On the after-scoop cloud:
+    - frac 0.5 → +40°/−18 mm, +6.8 mm, travel 29 mm, the bite wholly in
+      the high ground (`maps/frac50` image);
+    - headings ±60/±90 at 0.75 → +60/−12, +5.5 mm only.
+  - Default is now 0.5. Headings stay ±40 (the bigger turns gained little
+    and are nearer joint limits).
+  - Untested: whether a 29 mm stroke brings up as much as 40-52 mm.
+
+**`right_spoon`: push a scoop lying on its side onto its back (2026-10-23). Not yet run on the robot.**
+- User asked whether the robot can right a spoon that has fallen on its
+  side. Agreed: a scripted motion + scan check + retry, not a learned
+  policy.
+- **Telling the poses apart** (`spoon_pose`, `robochem/skills/right_spoon.py`).
+  It compares the cloud's two end thirds along the principal axis: width
+  across (95−5 pct) and height (p95 over the table).
+  - Flat, mouth up (`four_items_20261022_162033`): widths 19 / 27 mm, the
+    wide end (bowl) LOW at 8.9 mm; the handle end high at 23.1 mm (the
+    crank lifts it).
+  - On its side (`spoon_on_side_20261023_210216`, cams 2+3): widths
+    15.2 / 15.2 mm; the bowl standing tall (21.3 mm), the handle low
+    (6.7 mm).
+  - Upside down is assumed to be the wide end high. Only checked on the
+    flat cloud mirrored in z.
+  - `tool_long_axis_yaw` on the side cloud already refused ("cannot tell
+    the bowl end from the handle (15 vs 15 mm)"), so a turned pick_up of a
+    side-lying spoon falls back to the home rotation.
+- **Which way the mouth faces.** From above, the side-lying scoop is a "Z":
+  each end segment fitted on its own gives two parallel lines 15.1-16.6 mm
+  apart (end fractions 0.25-0.35). That is the crank's ~14 mm rise turned
+  sideways, so the handle's line lies on the mouth's side of the bowl's.
+  - A whole-cloud principal axis hides it (1.9 mm), because the axis runs
+    through both ends.
+  - On the capture: mouth toward (+0.95, −0.32), away from the base and
+    slightly right. **Confirmed by the user at the bench (2026-10-23): the
+    mouth faced away from the robot.**
+- **Motion:** jaws closed, TCP 18 mm over the table (the flat-spoon grasp
+  height, known to clear the table), from 35 mm out on the mouth side,
+  pushed under impedance to 30 mm past the bowl centre on the far side.
+  The bowl's top edge goes away from the mouth, so the scoop rolls onto its
+  back. Then it rescans, up to 2 pushes. Upside down / unknown are
+  reported, not handled.
+- **Rejected: lift and roll the wrist 90°.** The Franka hand is a ~200 mm
+  bar along the closing axis. A 90° roll stands it on end ~100 mm below the
+  fingers, so it could only let go from >10 cm up.
+- Registered as skill `right_spoon` (touches `object_name`). Run:
+  `python -u scripts/run_experiment.py --bench jellyfish --workspace-min 0.25 -0.40 -0.13 --no-preflight --skill right_spoon`
+- Watch: the hand's bar sweeps ±100 mm along base Y at ~76 mm over the
+  table during the push. Keep the stirrer holder (85 mm + cube) out of
+  that band.
+- **The first launch failed on import** (2026-10-23): "skill_catalog is out
+  of step with robochem.skills: right_spoon: in SKILL_REGISTRY but not in
+  the catalogue". Then: "Can't instantiate abstract class RightSpoonSkill
+  with abstract methods check_preconditions".
+  - Fixed: `right_spoon` has a catalogue entry (`object_name`, `attempts`;
+    the planner may use it before a pick_up), and `check_preconditions`
+    refuses while the jaws hold something.
+  - **Lesson: after registering a skill, run
+    `python scripts/run_experiment.py --help` in the robot venv and
+    `test_agents_offline.py` (2 s) before handing over the command.**
+- **pick_up rights the scoop by itself** (user: it must decide on its own
+  whether the spoon is on its side, and leave it alone otherwise).
+  - New pick_up param `right_if_on_side` (default False; both benches'
+    `larger spoon` picks carry True).
+  - After pick_up's own scan it runs `spoon_pose` on those points, so
+    there is no extra scan.
+    - On its side: `right_spoon`, open the jaws, home, rescan, then the
+      normal turned pick.
+    - Flat: nothing extra.
+    - Upside down: a warning, and it picks anyway.
+  - The result reports `righted`.
+- Fake-arm checks on the two real clouds:
+  - Flat: "lies flat, mouth up already", 0 arm commands.
+  - On its side: two pushes (0.587, −0.119) → (0.525, −0.098) at TCP z
+    0.0068, a rescan after each, then "still on its side after 2 push(es)"
+    (the fake cloud never changes).
+  - The flat cloud through pick_up printed "How 'larger spoon' lies: flat"
+    and took no righting branch; the test double has no grasp maths, so
+    that run stops there.
+  - Bench test expectation updated; 34/34 pick checks,
+    `test_agents_offline` 133/133, `run_experiment.py --help` imports in
+    py3.8.
+- **First robot try (2026-10-23, `experiments/right_then_pick_20261023.log`):
+  it slid the scoop instead of tipping it.**
+  - pick_up's check worked: "How 'larger spoon' lies: on_side (16.3 / 16.2
+    mm wide, 21.9 / 9.4 mm high)", and right_spoon was called. Crank step
+    18.5 mm, mouth (+0.93, −0.37).
+  - Push 1 ran at TCP z 0.0068 (18 mm over the table) to 30 mm past the
+    bowl centre. The bowl moved ~40 mm toward the base and turned ~30°
+    (mouth then (+0.98, +0.19)), still on its side.
+  - User: "pushing too deep; it translates the spoon instead of righting
+    it". The run was stopped after push 2.
+  - Fix:
+    - The fingertips meet the bowl at `push_contact_frac` 0.7 of its
+      measured height. `finger_below_tcp` 0.009 is an estimate, not
+      measured on this hand. For the 21-22 mm bowl the TCP is ~24 mm over
+      the table, 6 mm higher than before.
+    - `push_past` 30 → 10 mm.
+    - Up to 3 pushes: a push that slid it (> 10 mm, still on its side)
+      raises the next by 4 mm; one that did not move it (< 5 mm) lowers
+      the next by 3 mm, never below 8 mm.
+  - Fake-arm sequences (real clouds):
+    - slid 40 mm, then flat → push 2 at fingertips 18.9 mm, "flat after 2
+      pushes";
+    - never moves → 14.9 → 11.9 → 8.9 mm, then "still on its side after
+      3 push(es)".
+  - Catalogue `attempts` default synced to 3 (the audit caught the
+    mismatch). Imports ok in py3.8; agents 133/133.
+- **Pushing does not right it; pressing does (user's hand test, 2026-10-23):**
+  "only by pressing the side-lying spoon's bowl down with a very small
+  force". right_spoon's default `method` is now `"press"` (the push stays
+  as `"push"`).
+  - Where: the centroid of the bowl end's top 30% of points
+    (`bowl_top_xy`), `press_offset` 4 mm toward the bowl's back (away from
+    the mouth), +3 mm more per retry.
+  - How: jaws closed, from 15 mm over the bowl's top, 1.5 mm steps. Contact
+    is a 0.8 N change from a resting baseline (sign ignored, as in place's
+    probe). Then 4 mm further, so it rolls over. Never below 8 mm
+    fingertip height. Then rescan, up to 3 tries.
+  - Fake arm (force −1.5 N below the 21.3 mm top): start 36 mm, contact
+    21.3 mm, lowest fingertips 17.3 mm, flat after 1.
+  - **Open question for the user:** where exactly the hand pressed (top
+    centre / mouth side / back side) and whether it fell mouth up. The
+    back-side offset is reasoned, not observed.
+- **Where to press, from the user (2026-10-23):** on the handle's bend
+  nearest the bowl, of the Z's two corners, not on the bowl. `press_at`
+  `"corner"` is now the default (`"bowl"` = the bowl's top, also the
+  fallback).
+  - Finding it: walk from the bowl segment's centroid toward the handle in
+    3 mm bins. The corner is the first bin whose median across-offset
+    leaves the bowl's line by > 25% of the line-to-line step.
+  - On `spoon_on_side_20261023_210216` (step 15.7 mm): the across-offset
+    stays within 0.13 of the step up to t = +18 mm, then 0.28 at +21 mm.
+    Corner (0.5468, −0.1272), 13.6 mm tall (bowl 21 mm, handle ~6 mm).
+    Drawn on cams 2 and 3 (`diag_out/powder_heightmap/spoon_corner.png`)
+    it sits on the bend by the bowl.
+  - Press: from 15 mm over the corner's top, contact at a 0.8 N change,
+    then 4 mm further (+2 mm per retry), fingertips never under 8 mm.
+  - Fake arm: contact 13.6 mm, lowest 9.6 mm, flat after 1.
+  - Imports ok (py3.8), agents 133/133.
+- **Robot try of the corner press: wrong spot, and too weak** (user,
+  2026-10-23: "the gripper is too big"; "the press is too weak").
+  - Closed jaws are ~2 × 2 cm. The bowl, 18-21 mm tall and 1.5-2 cm from
+    the 13.6 mm corner, was under them and met first.
+  - Fix: press with ONE finger. The jaws open `press_opening` 60 mm; the
+    wrist turns (smallest turn, |θ| <= 90°, either finger will do) to put
+    the closing axis along the scoop; the TCP goes 30 mm past the corner
+    toward the handle. The near finger is then over the corner, and the far
+    one 60 mm on, past the handle's end (t ≈ 81 mm vs the handle end
+    ≈ 63 mm).
+  - Deeper: `press_follow` 4 → 7 mm (+3 per retry). The press is
+    position-controlled, so that is real travel. `min_finger_height`
+    8 → 5 mm.
+  - Fake check: wrist −19°, TCP (0.537, −0.156), the near finger exactly
+    on the corner (0.5468, −0.1272), lowest fingertips 6.6 mm.
+    `finger_below_tcp` 9 mm is still an estimate.
+- **Stopped (user, 2026-10-23): "too hard for now; even by hand it has to
+  be picked up and set back down the right way."**
+  - Tried on the robot, none of which righted the scoop:
+    1. Sideways push at TCP 18 mm, 30 mm past the bowl: it slid ~40 mm
+       and turned ~30°.
+    2. A light press with the closed jaws on the crank corner by the bowl:
+       the ~2 × 2 cm jaws met the taller bowl next to it.
+    3. A one-finger press, 7 mm deep: not reported as working before the
+       user stopped.
+  - The way that does work by hand, pick it up and put it down flat,
+    was not tried. It needs a grasp of the side-lying scoop and a wrist
+    roll, and the 200 mm hand bar makes a low release impossible (see
+    above).
+  - State now:
+    - `right_spoon` is NOT registered and has no catalogue entry, so the
+      planner never sees it. The module stays, with `spoon_pose`.
+    - Both benches' `larger spoon` pick carries
+      `right_if_on_side "warn"`: "WARNING: ... lies ON ITS SIDE. Set it
+      flat, mouth up, by hand", and the pick goes on. No motion is added.
+    - `True` would still call right_spoon; do not use it until a working
+      motion exists.
+  - Checks: imports ok (py3.8), agents 133/133, pick checks 34/34.
+
+**Every skill call carries a speed, 0-100, chosen by the planner (2026-10-27). Not yet run on the robot.**
+- User: liquid should move as slowly as now; an empty spoon much faster.
+  The current pace is considered slow, and **nothing may run slower than it**.
+  A first version had 0 = 2x slower and 25 = today; the user rejected it the
+  same day.
+- Scale (`robochem/skills/pacing.py`):
+  - **0 = today's pace exactly**, and the slowest allowed (`DEFAULT_SPEED`,
+    factor 1.0). Any call without a speed, including every manual
+    `--params`, is unchanged.
+  - `SPEED_ANCHORS` ((0, 1.0), (100, 0.4)) are time multipliers, interpolated
+    geometrically, so each step of 10 is about 1.10x faster.
+    - 50 → 0.63 of today's time.
+    - 100 → 0.4 of today's time, i.e. 2.5x faster.
+  - A default 3 s `goto_pose` takes 5.6 s at 0 and 2.25 s at 100. Home takes
+    7.5 s at 0 and 3.0 s at 100, a little quicker than frankapy's own
+    defaults. 100 was picked as a cautious ceiling, not measured.
+  - `MIN_FAST_SECONDS` 1.0: a faster speed never shortens a move below 1 s
+    (stir's 1 mm probes and the twist's quarter cycles stay as they are).
+- Where it acts:
+  - `PacedArm.speed` scales `goto_pose`, `goto_joints` and `reset_joints`,
+    explicit `reset_joints` durations included.
+  - `stream_pose_path` scales `seconds`. Paths that already have one setpoint
+    per tick (stir's circles, dump's twist) are time-compressed as they are
+    (`resample_path_uniform`) and are not eased again.
+  - Holds and waits are not scaled.
+  - **Stir's circles speed up with the rest.** The 2026-10-22 note already
+    flagged cup drag at the current 2.5 s/rev. The guide puts stir at 30
+    (1.32x).
+- How a call gets it:
+  - `SkillsExecutor.execute` pops `params["speed"]` for any skill. It sets the
+    speed on the arm for that call and puts it back to 0 afterwards, even if
+    the skill raises. A non-number runs at 0 with a printed note.
+  - Manual use: `--params '{"object_name":"larger spoon","speed":60}'`.
+- Planner (`skill_planner.py`):
+  - The schema now requires `speed_reason` and then `speed`, so the model
+    writes its reason before picking the number.
+  - `skill_catalog.SPEED_GUIDE` / `speed_prompt_block()` render the scale
+    every 10 marks, with the seconds computed from the code:
+    - liquid 0;
+    - little liquid and the pipette 10;
+    - a loaded scoop 20;
+    - stir and a just-poured container 30;
+    - an empty container and a tool into its holder 40;
+    - an empty tool 50-70;
+    - nothing held 80+.
+  - Only `moves_arm` skills get `speed` in params. The orchestrator prints
+    `(speed N: reason)` after the rationale. It can be edited at the step
+    prompt like any other parameter.
+- **What the planner picks, replayed (gpt-4.1, 2026-10-27).**
+  - Method: each recorded sub-task went through `plan_skill_call` with the
+    record's scene, the held object and the history. Scratch script
+    `replay_speeds.py`, not kept.
+  - The skill chosen matched the record on every step of both runs.
+  - Jellyfish (`agent_run_20261022_145232`, 20 steps):
+    - spoon pick 60, scoop 20, dump 20;
+    - spoon and stirrer back to their holders 40, stirrer pick 60;
+    - stir 30;
+    - beaker of oil pick and pour 0, beaker put back 30;
+    - pick_pipette and dispense 10, pipette back 40.
+  - Magic Beaker (`agent_run_20261020_142834`, 32 steps):
+    - the same pattern for the three scoop/dump/stir rounds, except stirrer
+      picks at 50 twice and 60 once;
+    - beaker and cups A/B picks and pours 0;
+    - put-backs after a pour of 90 at 30.
+    - Step 32 (place cup B) got 0: the record ends before 31 ran, so the
+      model saw no pour of cup B in the history and believed it still held
+      10 ml. In a live run it would follow a 90 pour.
+- Checks:
+  - `test_agents_offline.py` 137/137: 3 new speed checks; 2 expectations now
+    include `"speed"`.
+  - `test_robot_and_sim_share_one_pace` passes unchanged.
+  - Fake-arm check (first scale, same code path): the default speed
+    reproduced 5.625 / 0.9375 / home 7.5. At speed 100 the same moves were
+    2.25 / 0.9375 (floor) / home 3.0.
+- First things to watch on the robot:
+  - The empty-spoon `pick_up` at 60, for velocity or acceleration
+    discontinuity faults (`last_motion_errors`).
+  - The stir at 30 for cup drag.
+  - The dump twist at 20.

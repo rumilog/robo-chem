@@ -90,7 +90,8 @@ class StirSkill(BaseSkill):
             # is its own skill. Falls back to blocking waypoints wherever
             # streaming is unavailable (no ROS, dry runs, tests).
             "smooth": True,
-            "seconds_per_revolution": 4.0,
+            # 4.0 until 2026-10-22; the user asked for a faster stir.
+            "seconds_per_revolution": 2.5,
             "stream_rate_hz": 50.0,
             # Cartesian stiffness of the streamed circle, [x, y, z, rx, ry, rz]
             # (N/m, Nm/rad). frankapy's dynamic mode is always cartesian
@@ -530,30 +531,32 @@ class StirSkill(BaseSkill):
                   f"{rev_seconds:.1f}s each, streamed at {rate_hz:.0f}Hz"
                   + (f", stiffness {params['stream_stiffness']}"
                      if params.get("stream_stiffness") else "") + "...")
+            # All revolutions as ONE streamed motion: it speeds up once, stirs
+            # at a steady pace and slows down once. One skill per revolution
+            # eased to a stop at the end of every circle (the user,
+            # 2026-10-22: "make it continuous").
             streamed = True
-            for rev in range(1, revolutions + 1):
-                path = self._circle_path(center, radius, stir_z,
-                                         rev_seconds, rate_hz)
-                stiffness = params.get("stream_stiffness")
-                extra = {"stiffness": stiffness} if stiffness else {}
-                ok, msg = self.stream_pose_path(path, rotation,
-                                                seconds=rev_seconds,
-                                                rate_hz=rate_hz, tag="Stir", **extra)
-                if not ok:
-                    print(f"[Stir] Smooth trace unavailable ({msg}); "
-                          f"falling back to waypoints")
-                    streamed = False
-                    break
-
+            total = rev_seconds * revolutions
+            path = self._continuous_circle_path(center, radius, stir_z,
+                                                revolutions, total, rate_hz)
+            stiffness = params.get("stream_stiffness")
+            extra = {"stiffness": stiffness} if stiffness else {}
+            ok, msg = self.stream_pose_path(path, rotation, seconds=total,
+                                            rate_hz=rate_hz, tag="Stir", **extra)
+            if not ok:
+                print(f"[Stir] Smooth trace unavailable ({msg}); "
+                      f"falling back to waypoints")
+                streamed = False
+            else:
                 ok, held = self.check_still_holding(start_width, tag="Stir")
                 if not ok:
-                    print(f"[Stir] {held} — aborting mid-stir")
+                    print(f"[Stir] {held} — lost during the stir")
                     return False, {
                         "error": f"Stirrer lost during stirring: {held}",
-                        "revolutions_completed": float(rev - 1),
+                        "revolutions_completed": 0.0,
                     }
-                completed = rev * per_rev
-                print(f"[Stir]   revolution {rev}/{revolutions} done ({msg})")
+                completed = revolutions * per_rev
+                print(f"[Stir]   {revolutions} revolutions done in one motion ({msg})")
 
         if not streamed:
             waypoints = self._circle_waypoints(center, radius, stir_z,
@@ -757,6 +760,30 @@ class StirSkill(BaseSkill):
                 z,
             ]))
         return path
+
+    @staticmethod
+    def _continuous_circle_path(center_xy, radius: float, z: float,
+                                revolutions: int, seconds: float,
+                                rate_hz: float, ramp_fraction: float = 0.4
+                                ) -> List[np.ndarray]:
+        """
+        Every revolution in one path: angular speed eases up over the first
+        ``ramp_fraction`` of a revolution, holds steady, and eases down over
+        the last, ending exactly back at the start angle.
+        """
+        n = max(2, int(round(seconds * rate_hz)))
+        t = np.linspace(0.0, 1.0, n + 1)
+        ramp = min(0.5, ramp_fraction / max(1, revolutions))
+
+        def ease(x):
+            x = np.clip(x, 0.0, 1.0)
+            return x * x * (3.0 - 2.0 * x)
+
+        speed = ease(t / ramp) * ease((1.0 - t) / ramp)
+        angle = np.concatenate([[0.0], np.cumsum((speed[1:] + speed[:-1]) / 2)])
+        angle *= 2.0 * np.pi * revolutions / angle[-1]
+        return [np.array([center_xy[0] + radius * np.cos(a),
+                          center_xy[1] + radius * np.sin(a), z]) for a in angle]
 
     @staticmethod
     def _circle_waypoints(center_xy: np.ndarray, radius: float, z: float,

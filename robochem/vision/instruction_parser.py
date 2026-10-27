@@ -7,6 +7,8 @@ Uses OCR + VLM to extract structured task information.
 
 from typing import Dict, List, Optional
 from openai import OpenAI
+
+from ..agents.llm_client import chat_create
 import base64
 import json
 import cv2
@@ -133,7 +135,7 @@ says "the empty clear cup", do not write "the beaker". Read small print
 carefully rather than guessing it from the pictures."""
 
         try:
-            response = self.client.chat.completions.create(
+            response = chat_create(self.client,
                 model=_model(),
                 messages=[
                     {
@@ -247,7 +249,7 @@ Extract:
 Return as JSON with keys: goal, steps, reagents, equipment, expected_outcome"""
 
         try:
-            response = self.client.chat.completions.create(
+            response = chat_create(self.client,
                 model=_model(),
                 messages=[
                     {"role": "system", "content": "Parse chemistry tasks into structured format."},

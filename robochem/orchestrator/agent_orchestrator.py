@@ -182,6 +182,8 @@ class StepRecord:
     adjusted: str = ""
     #: Photos of the bench taken right after this step (SNAPSHOT_AFTER).
     photos: List[str] = field(default_factory=list)
+    #: What StepChecker saw in the target afterwards (pour, dump), or None.
+    check: Optional[Dict[str, Any]] = None
 
     def as_dict(self) -> dict:
         return {
@@ -197,6 +199,7 @@ class StepRecord:
             "result": self.result,
             "seconds": round(self.seconds, 2),
             "photos": list(self.photos),
+            "check": self.check,
         }
 
 
@@ -244,6 +247,8 @@ class AgentOrchestrator:
         verbose: bool = True,
         confirm=None,
         snapshot=None,
+        step_checker=None,
+        preflight=None,
     ) -> None:
         """
         Args:
@@ -272,6 +277,12 @@ class AgentOrchestrator:
                 SNAPSHOT_AFTER; the paths go in the step record as ``photos``
                 for the report. A snapshot that fails is reported and the run
                 goes on.
+            step_checker: :class:`~robochem.orchestrator.step_checks.StepChecker`,
+                which looks at a pour's or dump's target afterwards; None for
+                no check. Only a strict checker's "suspect" fails the step.
+            preflight: :class:`~robochem.orchestrator.preflight.Preflight`,
+                run on the plan before the first step: targets out of reach
+                are moved while the gripper is still empty. None skips it.
         """
         self.skills = skills_executor
         self.vision = vision_system
@@ -286,6 +297,8 @@ class AgentOrchestrator:
         self.verbose = verbose
         self.confirm = confirm
         self.snapshot = snapshot
+        self.step_checker = step_checker
+        self.preflight = preflight
 
         # What we believe is in the gripper. The arm is the authority on whether
         # anything is held; only the name is bookkeeping.
@@ -417,6 +430,23 @@ class AgentOrchestrator:
                 plan.infeasible_reason or "the planner reported the goal infeasible",
                 0, [], started,
             )
+
+        # --- reach, before anything moves ---------------------------------
+        if self.preflight is not None and not self.dry_run:
+            skip = set()
+            if resume is not None:
+                start = int(from_step) if from_step else _failed_step(resume)
+                skip = {s.index for s in plan.subtasks if s.index < start}
+            ahead = replace(plan, subtasks=[s for s in plan.subtasks if s.index not in skip])
+            try:
+                report = self.preflight.run(self.preflight.items_from_plan(ahead))
+            except Exception as exc:
+                report = {"warnings": [f"preflight failed: {type(exc).__name__}: {exc}"],
+                          "moved": [], "blocked": None}
+                self._say(f"[preflight] {report['warnings'][0]}; going on without it")
+            record["preflight"] = report
+            if report.get("blocked"):
+                return self._blocked(record, "preflight", report["blocked"], task, started)
 
         # --- execute, verify, replan -------------------------------------
         # Four camera captures, so only when something will compare against them.
@@ -575,6 +605,8 @@ class AgentOrchestrator:
             self._say(f"   -> {call.as_command()}")
             if call.rationale:
                 self._say(f"   ({call.rationale})")
+            if call.speed_reason and "speed" in call.params:
+                self._say(f"   (speed {call.params['speed']}: {call.speed_reason})")
 
             if self.dry_run:
                 record.success = True
@@ -616,6 +648,22 @@ class AgentOrchestrator:
                               f"sub-task {subtask.index}")
                 except Exception as exc:
                     self._say(f"   [photos] none taken: {type(exc).__name__}: {exc}")
+            if success and self.step_checker is not None:
+                try:
+                    record.check = self.step_checker.check(call, result)
+                except Exception as exc:
+                    record.check = {"status": "skipped",
+                                    "detail": f"{type(exc).__name__}: {exc}"}
+                if record.check is not None:
+                    self._say(f"   [check] {record.check['status']}"
+                              f" ({record.check.get('seconds', 0)}s): "
+                              f"{record.check.get('detail', '')}")
+                    if record.check.get("fails_step"):
+                        success = False
+                        record.success = False
+                        record.failure_kind = "check"
+                        record.reason = (f"{call.skill} ran, but the target looked "
+                                         f"wrong afterwards: {record.check.get('detail')}")
             steps.append(record)
             self.history.append(
                 StepOutcome(call, bool(success), record.reason or "ok")
@@ -756,6 +804,13 @@ class AgentOrchestrator:
             self.held_tool_offset = (
                 [float(v) for v in offset] if offset is not None else None
             )
+        elif call.skill == "pick_pipette":
+            # 2026-10-21: missing, so after pick_pipette + dispense the loop
+            # believed the jaws held "something unidentified" and refused to
+            # put the pipette back.
+            self.held_object = (call.params.get("object_name")
+                                or (result or {}).get("grasped_object") or "pipette")
+            self.held_tool_offset = None
         elif call.skill in ("place", "open_gripper"):
             self.held_object = None
             self.held_tool_offset = None
@@ -783,6 +838,13 @@ class AgentOrchestrator:
                 fn = getattr(self.skills, hook, None)
                 if callable(fn):
                     fn(skill, params, result)
+            remember = getattr(self.vision, "remember_position", None)
+            if callable(remember):
+                # Where containers were last seen, to break label-vote ties.
+                if skill == "pour" and result.get("lip_xy"):
+                    remember(params.get("target_container"), result["lip_xy"])
+                elif skill == "place" and result.get("place_position"):
+                    remember(self.held_object, result["place_position"])
             call = SkillCall(skill=skill, params=params,
                              subtask_index=int(st.get("subtask_index") or 0),
                              subtask=str(st.get("subtask") or ""))
@@ -822,6 +884,14 @@ class AgentOrchestrator:
 
     def _with_offset(self, description: Optional[str]) -> Optional[str]:
         """Append the measured tool offset, so the model can pass it on verbatim."""
+        if description and self.dry_run:
+            # A dry run never grasps, so nothing is measured. gpt-6-astra
+            # refused the scoop over the missing measurement on 2026-10-20
+            # and replanned into multi-skill sub-tasks; on the robot the
+            # pick_up reports it.
+            return (f"{description}. DRY RUN: nothing was grasped, so no tool_offset "
+                    f"was measured. Leave tool_offset out; on the robot the pick_up "
+                    f"supplies it")
         if not description or self.held_tool_offset is None:
             return description
         x, y, z = self.held_tool_offset

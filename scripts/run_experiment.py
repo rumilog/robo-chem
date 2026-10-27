@@ -51,6 +51,8 @@ from robochem.verification.chemistry_verifier import ChemistryVerifier
 from robochem.utils.logging_utils import ExperimentLogger
 from robochem.agents import config as agent_config
 from robochem.orchestrator.agent_orchestrator import AgentOrchestrator
+from robochem.orchestrator.step_checks import StepChecker
+from robochem.orchestrator.preflight import Preflight
 from robochem.orchestrator.vlm_orchestrator import VLMOrchestrator
 
 DEFAULT_CAMERAS = [2, 3, 4, 5]
@@ -104,7 +106,12 @@ def confirm_step(subtask, call) -> bool:
         try:
             answer = input(f"   [step {subtask.index}] Enter to run it, key=value to change a "
                            f"parameter (e.g. pour_angle=60), q to stop here: ")
-        except EOFError:
+        except (EOFError, KeyboardInterrupt):
+            # Ctrl-C here is a stop like q, so the run record is still written.
+            # On 2026-10-19 a session that had run sub-tasks 15-32 ended at
+            # this prompt and left no record, and with it went the paths of
+            # its 16 photos.
+            print("\n   stopped here")
             return False
         text = answer.strip()
         if not text:
@@ -214,6 +221,7 @@ def build_stack(args):
         bench=BENCHES.get(args.bench),
     )
     vision.object_localizer.camera_ids = list(args.cameras)
+    vision.reuse_scans = not args.rescan_always
     if vision.bench is not None:
         print(f"Bench '{vision.bench.name}': "
               + ", ".join(o.name for o in vision.bench.objects))
@@ -272,6 +280,29 @@ def main() -> int:
     parser.add_argument("--no-step-photos", action="store_true",
                         help="Do not photograph the bench after each pour (the report "
                              "uses those photos for the colours of cups poured out later)")
+    parser.add_argument("--holding", metavar="NAME",
+                        help="The gripper already holds NAME (a --skill chain that "
+                             "stopped mid-way, arm home with the tool still in hand). "
+                             "Starting a new chain with pick_up would open the jaws "
+                             "and drop it")
+    parser.add_argument("--held-offset", nargs=3, type=float, metavar=("X", "Y", "Z"),
+                        help="With --holding: the pick's suggested_tool_offset "
+                             "(the log's 'tool_offset x/y ... as measured at the pick')")
+    parser.add_argument("--picked-at", nargs=3, type=float, metavar=("X", "Y", "Z"),
+                        help="With --holding: where it was picked up (the log's "
+                             "'Noted where ... was picked from'), so place can put it back")
+    parser.add_argument("--no-preflight", action="store_true",
+                        help="Do not check every target's reach before the arm starts "
+                             "(and do not move cups that are out of reach)")
+    parser.add_argument("--rescan-always", action="store_true",
+                        help="Scan with all four cameras before every skill, as before "
+                             "2026-10-22, instead of reusing a scan of an object nothing "
+                             "has touched once one camera's fresh frame agrees")
+    parser.add_argument("--no-step-checks", action="store_true",
+                        help="Do not look at the target after each pour and dump")
+    parser.add_argument("--strict-checks", action="store_true",
+                        help="A pour or dump whose target shows no change fails the step "
+                             "(default: reported, and the run goes on)")
     parser.add_argument("--max-retries", type=int, default=3,
                         help="Corrective replanning attempts for --task")
     parser.add_argument("--legacy-planner", action="store_true",
@@ -294,7 +325,8 @@ def main() -> int:
         help="Continue an earlier --task / --instruction-image run from its record "
              "(experiments/agent_run_*.json): same goal and plan, the steps before "
              "--from-step not run again, what they held and where they picked "
-             "things restored. The bench must be as that run left it",
+             "things restored. The bench must be as that run left it. "
+             "'latest' takes the newest record in --log-dir that moved the robot",
     )
     parser.add_argument(
         "--from-step", type=int, default=None,
@@ -371,6 +403,18 @@ def main() -> int:
         build_sim_stack(args) if args.sim else build_stack(args)
     )
 
+    if args.holding:
+        held = vision.canonical_name(args.holding)
+        skills.held = held
+        skills.held_measure = ({"suggested": list(args.held_offset)}
+                               if args.held_offset else {})
+        if args.picked_at:
+            skills.pick_sites[str(held).strip().lower()] = list(args.picked_at)
+        vision.set_held(held)
+        print(f"[resume] holding {held!r}"
+              + (f", tool offset {args.held_offset}" if args.held_offset else "")
+              + (f", picked from {args.picked_at}" if args.picked_at else ""))
+
     try:
         # Skill mode: useful for validating skills without involving the
         # planner. Several --skill flags run as a sequence against the one cell,
@@ -392,19 +436,61 @@ def main() -> int:
                 ))
                 return 0 if located else 1
 
+            from robochem.agents.skill_planner import SkillCall
+            checker = (None if args.sim or args.no_step_checks
+                       else StepChecker(vision, skills, strict=args.strict_checks,
+                                        photo_dir=Path(args.log_dir) /
+                                        f"checks_{time.strftime('%Y%m%d_%H%M%S')}"))
+            timeline = []
+
+            def summary():
+                if len(plans) > 1:
+                    print("\n--- timing ---")
+                    for row in timeline:
+                        print(f"  {row}")
+                    print(f"  total {time.time() - chain_started:.1f}s")
+
+            chain_started = time.time()
+            if not (args.sim or args.no_preflight):
+                pf = Preflight(vision, skills)
+                report = pf.run(pf.items_from_calls(plans))
+                if report.get("seconds") is not None:
+                    timeline.append(f"0. preflight    {report['seconds']:6.1f}s  "
+                                    f"{len(report['moved'])} moved, "
+                                    f"{len(report['warnings'])} warning(s)")
+                if report["blocked"]:
+                    print(f"\nStopped before step 1: {report['blocked']}")
+                    summary()
+                    return 1
             last = {}
             for step, (name, params) in enumerate(plans, 1):
                 if len(plans) > 1:
                     print(f"\n--- step {step}/{len(plans)}: {name} ---")
                 print(f"Executing skill {name!r} with {params}")
+                started = time.time()
                 success, last = skills.execute(name, params)
+                row = f"{step}. {name:<12} {time.time() - started:6.1f}s  " + (
+                    "ok" if success else "FAILED")
                 print(f"success={success}")
+                if success and checker is not None:
+                    verdict = checker.check(
+                        SkillCall(skill=name, params=params, subtask_index=step), last)
+                    if verdict is not None:
+                        print(f"[check] {verdict['status']} ({verdict.get('seconds', 0)}s): "
+                              f"{verdict.get('detail', '')}"
+                              + (f"  [{verdict['photo']}]" if verdict.get("photo") else ""))
+                        row += f"  check {verdict['status']} {verdict.get('seconds', 0)}s"
+                        if verdict.get("fails_step"):
+                            success = False
+                timeline.append(row)
                 if not success:
                     print(json.dumps(last, indent=2, default=str))
                     print(f"\nStopped at step {step}/{len(plans)} ({name})")
+                    summary()
                     return 1
             print()
             print(json.dumps(last, indent=2, default=str))
+            summary()
             return 0
 
         # Full orchestrated task
@@ -441,11 +527,30 @@ def main() -> int:
             confirm=confirm_step if args.step else None,
             snapshot=(None if args.dry_run or args.no_step_photos else make_snapshot(
                 vision, Path(args.log_dir) / f"photos_{time.strftime('%Y%m%d_%H%M%S')}")),
+            preflight=(None if args.dry_run or args.sim or args.no_preflight
+                       else Preflight(vision, skills)),
+            step_checker=(None if args.dry_run or args.sim or args.no_step_checks
+                          else StepChecker(vision, skills, strict=args.strict_checks,
+                                           photo_dir=Path(args.log_dir) /
+                                           f"checks_{time.strftime('%Y%m%d_%H%M%S')}")),
         )
 
         resume = None
         if args.resume:
-            resume = json.loads(Path(args.resume).read_text(encoding="utf-8"))
+            path = Path(args.resume)
+            if args.resume == "latest":
+                # On 2026-10-19 a resume from 15 was pointed at the 10-15 record
+                # by hand: it ran that day's 33-step plan, not the 31-step plan
+                # the run being resumed had made.
+                from robochem.agents.reporter import latest_record
+                path = latest_record(args.log_dir)
+                if path is None:
+                    print(f"--resume latest: no record in {args.log_dir} that moved the robot")
+                    return 1
+            resume = json.loads(path.read_text(encoding="utf-8"))
+            done = [s.get("subtask_index") for s in resume.get("steps") or [] if s.get("success")]
+            print(f"[resume] record {path}: started {resume.get('started')}, "
+                  f"{resume.get('outcome')}; sub-tasks done there: {done}")
         outcome = orchestrator.run(
             task=args.task,
             instruction_image=args.instruction_image,

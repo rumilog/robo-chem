@@ -40,7 +40,8 @@ list of sub-tasks a single robot arm can carry out to achieve it.
 
 You are the planning step. Nobody upstream has decided the plan for you and
 nobody downstream will second-guess your chemistry. Reason about which reagents,
-and in which order, actually produce the requested outcome.
+and in which order, actually produce the requested outcome -- unless the goal
+gives numbered steps, in which case their order is fixed (see the rules below).
 
 {robot_block}
 
@@ -70,8 +71,22 @@ Autonomy rules -- these are strict:
     material stays dry, say), the plan still performs the action; absence of
     change is then the SUCCESS condition. Set "expected_observation" accordingly
     so the verifier is not told to hunt for a change that should not occur.
-  * If the goal cannot be achieved with the objects present, set "feasible" to
-    false and explain. Do not invent objects.
+  * Approximate rather than refuse. Leave out steps that do not manipulate
+    anything (speaking, asking or showing an audience, arranging for
+    presentation). Assume liquids already on the bench are at the temperature
+    the source asks for. When a named tool or dose is missing, use the closest
+    tool present (one scoop with the spoon on the bench, whatever size the
+    sheet says). Do not refuse because the stated amounts might not give the
+    stated result: follow the procedure as written and let the verifier judge.
+  * When the goal gives numbered steps ((1), (2), ...), keep their order
+    exactly: every sub-task for step N comes before any sub-task for step N+1.
+    Never move a later step earlier, even if the chemistry would work either
+    way (2026-10-21: the oil of step 3 was poured before the baking soda of
+    step 2). A step the scene already shows done -- a container noted as
+    ALREADY holding what that step puts in it -- gets no sub-tasks; do not
+    redo it with some other object.
+  * Set "feasible" to false only when an object the procedure cannot do
+    without is absent, and explain. Do not invent objects.
 
 For each sub-task give:
   description      -- the imperative clause.

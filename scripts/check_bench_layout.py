@@ -99,6 +99,10 @@ def main() -> int:
         wanted = {bench.canonical(n) for n in args.names}
         objects = [o for o in objects if o.name in wanted]
 
+    # The key from .env, as run_experiment.py gets it, so the script does not
+    # need scripts/env.sh sourced first (it died in OpenAI() on 2026-10-20).
+    from robochem.agents import config as agent_config
+    agent_config.load_env()
     vision = VisionSystem(cameras={}, grounding_url=args.grounding_url, bench=bench)
     vision.object_localizer.camera_ids = list(args.cameras)
 

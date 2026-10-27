@@ -34,11 +34,15 @@ from . import config, llm_client
 from .planner import SubTask
 from .robot_profile import DEFAULT_PROFILE, RobotProfile
 from .scene import Scene
+from robochem.skills.pacing import DEFAULT_SPEED, parse_speed
+
 from .skill_catalog import (
+    CATALOG,
     InfeasibleSkill,
     coerce_params,
     parse_skill,
     skill_enum_schema,
+    speed_prompt_block,
     vocabulary_prompt_block,
 )
 
@@ -51,6 +55,8 @@ workspace, what the gripper is currently holding, and what the previous steps of
 this run actually did. Emit the single skill call that carries out this sub-task.
 
 {vocabulary_block}
+
+{speed_block}
 
 {robot_block}
 
@@ -69,6 +75,10 @@ How to choose:
     it. Guessing a distance is worse than saying nothing.
   * Values go in "params" as JSON literals: a string as "plastic beaker" (with
     the quotes), a number as 0.02, a boolean as true.
+  * Speed is not a parameter: it goes in "speed". First write "speed_reason":
+    what this call carries or touches at its most delicate moment (liquid,
+    powder, an empty tool, nothing) and so how fast that can move. Then pick
+    the speed on the scale above.
 
 If this sub-task cannot be carried out by exactly one skill from the list, set
 "feasible" to false and say what capability is missing. Do NOT approximate it
@@ -97,12 +107,17 @@ _SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "speed_reason": {"type": "string"},
+        "speed": {
+            "type": "integer",
+            "description": "0-100, how fast the arm moves through this call",
+        },
         "rationale": {"type": "string"},
         "expected_outcome": {"type": "string"},
     },
     "required": [
-        "feasible", "infeasible_reason", "skill", "params", "rationale",
-        "expected_outcome",
+        "feasible", "infeasible_reason", "skill", "params", "speed_reason",
+        "speed", "rationale", "expected_outcome",
     ],
     "additionalProperties": False,
 }
@@ -118,11 +133,13 @@ class SkillCall:
     expected_outcome: str = ""
     subtask_index: int = 0
     subtask: str = ""
+    speed_reason: str = ""
 
     def as_dict(self) -> dict:
         return {
             "skill": self.skill,
             "params": self.params,
+            "speed_reason": self.speed_reason,
             "rationale": self.rationale,
             "expected_outcome": self.expected_outcome,
             "subtask_index": self.subtask_index,
@@ -190,6 +207,7 @@ def plan_skill_call(
         model=model or config.strong_model(),
         system_prompt=_SYSTEM_PROMPT.format(
             vocabulary_block=vocabulary_prompt_block(),
+            speed_block=speed_prompt_block(),
             robot_block=profile.as_prompt_block(),
         ),
         user_content=[
@@ -217,10 +235,17 @@ def plan_skill_call(
 
     skill = parse_skill(response.get("skill", ""), subtask=subtask.description)
     params = coerce_params(skill, response.get("params", []), subtask=subtask.description)
+    # Speed rides in params, where SkillsExecutor.execute takes it off; only
+    # for a skill that moves the arm, so the log of the others stays as it was.
+    # Missing or not a number: the tuned pace.
+    if CATALOG[skill].moves_arm:
+        speed = parse_speed(response.get("speed"))
+        params["speed"] = int(round(speed)) if speed is not None else DEFAULT_SPEED
 
     return SkillCall(
         skill=skill,
         params=params,
+        speed_reason=str(response.get("speed_reason", "")).strip(),
         rationale=str(response.get("rationale", "")).strip(),
         expected_outcome=str(response.get("expected_outcome", "")).strip(),
         subtask_index=subtask.index,
