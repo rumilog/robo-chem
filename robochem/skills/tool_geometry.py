@@ -75,11 +75,15 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         # TCP to rod tip: 15 mm to the cube centre plus the 66 mm rod (CAD,
         # stirrer v1.stl). pick_up measures ~0.017: the rod is in the holder.
         "tool_length": 0.081,
-        # place's vertical insert: home, cross at height, straight down, and
-        # release only once the probe feels the seat (validated in sim
-        # 2026-09-25 and 2026-09-27, see progress.md).
-        "put_back": {"vertical_insert": True, "release_clearance": 0.0,
-                     "stop_force_n": 1.0},
+        # place's vertical insert: home, cross at height, one move straight
+        # down, open. The force probe (stop_force_n 1.0, 2 mm steps) was taken
+        # out at the user's request (2026-10-27: too slow, just let go): it
+        # was 6 steps of the 40 s place. The release is 15 mm above where the
+        # pick held it, above the seat contacts felt so far (13 mm on
+        # 2026-10-05, 5 mm on 2026-10-27: the rod slips in the jaws), so it
+        # is never driven into the seat (-96 N on 2026-10-05) and drops at
+        # most 15 mm down the bore.
+        "put_back": {"vertical_insert": True, "release_clearance": 0.015},
     },
 }
 

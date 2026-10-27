@@ -123,6 +123,31 @@ def tool_extent_x(points, grasp_pose):
 MAX_GRASP_YAW_DEG = 120.0
 
 
+def drop_stray_points(points, radius: float = 0.003, min_neighbours: int = 8):
+    """
+    ``points`` without the sparse ones: fewer than ``min_neighbours`` points
+    (itself included) within ``radius``.
+
+    The depth cameras leave arcs of stray points along an object's edges. On
+    2026-10-27 they lay beside the red scoop's handle and made it read 22 mm
+    wide against the bowl's 27, so a flat scoop was called "on its side" and
+    yaw auto refused (bowl and handle alike). Without them the same cloud read
+    11 vs 21 mm: flat, wrist +9.6 deg. Only for decisions about the tool's
+    shape; the grasp is computed from the cloud as it was. When the filter
+    would take away more than half, the cloud is returned whole.
+    """
+    P = np.asarray(points, dtype=float)
+    if len(P) < 50:
+        return P
+    try:
+        from scipy.spatial import cKDTree
+    except ImportError:
+        return P
+    counts = np.array([len(n) for n in cKDTree(P).query_ball_point(P, float(radius))])
+    kept = P[counts >= int(min_neighbours)]
+    return kept if len(kept) >= 0.5 * len(P) else P
+
+
 def tool_long_axis_yaw(points, end_frac: float = 0.3):
     """
     (yaw, info): the direction, in the table plane, from a long tool's handle
@@ -356,7 +381,7 @@ class PickUpSkill(BaseSkill):
         if mode in ("auto", "long", "square"):
             yaw, info, why = None, None, []
             if mode in ("auto", "long"):
-                yaw, info = tool_long_axis_yaw(object_pc)
+                yaw, info = tool_long_axis_yaw(drop_stray_points(object_pc))
                 if yaw is None:
                     why.append(f"long axis: {info}")
             if yaw is None and mode in ("auto", "square"):
@@ -456,7 +481,8 @@ class PickUpSkill(BaseSkill):
         if mode and object_pc is not None:
             from .right_spoon import RightSpoonSkill, spoon_pose
             table = self.config.get("table_z")
-            lies = spoon_pose(object_pc, float(table) if table is not None else 0.0)
+            lies = spoon_pose(drop_stray_points(object_pc),
+                              float(table) if table is not None else 0.0)
             print(f"[PickUp] How '{object_name}' lies: {lies['pose']} "
                   f"(end widths {lies.get('width_mm')} mm, heights {lies.get('height_mm')} mm)")
             if lies["pose"] == "on_side" and mode == "warn":

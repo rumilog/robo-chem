@@ -5093,3 +5093,99 @@ being dragged or z drift (the 2026-10-10 rod-touch issue).
     discontinuity faults (`last_motion_errors`).
   - The stir at 30 for cup drag.
   - The dump twist at 20.
+- **First robot run, speed 0 (2026-10-27 15:4x, `experiments/speed_test_20261027.log`).**
+  - Spoon pick_up took 67.2 s and place took 25.1 s. This is the baseline
+    for the speed-60 comparison.
+  - A second run, also at speed 0, failed on the lift ("Object lost during
+    the lift: gripper went from 19.4mm to 1.7mm", pick_up 61.6 s). The spoon
+    was still on its side; yaw again refused (26 vs 20 mm). No speed-60 run
+    yet.
+  - The first attempt died on `No module named 'numpy'` because
+    `scripts/env.sh` had not been sourced.
+  - **The wrist did not turn.** It is not the speed change: `yaw auto`
+    refused.
+    - The spoon lay on its side ("lies ON ITS SIDE" warning). Its two ends
+      read 27 vs 24 mm wide, inside the 1.3x the bowl test needs, and the
+      square-top fallback is for the stirrer cube.
+    - It grasped at home rotation and still picked and placed.
+    - User report: "it never turns, always straight ahead".
+  - **The spoon was NOT on its side (user). It was a perception error, now fixed.
+    Not yet re-run on the robot.**
+    - What was checked:
+      - `check_object.py --object "white plastic tool"` at 15:49/15:5x,
+        spoon at (0.557, -0.196), saved `diag_out/spoon_points.npy`.
+      - The 2D masks are clean on all four cameras. The scoop on the bench
+        is now red, and `"white plastic tool"` still finds it; `"red
+        plastic tool"`, `"red plastic spoon"` and `"orange plastic scoop"`
+        return no masks at all, so keep the prompt.
+      - cam 5 sees only part of it: 262 px, conf 0.54, 25 mm off the other
+        cameras.
+    - Cause: a top view of the fused cloud shows the spoon itself is right,
+      about 70 mm long, bowl ~27 mm, handle ~10 mm. Next to the handle lie
+      arcs of sparse stray points (depth edge pixels). They put the
+      handle-end width (5-95 percentile) at 22 mm. Bowl and handle then
+      failed the 1.3x width test, so `spoon_pose` said `on_side` and `yaw
+      auto` refused.
+    - Fix: `pick_up.drop_stray_points`.
+      - It keeps points with at least 8 points (itself included) within 3 mm,
+        using scipy cKDTree. When it would remove more than half the cloud,
+        the cloud is kept whole.
+      - It is used only for `spoon_pose` and `tool_long_axis_yaw`; the grasp
+        cloud is unchanged.
+      - On the saved cloud it kept 2805 of 3052 points. Result: `flat`,
+        handle 11 / bowl 21 mm, yaw +9.6°.
+      - Stricter settings (k12 at 3 mm, k15 at 4 mm) give the same.
+    - Not checked: a truly side-lying scoop after the filter. The 2026-10-23
+      capture has images only, no cloud.
+    - The spoon lies nearly straight ahead (+9.6°), so even a working turn
+      is small. Angle it on the bench to see a clear one.
+    - `test_cups_are_taken_from_behind` fails offline (`FakePose` into
+      `to_rigid_transform` from `place.py:151`). It fails the same with the
+      filter off; not from this change.
+
+**Stirrer put-back: one move down and open, no force probe (user, 2026-10-27). Not yet run on the robot.**
+- Robot run `experiments/stirrer_speed_20261027.log` (pick 60, place 40):
+  - pick_up 42.5 s ok; place 40.0 s ok.
+  - The place went: home, cross at 0.30, down to 15 mm above the release,
+    then six 2 mm force-probe steps. Contact was at z 0.1088 (−1.12 N),
+    5 mm ABOVE the pick's grasp z 0.1038.
+- User: too slow, "just open the gripper".
+- `tool_geometry` stirrer `put_back` is now
+  `{"vertical_insert": True, "release_clearance": 0.015}`. `stop_force_n` is
+  gone, so place uses its plain single descent.
+- Why 15 mm:
+  - The seat has been felt 13 mm (2026-10-05) and 5 mm (today) above the
+    grasp z; the rod slips in the jaws.
+  - Releasing at the grasp z would drive it 5-13 mm into the seat
+    (−96 N on 2026-10-05).
+  - At 15 mm the rod drops at most 15 mm down the 66 mm bore.
+  - If it ever lands crooked, lower it toward 0.010.
+- Still in place: the home first and the 0.30 crossing.
+- Checks:
+  - `test_executor_uses_bench_names` 25/25.
+  - `test_place_releases_on_a_negative_press` dies on the same `FakePose` /
+    `place.py:151` error as `test_cups_are_taken_from_behind`. That error is
+    pre-existing.
+
+**New objects by name alone: what SAM 3 needs (2026-10-27).**
+- `"pen"` (a red marker standing upright) was found by SAM 3 on all four
+  cameras with no manifest entry: about 13 cm tall, 13-19 mm wide.
+  - Cam 4 put it 350 mm off: the gripper stood in front of it, so the mask's
+    depth was the gripper.
+  - Put back it needs `vertical_insert` + `release_clearance`. The plain
+    put-back releases at centroid z + 20 mm, and a top-held upright object
+    would be driven into the table.
+- `"blue papercup"` failed (`speed_test_20261027.log` l.544-597). Two causes:
+  - Any name with "cup" goes first through the labelled-cup path: it looked
+    for a paper label reading "blue papercup", which cost 20+ s.
+  - The object is a blue drink CARTON, not a cup. `"blue papercup"`,
+    `"blue paper cup"` and `"blue cup"` all gave no masks.
+- Prompts that find it on all four cameras (same frames):
+  - `"blue carton"` (conf 0.55-0.83);
+  - `"juice box"` (0.62-0.94);
+  - `"drink carton"` (0.40-0.71).
+  - `"blue box"` found it on cam 5 only.
+- Its geometry (`check_object`): 139 mm tall, cloud 55-65 mm wide, top 46-51
+  mm. Cameras up to 38 mm apart, so the width is probably inflated.
+- Lesson: name what the object is, not what it is used as, and keep "cup"
+  out of a name that is not a labelled cup.
