@@ -1,6 +1,6 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-10-27
+Last updated: 2026-10-29
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
@@ -147,6 +147,7 @@ python scripts/run_experiment.py --skill pour \
 | `pick_up` upright top grasp + reset_joints pre-scan | Working (beaker + spoon params above) |
 | `pour` tip toward/away base + stall detection + site offsets | Working with `forward_offset=-0.08` |
 | Smoke scripts | `scripts/smoke_test_skills.py`, `scripts/smoke_test_motion.py` |
+| Label pairing vs distance from the label (`scripts/label_distance_test.py`) | **Measured 2026-10-29**, 96 locates: never the wrong container; read reliably while the container stands on or against its sheet; with the other labels present elimination found it every time (see "Label distance test" at the end) |
 
 ---
 
@@ -5189,3 +5190,158 @@ being dragged or z drift (the 2026-10-10 rod-touch issue).
   mm. Cameras up to 38 mm apart, so the width is probably inflated.
 - Lesson: name what the object is, not what it is used as, and keep "cup"
   out of a name that is not a labelled cup.
+
+**Label reading benchmark: printed vs handwritten labels (2026-10-29). Cameras only, the arm locked and never imported.**
+- `scripts/label_reading_benchmark.py`, steps `ground-truth`, `scan --set NAME`, `report`.
+  Output in `experiments/label_benchmark_20261029/`: `ground_truth.json`,
+  `scans.jsonl` (one line per locate, with every camera's raw reads),
+  `report.md`, `summary.csv`, `failures/` (frames of wrong or missed locates).
+- Bench: four containers in a square, labels swapped between sets. The square
+  may be moved between sets (user, 2026-10-29), each container keeping its
+  corner, so **every set takes its own ground truth**
+  (`ground_truth_<set>.json`). `scan --set X` takes it first when X has none;
+  `--redo-truth` retakes it. The corners are found from the centre of the
+  four, in base x/y, so the square must stay roughly square-on to the arm. Its own manifest `LABEL_TEST` (the jellyfish dishes and oil
+  beaker, plus the jellyfish clear cup on a `10 ML WATER` label), so the
+  reader chooses among exactly 4 labels.
+  - red cabbage powder dish (0.626, +0.088); baking soda dish (0.615, −0.085);
+  - 10 ml water clear cup (0.425, +0.088); vegetable oil beaker (0.392, −0.087).
+  - "Top" in the user's description = +x (away from the arm), "left" = +y.
+- Same path as a skill's locate (`VisionSystem.locate` → `_locate_by_vote`,
+  gpt-4.1 closed-set reads, cross-camera vote). The differences: before every
+  locate the script clears kept scans, `last_seen` (the vote's tie-breaker)
+  and `tracked`, and turns scan reuse off. Elimination still counts as found,
+  as in a run; `resolved_by` says which way each locate was settled.
+- Ground truth without labels: placement with `read_all` stubbed to return
+  nothing, each container named by quadrant, then located again held to that
+  spot through `tracked` (same final localisation, labels not read). 3
+  repeats agreed within 0.0-0.2 mm. The names drawn on
+  `ground_truth_frames_printed/cam4.png` were checked by eye.
+- **Printed labels, 10 scans: 40/40 correct container**, mean |xy| offset
+  0.2 mm, max 0.4 mm. So any offset beyond ~1 mm in a handwritten set is a
+  wrong container, not localisation noise. ~14 s per locate.
+  - 35 of 40 had 4 of 4 cameras reading the label. The 5 others were 3 of 4:
+    cam 3 misread the red cabbage dish in scans 7-10 (as `10 ML WATER` twice,
+    `VEGETABLE OIL`, `BAKING SODA`), cam 2 read baking soda as `10 ML WATER`
+    in scan 10. The vote outvoted them each time.
+- **Bozhang's handwriting, 10 scans: 40/40 correct**, mean |xy| 0.2 mm, max
+  1.1 mm (baking soda). Square moved for this set; ground truth 3 repeats
+  within 0.4 mm. Red cabbage 3 of 4 cameras in 7 of 10 scans: **cam 3 read
+  it as `10 ML WATER` every time**. All other locates 4 of 4. Cam 3 now
+  misreads red cabbage on both printed and handwritten paper, so it is
+  probably that view rather than the writing (in cam 3 the paper is seen
+  sideways and at a low angle; not checked further).
+- Next: sets `rumi`, `aliyah` (`scan --set rumi`, …), run by the user. Each
+  appends to `scans.jsonl` and reprints the whole table.
+
+**Label distance test: how far a container can stand from its label (2026-10-29). All six phases run on the cell.**
+
+Cameras only, the arm never imported. `scripts/label_distance_test.py`, data
+in `experiments/label_distance_20261029/` (gitignored, 1.2 GB, local only;
+`report.md` there is the full per-spot table, `README.md` says what is where).
+
+**Results.** 3 locates by label per spot, 5-6 spots per phase, distance =
+how far x's centre moved from where it stood on its label, measured by hand.
+
+| x | phase | on own label | by label | by elim. | wrong | not found | farthest always by label | nearest missed by label |
+|---|---|---|---|---|---|---|---|---|
+| baking soda dish | labelled | 3/3 | 14/18 | 4/18 | 0 | 0 | 13.1 cm | 7.51 cm |
+| baking soda dish | unlabelled | 3/3 | 9/18 | 1/18 | 0 | 8/18 | 18 cm | 6 cm |
+| 10 ml water cup | labelled | 3/3 | 12/15 | 3/15 | 0 | 0 | 12.31 cm | 41 cm |
+| 10 ml water cup | unlabelled | 3/3 | 12/15 | 0/15 | 0 | 3/15 | 18 cm | 16 cm |
+| oil beaker | labelled | 3/3 | 12/15 | 3/15 | 0 | 0 | 20.8 cm | 31 cm |
+| oil beaker | unlabelled | 3/3 | 9/15 | 1/15 | 0 | 5/15 | 11.24 cm | 28.2 cm |
+
+- **Never wrong: 0 of 96 locates returned the other container.** A miss is
+  always "not found", never a wrong pick. With the other labels present,
+  **nothing was ever lost** (elimination caught every missed read).
+- **Centre distance is the wrong axis.** What decides a read is whether the
+  paper is still in the container's crop, i.e. whether the container still
+  touches or abuts its own sheet:
+  - water, unlabelled: **18 cm read 4/4 cams** (cup against the bottom edge
+    of its paper, `trials/10_ml_water_unlabelled/04/cloud_top.png`), **16 cm
+    not found** (cup out in the open between the dishes, bare table to the
+    paper, `.../02/cloud_top.png`);
+  - baking soda: 7.51 cm and 6 cm missed while 9-18 cm were read; the 6 cm
+    one was the dish sitting **on top of its own text** (user).
+  - Rule of thumb for now: **reliable while the container stands on or right
+    against its sheet with the text visible; gone once there is bare table
+    between them.** A hypothesis from two frames, not measured as an
+    edge-to-paper gap.
+  - The ground-truth spot is the container's centre on the sheet, near one
+    edge of the paper, so "N cm from the label spot" means different
+    things in different directions. Direction was not recorded.
+- **Elimination needs the partner's label, but a content read can stand in
+  for it.** With the papers removed it still fired twice (2 of 48 locates):
+  cam 5 read the red cabbage dish as `RED CABBAGE POWDER` from its red
+  powder (baking soda 6 cm), cam 2 read the water cup as `10 ML WATER`
+  (beaker 28.2 cm). The closed-set reader names containers from what they
+  hold. In the labelled phases elimination fired whenever x was far from its
+  paper: water 41 cm 3/3, beaker 31 cm 3/3, baking soda 7.51 cm 3/3.
+- **Far reads with 1 camera are suspect.** Baking soda labelled 44 cm 2/3
+  "by label" from a single camera and baking soda 18 cm unlabelled (1 cam)
+  were not checked against frames; given the above, likely content or a
+  neighbouring sheet, not the label. Treat "by label" on 1 camera far from
+  the paper as unconfirmed.
+- Localisation: ground truths repeated within 0.1-0.4 mm; on-label checks
+  landed 0.0-0.1 mm from them. The test does not measure absolute position.
+
+**Method.**
+- Bench: `LABEL_TEST` (red cabbage dish top-left, baking soda dish top-right,
+  10 ml water clear cup bottom-left, oil beaker bottom-right; top = away from
+  the arm, left = the arm's left). Same memory-free `VisionSystem.locate` as
+  the label reading benchmark above (imports its helpers).
+- Per x (baking soda dish, water cup, beaker), two phases (user's protocol):
+  `labelled` (other 3 labels on the bench) and `unlabelled` (other 3 papers
+  removed, containers left). Vote groups are {baking soda, red cabbage}
+  (`white bowl`) and {10 ml water, vegetable oil} (`clear plastic cup`), so
+  removing the papers takes away x's only elimination partner **with no code
+  switched off**. Switching elimination off in code was tried and reverted
+  the same day (user: it misrepresents the system on the bench).
+- Each phase: `ground-truth` (labels-off placement named by quadrant, 3 held
+  repeats, then 3 on-label checks by label), then `trials` (move x, type the
+  hand distance in cm, 3 locates by label). Scoring needs no camera
+  distance: only x moves, so a locate within 30 mm of the partner's
+  ground-truth spot is **wrong**, anywhere else is x; **by label** if ≥1
+  camera read x's label on it, else **by elimination**. A camera-measured
+  distance was written and dropped the same day: depth does not see the
+  clear containers, and the user wanted one hand method for all three.
+
+      python scripts/label_distance_test.py ground-truth --object "beaker" --phase unlabelled
+      python scripts/label_distance_test.py trials --object "beaker" --phase unlabelled
+      python scripts/label_distance_test.py report
+      python scripts/label_distance_test.py view-cloud --object beaker --npy .../trials/<set>/NN/cloud_raw.npy
+
+  Objects `"baking soda cup"`, `"10 ml water cup"`, `"beaker"` (the bench
+  name; it resolves by the `vegetable oil` label). `run` = ground-truth +
+  trials in one go. A second `trials` call numbers on from the phase's last
+  trial.
+- 3D view per trial (`cloud.png`, `cloud_top.png`, `cloud_mesh.ply`,
+  `cloud_raw.npy`): TSDF of the last locate's single-frame 848x480 capture,
+  x as the skills get it (clear containers as the model shell at the
+  silhouette fix), red dot + stem on each locate's `centroid`, green dot on
+  the label spot. Rendered in a fresh process (EGL headless, worked first
+  time); a failed render only warns.
+
+**What went wrong on the way (do not repeat).**
+- **Network:** the first beaker `labelled` ground truth had every label read
+  fail (`VLM label read failed: Connection error.`, 134 s per locate instead
+  of ~14 s); its 3 checks were logged as not found. Rerun once
+  `api.openai.com` answered: 3/3, `VEGETABLE OIL` on 4/4 cams. A locate with
+  no reads at all is now logged `no reads`, warned about, and left out of
+  every score (old rows recognised as not found + empty `all_reads`). Every
+  other locate that day had reads from 4 cams in 13-15 s.
+- **Trial numbering:** a second `trials` call restarted at 1, so baking soda
+  labelled 44 cm was logged as trial 1 again and overwrote the 9.35 cm
+  frames (jsonl intact). Fixed: numbering continues; the report keys spots
+  by (trial, distance). Baking soda labelled has no 3D views (ran before
+  that code).
+- **No memory behind the content reads** (checked in code): each read is a
+  stateless gpt-4.1 call with the crop and the 4 label strings only;
+  `fresh()` clears `scans`, `last_seen`, `tracked`, `seen_containers` and the
+  localizer cache before every locate; nothing is persisted.
+
+**Next, if this is picked up again.** Measure the gap from the container's
+edge to its sheet (and the direction) instead of centre distance; check
+the 1-camera far reads against their frames; try a red cabbage dish without
+powder (or a covered one) to see whether content reads stop.
