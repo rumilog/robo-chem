@@ -1,6 +1,6 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-10-29
+Last updated: 2026-11-04
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
@@ -155,8 +155,14 @@ python scripts/run_experiment.py --skill pour \
 
 - Corrupt `.intr` files (fy≈fx/2) were a major early failure mode; pipeline now
   prefers **live RealSense factory intrinsics**
-- Extrinsics: HSV green cube fiducial + Kabsch; install under robomail
-  `calib/` with dated backup
+- Extrinsics: a gripped cube (HSV-thresholded) swept through a pose grid,
+  the robot's TCP as reference. **Since 2026-10-10 the solve is the cube-model
+  fit** (`robochem/vision/cube_calibration.py`: joint soft-L1 least squares,
+  each camera's points on a cube of known size around the TCP, plus the table
+  plane). Median + Kabsch (the 2026-09-04 method) is only its starting guess
+  and was biased ~18 mm per camera; do not describe the calibration as
+  "Kabsch" (a paper draft did, 2026-10-28). Installed under robomail `calib/`
+  with dated backup
 - Scripts: `calibrate_cameras.py`, `validate_calibration.py`, `check_object.py`
 - Prompt `"plastic beaker"` detects the red translucent beaker more reliably
   than bare `"beaker"`
@@ -5345,3 +5351,159 @@ how far x's centre moved from where it stood on its label, measured by hand.
 edge to its sheet (and the direction) instead of centre distance; check
 the 1-camera far reads against their frames; try a red cabbage dish without
 powder (or a covered one) to see whether content reads stop.
+
+**RA-L paper template (2026-10-28, `paper/`). Builds clean in both modes.**
+- **All writing and sections live in `paper/main.tex` itself** (user,
+  2026-10-28): no `sections/` folder, no `\input` files. Beside it:
+  `ieeeconf.cls`, `references.bib` (the user's own, 4 entries as of
+  10-28), an empty `figures/`. Figures are framed `\placeholderfig` boxes so
+  it builds before any image exists.
+- **RA-L rules, read from ieee-ras.org on 2026-10-28** (summarised in the
+  header comment of `main.tex`):
+  - **Initial submission is IEEE *conference* format, `ieeeconf.cls`** from
+    the PaperCept pack (ras.papercept.net/conferences/support/files/ieeeconf.zip),
+    with `\overrideIEEEmargins`. IEEEtran `journal` is for the accepted
+    version only. The first draft of this template used IEEEtran journal for
+    submission, which was wrong.
+  - **Double-anonymous for all RAS journals since 2025-01-01.** The byline
+    stays, with no names; no acknowledgments or funding until accepted; own
+    work cited in the third person; no GitHub/YouTube/lab links.
+  - 6 pages with everything counted, references included; +2 at $175/page,
+    8 max. PDF >= 1.4, fonts embedded, no cover page.
+- **One switch:** `\camerareadyfalse` (default) gives the anonymous
+  `ieeeconf` submission; `\camerareadytrue` gives IEEEtran journal with
+  names, the capitalised RA-L running head, the first-page footnotes in
+  RA-L's order (received / recommended by / funding / affiliations / the
+  verbatim DOI line) and the acknowledgment.
+  - **`\documentclass` cannot sit inside an `\if...\else...\fi`**: the class
+    looks ahead and the `\else` branch runs too (an undefined
+    `\IEEEoverridecommandlockouts` under IEEEtran). The branch defines
+    `\loadpaperclass`, which is called after `\fi`.
+  - `ieeeconf` has no `\IEEEPARstart`, and its keywords environment is
+    `keywords`, not `IEEEkeywords`. Both are switched on the mode.
+- **Build (Windows):** MiKTeX 25.12 installed per-user with
+  `winget install --id MiKTeX.MiKTeX -e --scope user`, auto-install of
+  packages turned on (`initexmf --set-config-value="[MPM]AutoInstall=1"`).
+  Binaries in `%LOCALAPPDATA%\Programs\MiKTeX\miktex\bin\x64` (not yet on
+  the PATH of an already-open shell). Then `cd paper && latexmk -pdf main`.
+  The TinyTeX download-and-run script was refused by the auto-mode
+  permission check; winget was not.
+- **Checked on the 2026-10-28 build** (pypdf + pypdfium2 renders): both
+  modes are US Letter, PDF 1.5, every font embedded, PDF Author empty;
+  submission is 3 pages of placeholders. One harmless 1.6 pt overfull vbox
+  from the placeholder floats.
+- **Overleaf: upload `ieeeconf.cls` with `main.tex`** (2026-10-28). It is
+  not in TeX Live, so on Overleaf `\documentclass{ieeeconf}` failed and the
+  user switched the line to `IEEEtran`, which broke `\overrideIEEEmargins`
+  and the `keywords` environment (both ieeeconf-only). Now `main.tex`
+  checks `\IfFileExists{ieeeconf.cls}`: if missing it builds with IEEEtran
+  conference mode, maps `keywords` to `IEEEkeywords`, and prints a red
+  warning on page 1. Tested all three builds (ieeeconf, missing cls,
+  camera-ready). Locally MiKTeX also has an unrelated CTAN `IEEEconf.cls`
+  (loads `article`) that Windows' case-insensitive lookup can match; the
+  copy in `paper/` takes precedence.
+- **Positioning agreed with the user (2026-10-28): chemistry on the
+  human's terms.** The robot adapts to a lab set up for people, instead of
+  the lab being instrumented for the robot. "Like a human" is always made
+  concrete as P1-P5 in the introduction: P1 reads the printed protocol, P2
+  ordinary bench (no fixtures/tags/precise placement), P3 identifies
+  containers by human-written labels, P4 looks again before each action
+  (rescan per skill), P5 handles things by what they are (planner-set
+  speed, angles, depths). There is no P6: the user decided (2026-10-28)
+  the paper does not mention checking the outcome at all, since the system
+  won't have it (robot runs use `--no-verify`). The same P1-P5 are the columns of Table I
+  (Related Work, rows left blank for the user to fill from the papers)
+  and the structure of Experiments (one ablation each: single camera vs.
+  vote; locate once vs. rescan; fixed slow/fast vs. planner speed).
+  - Avoid "human reasoning", "thinks like a chemist", "human-level", and
+    "weak labels" (reads as weak supervision; say "human-readable labels").
+    Don't claim labels beat AprilTags; claim pose comes from the cloud, so
+    the label only needs to carry identity.
+  - **Title deliberately unchanged** (user: "do not change the title yet").
+  - Two claims must match the code version used for experiments: P4
+    (scan reuse when nothing moved, added 2026-10-22, not yet on the
+    robot) and P5 (speed, added 2026-10-27, not yet on the robot).
+  - **`main.tex` holds TODOs and advice only, no drafted prose** (user,
+    2026-10-28). Prose drafted for the abstract, introduction,
+    contributions and captions was turned back into per-paragraph
+    TODO guidance; our row of Table I is blank until experiments fill it.
+    The user then wrote the introduction themselves; on request I fixed
+    its spelling/grammar (keeping their wording) and wrote the three
+    contribution bullets in the same plain voice, each with a `\todo` for
+    its number. Write prose only where the user asks, and match their
+    voice: no dashes, no "not only X but Y", no stock AI words.
+  - Open in the intro: it calls the five properties a "five-step
+    verification system", but the robot runs used `--no-verify`, so the
+    word claims something the system doesn't do. Outcome checking was
+    dropped from Limitations/Conclusion; the user has to pick the word.
+  - **What the four cited papers actually do (2026-10-29, read via arXiv;
+    the user should confirm against their copies).** Baselines are tied
+    to these, so the comparison is against prior methods, not strawmen.
+    - ORGANA (arXiv 2401.06949): Grounding DINO + SAM + depth, poses from
+      PCA, explicitly "without the use of AprilTags". Perceives once at
+      startup (~20 s), no online replanning; the *user* grounds each
+      detected vessel's function. Plans via CLAIRify -> XDL -> PDDLStream.
+      Pours closed-loop on scale weight; no per-object speed. Baselines:
+      manual and CLAIRify-style workflow; metrics are user interaction
+      time, NASA-TLX, SUS. So do NOT cite ORGANA for "fiducials"; it is
+      the source for the perceive-once and user-assigned-identity baselines.
+    - Yoshikawa et al. / CLAIRify (arXiv 2303.14100, the conference
+      version of the cited journal paper): LLM -> XDL with an iterative
+      verifier, PDDLStream TAMP, Franka Panda + Robotiq 2F-85, scale and
+      stirrer instruments. Evaluated mostly on plan quality vs. SynthReader.
+    - AgentChemist (arXiv 2603.23886): Qwen3-VL planner/supervisor agents
+      plus a VLA policy on Mobile ALOHA (Piper arms). ResNet50 instrument
+      detection; Discussion says it "relies on pre-set instrument layouts".
+      Ablates the LLM (Qwen3 vs Qwen2 vs non-LLM) and reports standard vs.
+      disturbed layout (98% vs 94% success): both are protocols worth
+      mirroring.
+    - Chemistry3D (arXiv 2406.08160): Omniverse simulation toolkit; no
+      baselines in the abstract.
+  - **Perturbation experiment (E1), agreed 2026-10-29:** two conditions
+    only: perceive once with identity fixed at the start (ORGANA's method)
+    vs. re-scan every skill + read labels (ours). Events: none / move a
+    cup / swap two identical cups, seeded schedule replayed in both
+    conditions, 5 trials per cell = 30 short chains (pick->pour->place).
+    A "re-scan, identity by position only" middle condition was proposed
+    and dropped by the user: identical cups of white powder (baking powder
+    vs. citric acid) cannot be told apart without the label, so it adds
+    nothing. Say that reason in the paper in case a reviewer asks whether
+    the gain comes from re-scanning or from the labels. Still needs a
+    "locate once" flag; check the swap case with scan reuse on first.
+- **Citations: only papers the user has read** (user, 2026-10-28). The
+  first draft cited 14 references written from memory (SayCan, SAM,
+  MuJoCo, FrankaPy, ...); none were vetted, and the user's `references.bib`
+  replaced them. Those `\cite`s are removed; `main.tex` cites only the 4
+  entries in the user's `.bib`. Related Work and System Overview now say
+  "Add papers" / "(cite)" where a reference is still needed. Do not put
+  references into the paper from memory: suggest them in chat and let the
+  user choose. Before submitting, also run the PDF through the PaperCept
+  PDF check.
+- **Label experiments added to the paper (2026-11-04).** Sec. VII-C
+  (`\label{sec:exp_labels}`) now has two data tables copied from the two
+  2026-10-29 entries above: `tab:label_reading` (printed 40/40, 0.2/0.4 mm,
+  35/40 all-4-cams; handwriting 1 40/40, 0.2/1.1 mm, 33/40; rows for
+  handwriting 2-3 left `\tbd`) and `tab:label_distance` (the six phase rows,
+  total 96 locates: 68 by label, 12 by elimination, 0 wrong, 16 not found).
+  The ablation table's P3 vote row is 80/80 at ~14 s; the single-camera row
+  is `\tbd`, to be scored offline from each camera's read in `scans.jsonl`.
+  Everything around the tables is TODO guidance, not prose (protocol,
+  headline, the cam 3 misreads, content reads standing in for labels, why
+  elimination was not switched off in code), plus a TODO in Sec. IV-B
+  saying "by label" / "by elimination" / "not found" must be defined there
+  first, TODOs with the numbers in the abstract and contribution 2, and a
+  labels TODO in Limitations. Writers are not named (double-anonymous).
+  `makecell` added to the preamble.
+  - **The raw data is not on the laptop**: `experiments/` is gitignored,
+    so `label_benchmark_20261029/` and `label_distance_20261029/` live
+    only on the robot PC. The table numbers came from progress.md, and the
+    "33/40" was derived from its prose (red cabbage 3/4 cams in 7 of 10
+    scans). Check both tables against `report.md` there before submitting.
+  - Local build: 5 pages, no errors; the only overfull box is Table I's
+    (5.5 pt, pre-existing). The local `references.bib` still has 4 entries
+    while the text cites ~20 keys, so most citations show as `[?]` locally;
+    that is the user's bib, not touched.
+- The Experiments comment lists the runs already in this file (2026-10-08
+  31/31 in 2177 s, the 10-15/10-19/10-20 runs, the 10-22 chain). These were
+  single development runs on changing code; the results tables need repeated
+  trials on one frozen code version.

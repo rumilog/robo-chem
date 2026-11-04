@@ -1,0 +1,836 @@
+%% =====================================================================
+%% robo-chem -- IEEE Robotics and Automation Letters (RA-L) submission
+%% =====================================================================
+%% Build: latexmk -pdf main
+%%        (or pdflatex main && bibtex main && pdflatex main && pdflatex main,
+%%        or upload paper/ to Overleaf)
+%%
+%% RA-L rules this file follows (ieee-ras.org/publications/ra-l, checked
+%% 2026-10-28 -- re-check before submitting):
+%%  * Length: 6 pages in two-column format, EVERYTHING included (figures,
+%%    tables, references, appendices). Up to 2 more pages at $175/page,
+%%    8 pages absolute maximum. Per-section budgets are in the comment
+%%    above each section: ~5.3 pages of body + ~0.7 page of references.
+%%  * Initial submission: IEEE conference format, ieeeconf.cls from the
+%%    PaperCept support pack (shipped next to this file), letter paper.
+%%  * Final (accepted) version: IEEE journal format, IEEEtran.cls, with the
+%%    RA-L running head and first-page footnotes. Flip \camerareadytrue below.
+%%  * Double-anonymous review (all RAS journals since 2025-01-01): leave a
+%%    byline but no names or affiliations; no acknowledgments or funding
+%%    until accepted; cite your own work in the third person ("In [3]...",
+%%    never "our earlier work"); no identifying links (GitHub, YouTube,
+%%    lab pages) -- use https://anonymous.4open.science/ if needed; no lab
+%%    names/logos/faces in figures or the video.
+%%  * No cover page. Submit as PDF >= 1.4 with all fonts embedded; run it
+%%    through the PaperCept PDF check before uploading.
+%%  * Keywords: 2-5, the first two from the RA-L keyword list. They are
+%%    also entered in PaperCept.
+%%  * One optional video/multimedia zip (<= 50 MB, ReadMe.txt +
+%%    Summary.txt). It may not carry extra text or results.
+%% =====================================================================
+
+% ---- Submission vs. final version -----------------------------------
+% \camerareadyfalse: anonymous initial submission (ieeeconf, conference)
+% \camerareadytrue:  accepted version (IEEEtran journal, names, footnotes)
+\newif\ifcameraready
+\camerareadyfalse
+
+% \documentclass cannot sit inside an \if branch (it looks ahead past the
+% \else), so the branch only picks the class and it is loaded after \fi.
+%
+% ieeeconf.cls is NOT part of TeX Live/Overleaf: it comes from the PaperCept
+% pack and must sit next to main.tex (upload it to Overleaf too). If it is
+% missing, the paper still builds with IEEEtran's conference mode, but page 1
+% carries a red warning: that is not the format RA-L asks for.
+\newif\ifieeeconfmissing
+\ifcameraready
+  \newcommand{\loadpaperclass}{%
+    \documentclass[letterpaper, 10pt, journal, twoside]{IEEEtran}}
+\else
+  \IfFileExists{ieeeconf.cls}{%
+    \newcommand{\loadpaperclass}{%
+      \documentclass[letterpaper, 10pt, conference]{ieeeconf}%
+      \IEEEoverridecommandlockouts  % enables \thanks and the keywords block
+      \overrideIEEEmargins}         % required by PaperCept (printer margins)
+  }{%
+    \ieeeconfmissingtrue
+    \newcommand{\loadpaperclass}{%
+      \documentclass[letterpaper, 10pt, conference]{IEEEtran}%
+      \IEEEoverridecommandlockouts}
+  }
+\fi
+\loadpaperclass
+\ifieeeconfmissing
+  % IEEEtran calls ieeeconf's keywords environment IEEEkeywords.
+  \newenvironment{keywords}{\begin{IEEEkeywords}}{\end{IEEEkeywords}}
+  \typeout{*** ieeeconf.cls not found: built with IEEEtran conference mode.
+    Put ieeeconf.cls next to main.tex before submitting to RA-L. ***}
+\fi
+
+% ---- Packages -------------------------------------------------------
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{makecell}      % two-line table headers
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{balance}       % evens the columns on the last page
+\usepackage[hidelinks]{hyperref}
+% Keep author names out of the PDF metadata while under review.
+\ifcameraready\else\hypersetup{pdfauthor={}, pdfcreator={}}\fi
+
+\graphicspath{{figures/}}
+
+% ---- Drafting helpers (delete before submission) --------------------
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\note}[1]{\textcolor{blue}{[#1]}}
+\newcommand{\tbd}{\textcolor{red}{--}}
+% Framed stand-in so the paper compiles before figures exist.
+% Usage: \placeholderfig{width}{height}{what goes here}
+\newcommand{\placeholderfig}[3]{%
+  \fbox{\parbox[c][#2][c]{#1}{\centering\footnotesize\textcolor{gray}{#3}}}}
+
+% Shorthand used throughout
+\newcommand{\sysname}{RoboChem}   % \todo{pick the system's name}
+\newcommand{\eg}{e.g.,\ }
+\newcommand{\ie}{i.e.,\ }
+
+% Index terms: 2-5; the first two must come from the RA-L keyword list
+% (https://www.ieee-ras.org/publications/ra-l/keywords).
+\newcommand{\paperkeywords}{AI-Enabled Robotics, Task Planning, Perception
+for Grasping and Manipulation, Robotics and Automation in Life Sciences}
+% \todo{confirm against the RAS keyword list}
+
+% ---- Running head (final version only) -------------------------------
+% Wording required by RA-L; IEEEtran sets it in capitals.
+\ifcameraready
+\markboth{IEEE Robotics and Automation Letters. Preprint Version. Accepted Month, Year}
+{Author \MakeLowercase{\textit{et al.}}: \sysname: Short Title}
+\fi
+
+\begin{document}
+\bstctlcite{IEEEexample:BSTcontrol}
+
+
+\ifcameraready
+\title{\sysname: From a Printed Instruction Sheet to a Completed
+Chemistry Experiment on a Robot Arm}
+\else
+\title{\LARGE \bf \sysname: From a Printed Instruction Sheet to a Completed
+Chemistry Experiment on a Robot Arm}
+\fi
+% \todo{working title -- revisit once the results section is written}
+
+\ifcameraready
+  % First-page footnotes in the order RA-L lists them. The DOI line is
+  % required verbatim. Fill the dates and editor from the acceptance email.
+  \author{First Author$^{1}$, \todo{author list}, and Amir Barati Farimani$^{1}$%
+  \thanks{Manuscript received: Month, Day, Year; Revised Month, Day, Year;
+  Accepted Month, Day, Year.}%
+  \thanks{This paper was recommended for publication by Editor
+  Editor A.\ Name upon evaluation of the Associate Editor and Reviewers'
+  comments.}%
+  \thanks{This work was supported by \todo{funding}.}%
+  \thanks{$^{1}$Department of Mechanical Engineering, Carnegie Mellon
+  University, Pittsburgh, PA 15213, USA. \todo{check affiliations and emails}}%
+  \thanks{Digital Object Identifier (DOI): see top of this page.}}
+\else
+  % RA-L: leave space for the byline, but no author information.
+  \author{Anonymous Author(s)}
+\fi
+
+\maketitle
+\ifcameraready\else
+  \thispagestyle{empty}
+  \pagestyle{empty}
+\fi
+\ifieeeconfmissing
+  \noindent\todo{ieeeconf.cls not found, so this is IEEEtran conference
+  format, not the RA-L submission format. Put ieeeconf.cls next to
+  main.tex (on Overleaf: upload it to the project).}
+\fi
+
+% =====================================================================
+% Abstract: 150-200 words, one paragraph, no citations.
+% Positioning (agreed 2026-10-28): the robot does chemistry on the human's
+% terms -- it adapts to a lab set up for people instead of the lab being
+% instrumented for the robot. "Like a human" is always made concrete by
+% the properties P1-P5 in the introduction; avoid "human reasoning",
+% "thinks like a chemist" and "human-level".
+% Shape: human lab -> automation inverts it -> what we built -> result.
+% Index terms: set in \paperkeywords in the preamble.
+% =====================================================================
+\begin{abstract}
+\todo{1-2 sentences: how people do a bench protocol -- a printed sheet,
+containers labelled by hand and set down loosely, looking again before
+each step.}
+\todo{1 sentence: the contrast -- lab automation usually makes the lab
+readable to the robot (fixed stations, fiducials/barcodes, scripts).}
+\todo{2-3 sentences: what the system does, one clause per property --
+reads the photographed protocol (P1), works on an ordinary bench (P2),
+identifies containers by their written labels across cameras (P3),
+re-perceives before every skill call (P4), sets how each skill runs,
+including speed, from what is handled (P5).}
+\todo{Result: one end-to-end number (runs, sub-tasks completed,
+interventions, time) and one number each from the label and perturbation
+experiments. Label number available now (Sec.~\ref{sec:exp_labels}): 80/80
+locates found the right container on printed and handwritten labels, and
+0 of 96 returned the wrong container when it was moved away from its
+label. Pick one; the first is the easier one to state in a clause.}
+\todo{Takeaway: one step closer to a robot doing bench chemistry the way
+people do. Avoid "human reasoning", "thinks like a chemist",
+"human-level".}
+\end{abstract}
+
+\ifcameraready
+\begin{IEEEkeywords}\paperkeywords\end{IEEEkeywords}
+\else
+\begin{keywords}\paperkeywords\end{keywords}
+\fi
+
+% =====================================================================
+% I. Introduction -- budget ~0.9 page (with the teaser figure)
+% Paragraphs: (1) how a person does a bench protocol, (2) automation
+% makes the lab robot-readable instead, (3) "on the human's terms" made
+% concrete as P1-P5, (4) how the system realizes each,
+% (5) contributions. P1-P5 are reused as the columns of Table I and as
+% the structure of Sec. VII, so keep the labels stable.
+% =====================================================================
+\section{Introduction}
+\label{sec:intro}
+A student running a bench protocol works from a printed instruction sheet.
+The reagents sit in containers that have been labelled by hand and set down
+wherever there was room, and identical cups are told apart only by their
+labels. The bench is shared, so a cup may not be where it was a minute ago;
+the student looks again before each step and finds it. The student also
+adjusts each step to what is being handled, carrying an empty cup quickly and
+a full one slowly. None of this is arranged for a robot: the instructions,
+the labels and the layout are all meant for people. 
+
+Existing robots for automated experiments mostly adapt the experiment's
+procedure, objects and layout to the system. The instructions have to be
+written as a script or in a chemical programming
+language~\cite{steiner2019organic,mehr2020universal,fakhruldeen2022archemist};
+every container and instrument needs a fixed or known
+position~\cite{burger2020mobile,dai2024autonomous}; and some systems
+identify containers by fiducial markers such as AprilTags rather than by
+the labels placed with them~\cite{yoshikawa2022chemistry}. This makes
+automated experiments fast and accurate, but at the cost of flexibility: a
+new experiment requires substantial manual reprogramming instead of simply
+handing the system a printed instruction sheet, and if an object is moved
+during the experiment, the run may not be able to continue.
+
+This work aims to close this gap by letting a robotic system adapt to a lab
+arranged for people. We make this goal concrete as five properties. Our system,   \sysname{}, (P1)~starts from the printed instruction sheet, with no manual
+rewriting into a script; (P2)~works on an ordinary bench, where containers
+need no fixed or preset positions and no visual markers; (P3)~tells
+identical-looking containers apart by their hand-written or printed labels;
+(P4)~looks at the bench again before every step, so it finds objects that
+have been moved; and (P5)~adapts how each step is executed (how fast to move, how far to tip, how deep to dig) to what is handled and what the step asks for. Section~\ref{sec:related}
+compares related work along these properties (Table~\ref{tab:related}), and
+Section~\ref{sec:experiments} evaluates each of them.
+
+\begin{figure}[t]
+  \centering
+  \placeholderfig{0.95\columnwidth}{4.2cm}{Teaser: the printed sheet
+  (left) $\rightarrow$ the robot at a bench of loosely placed,
+  hand-labelled cups (centre) $\rightarrow$ the finished experiment
+  (right)}
+  \caption{\todo{One sentence that states the framing on its own: the
+  robot runs the worksheet the way a student would, from the printed
+  sheet, on a bench of loosely placed, hand-labelled containers.}}
+  \label{fig:teaser}
+\end{figure}
+
+We implement \sysname{} with all five properties on a Franka Panda arm
+(Fig.~\ref{fig:teaser}). (P1)~A vision-language model (VLM) extracts the
+steps from a photo of the sheet, and a planner turns them into parameterized
+calls to a fixed set of skills. (P2)~SAM~3~\cite{carion2026sam3} segments
+objects in four camera views, and positions come from multi-view geometry:
+the depth point cloud for opaque objects and silhouettes for transparent
+ones. The system only needs a list of the objects on the bench (with the
+size of each transparent container), not their positions. (P3)~The VLM
+reads each container's label in every view, and the cameras vote.
+(P4)~Before each skill call, the target is located again if it has been
+handled or its image has changed. (P5)~The VLM chooses each call's pour
+angle from the wording of the step and its speed from what is held; a fixed
+rule sets the angles when the same container is poured from, or into, more
+than once, and the scoop depth comes from the measured powder surface.
+
+The contributions of \sysname{} are as follows:
+% Add each bullet's headline number once the experiments are run.
+\begin{itemize}
+  \item A system that carries out a chemistry experiment on a Franka Panda
+  arm from a photo of the printed instruction sheet, on an ordinary bench
+  with no fixed positions or markers for the containers.
+  \todo{end-to-end result}
+  \item A way to tell identical-looking containers apart by their
+  hand-written or printed labels, which they stand on, read in each of four
+  camera views and combined by a cross-camera vote. Because the position of
+  each container comes from multi-view geometry, the label only needs to say
+  what the container is and can be placed loosely.
+  \todo{identification accuracy: e.g.\ "found the right container in all
+  80 locates with printed and handwritten labels, and never picked the
+  wrong one in 96 locates with containers moved off their labels"
+  (Tables~\ref{tab:label_reading}, \ref{tab:label_distance}). Update the
+  80 once the other handwriting sets are scanned.}
+  \item Re-locating and re-identifying the containers before every step,
+  so the robot finds a container a person has moved between steps, even
+  among identical-looking ones. We compare this against locating objects
+  once at the start. \todo{perturbation result}
+\end{itemize}
+% Bullet 3: if scan reuse (progress.md, 2026-10-22) is on in the evaluated
+% code, say "before every skill call unless nothing has moved".
+
+
+% =====================================================================
+% II. Related Work -- budget ~0.6 page incl. Table I. Short paragraphs;
+% end each with how this work differs. Table I carries the positioning:
+% fill each row FROM THE PAPER ITSELF (only papers you have read and put
+% in references.bib). Use \checkmark, a dash, or a short word ("partial",
+% "sim only") -- do not guess.
+% =====================================================================
+\section{Related Work}
+\label{sec:related}
+
+\textbf{Robotic chemists and lab automation.}
+Much of the reliability of automatic laboratories~\cite{tom2024self}
+comes from adapting the experiment to the robot system. Procedures are written as scripts or in a chemical programming language~\cite{steiner2019organic,mehr2020universal,fakhruldeen2022archemist};
+robots work between fixed stations, with fixed sample racks and taught
+paths~\cite{dai2024autonomous,lunt2024modular}, and one localizes at each
+station by touching a calibration cube to within
+$\pm$0.12\,mm~\cite{burger2020mobile}; and containers or devices are
+identified or localized with fiducial markers such as AprilTags or QR
+codes~\cite{yoshikawa2022chemistry,angers2025roboculture,vescovi2023modular}.
+More recently, large language models generate procedures from natural
+language and pass them to liquid handlers or cloud
+platforms~\cite{boiko2023autonomous,bran2024augmenting} or to robot arms at
+the bench~\cite{yoshikawa2023large,darvish2025organa,wei2026agentchemist,zhang2025robochemist}. The closest to our system is
+ORGANA~\cite{darvish2025organa}: it also uses a Franka arm and perceives
+transparent glassware without markers, but the user assigns the role of each
+identical-looking vessel at start-up, and it does not replan online. As
+Table~\ref{tab:related} shows, none of these systems starts from a printed
+instruction sheet, tells containers apart by reading their labels, or is
+evaluated with a person moving objects mid-run.
+
+
+\textbf{Language models for robot planning.}
+The role of language models in robotics has grown from turning
+instructions into skill sequences, programs or
+trajectories~\cite{ahn2022saycan,singh2023progprompt,liang2023code,huang2023voxposer}
+to setting execution parameters and closing the loop. For execution
+parameters, Code as Policies~\cite{liang2023code} and
+IROSA~\cite{knauer2026irosa} adjust speed in response to a user's
+natural-language corrections, and ELLMER~\cite{monwilliams2025embodied} selects contact
+forces from object properties. For closed-loop operation, Inner
+Monologue~\cite{huang2022inner} re-detects the scene after every step, and
+BioProVLA-Agent~\cite{du2026bioprovla} uses a VLM to check conditions before
+and after each sub-task. Our system does not leave execution entirely to the
+model: the model chooses the pour angle from the wording of the step and the
+speed from what is held, a fixed rule assigns the angles when the same
+container is poured from, or into, more than once, and the scoop depth comes
+from the measured powder surface.
+
+\textbf{Identifying objects in the lab.}
+Fiducial markers such as AprilTags~\cite{olson2011apriltag,wang2016apriltag}
+give both an exact identity and a pose, but every object needs its own tag,
+and the offset from each tag to its object must be calibrated, which is
+fragile and time-consuming to maintain~\cite{angers2025roboculture}.
+Open-vocabulary models~\cite{liu2024grounding,carion2026sam3} need no
+markers, but they find objects by category and cannot tell identical-looking
+containers apart. Robots have identified objects by reading the text printed
+on them with OCR~\cite{sharma2023semantic,liu2021robot,khan2025shake}. We
+read the hand-written or printed label that each container stands on and
+combine the reads across four views; the label only says what the container
+is, while its position comes from multi-view geometry, so the same label can
+be read by both people and the robot.
+
+
+\begin{table}[t]
+  \caption{Comparison along the properties of Sec.~\ref{sec:intro}:
+  P1 instruction input, P2 no fixed positions or markers, P3 container
+  identification, P4 re-perception before each step, P5 adapted execution.
+  \checkmark: yes; $\circ$: partial; --: no or not reported.}
+  \label{tab:related}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}lcccccc@{}}
+    \toprule
+    System & P1 & P2 & P3 & P4 & P5 & Platform \\
+    \midrule
+    Chemputer~\cite{steiner2019organic,mehr2020universal} & script & -- & -- & -- & -- & Fluidic \\
+    Burger et al.~\cite{burger2020mobile}       & script & -- & --      & --      & --      & Mobile arm \\
+    Coscientist~\cite{boiko2023autonomous}      & text   & -- & --      & --      & --      & Liquid handler \\
+    CLAIRify~\cite{yoshikawa2023large}          & text   & $\circ$ & markers & $\circ$ & --      & Arm \\
+    ORGANA~\cite{darvish2025organa}             & text   & $\circ$ & user    & --      & --      & Arm \\
+    AgentChemist~\cite{wei2026agentchemist}     & text   & $\circ$ & --      & $\circ$ & $\circ$ & Dual-arm \\
+    RoboChemist~\cite{zhang2025robochemist}     & text   & $\circ$ & --      & $\circ$ & $\circ$ & Dual-arm \\
+    \midrule
+    \sysname{} (ours)                           & photo  & \checkmark & labels & \checkmark & \checkmark & Arm \\
+    \bottomrule
+  \end{tabular}
+  % Fill our row only with what the experiments show. P5 (planner-set
+  % speed) had not run on the robot as of 2026-10-27, and P4 depends on
+  % whether scan reuse is on in the evaluated code version.
+\end{table}
+
+% =====================================================================
+% III. System Overview -- budget ~0.4 page incl. the architecture figure.
+% Hardware, software split, the data flow in Fig. 2. Keep it short: the
+% next three sections carry the detail.
+% =====================================================================
+\section{System Overview}
+\label{sec:overview}
+
+\textbf{Hardware.} 
+
+The system runs on a Franka Emika Panda arm with a Franka Hand
+parallel-jaw gripper. Four Intel RealSense D415 RGB-D cameras are mounted
+on a cage around the bench and view it from different sides; their
+extrinsics are calibrated to the robot base with a cube held by the gripper,
+which is used only for calibration. The bench holds ordinary lab equipment:
+shallow white dishes of powdered reagents, clear plastic cups, a plastic
+beaker, a plastic transfer pipette standing in a lidded paper cup, and a
+3D-printed scoop, stirrer, and stirrer holder. Each container is stacked on a
+slip of paper with its contents written or printed on it.
+
+\textbf{Software.} 
+The system runs as two processes: the segmentation model
+SAM~3~\cite{carion2026sam3} runs as a separate GPU service, which the
+program controlling the arm calls over the local network. The agents follow
+the modular structure of PLATO~\cite{car2026plato} and consist of four
+parts. An instruction parser extracts the goal, steps, reagents and
+equipment from the photo of the sheet. A scene agent matches the objects
+seen by the four cameras to the names in the list of bench objects. A
+planner decomposes the goal into ordered sub-tasks and replans when a step
+fails. Before each sub-task, a skill-call agent produces one skill call from
+the measured state of the gripper; its output is constrained by a JSON
+schema to a fixed set of skills. The scene agent uses GPT-4.1 mini and the
+other three use GPT-4.1. \todo{probably needs to be changed}
+Each manipulation skill performs its own perception, grasp
+analysis and motion, and checks during execution that it has reached its
+target.
+
+\textbf{Data flow.} \todo{Walk through Fig.~\ref{fig:architecture} in 4-5
+sentences.}
+
+\begin{figure*}[t]
+  \centering
+  \placeholderfig{0.95\textwidth}{5.0cm}{Architecture: instruction image
+  $\rightarrow$ scene agent $\rightarrow$ planner $\rightarrow$ skill-call
+  agent $\rightarrow$ skills (perception + motion) $\rightarrow$ checks
+  $\rightarrow$ report; sim twin shown alongside}
+  \caption{\todo{System architecture.}}
+  \label{fig:architecture}
+\end{figure*}
+
+% =====================================================================
+% IV. Perception -- budget ~0.7 page.
+% Source material: progress.md "Calibration / perception notes",
+% the 2026-10-10 recalibration entries, label voting (2026-10-20).
+% =====================================================================
+\section{Multi-View Perception}
+\label{sec:perception}
+
+\subsection{Open-Vocabulary Segmentation and 3D Fusion}
+
+At every object identification request, SAM is run on each of the four cameras and ranks objects it sees to closeness of the object being searched for. The top 2 camera's scans which are closest to the object prompted are kept as the truth for pointcloud identification to go off of, because other cameras might not have a view of the label or object. The points identified are then bak-projected onto the pointcloud scan to get the 3d location of where the gripper arm should go to in order to complete the requested action on the requested object. 
+
+\subsection{Reading Human-Written Labels (P3)}
+
+Human labels are placed adjacent to objects that are ambiguous to humans
+as well
+
+\todo{Identical clear cups told apart by reading their labels in each view
+with the VLM, then a vote across cameras; ties resolved by the last known
+position. Make the trade-off explicit: pose comes from segmentation and
+the fused cloud, so the label only has to carry identity, and text does
+that with no setup, no placement constraint, and is readable by people.
+Do not claim it beats fiducials at what fiducials do (exact ID and pose).}
+
+\todo{The experiments in Sec.~\ref{sec:exp_labels} report locates found
+"by label" and "by elimination", so this subsection has to define both
+first. (1)~Each camera's crop of each candidate is read by the VLM as a
+closed-set choice among the label strings on the bench, not free OCR.
+(2)~Containers of the same kind form a vote group (the two white dishes;
+the clear cup and the beaker). (3)~Elimination: if no camera reads the
+wanted label but every other label in the group is placed firmly (two or
+more cameras) on another container, the one container left is the
+answer (\texttt{robochem/vision/\_\_init\_\_.py}, \texttt{eliminate}). (4)~If
+neither works the locate returns "not found" rather than a guess; say so
+here, because the distance test shows this is why misses are never wrong
+picks.}
+
+\todo{Say where the label must be for a read to work, from the distance
+test: the label is read when it is inside the container's crop, i.e.\ the
+container stands on or right against its slip of paper. The user's
+sentence above says "adjacent"; keep that, and make it match what was
+measured.}
+
+\begin{figure}[t]
+  \centering
+  \placeholderfig{0.95\columnwidth}{3.5cm}{Four camera views with masks
+  and the fused point cloud}
+  \caption{\todo{Perception pipeline output on the real bench.}}
+  \label{fig:perception}
+\end{figure}
+
+% =====================================================================
+% V. Manipulation Skills -- budget ~0.9 page incl. Table I.
+% One short paragraph per skill family; put parameters in Table I rather
+% than in prose. Say how each skill detects its own failure.
+% =====================================================================
+\section{Manipulation Skills}
+\label{sec:skills}
+
+\todo{Common structure: scan (P4) $\rightarrow$ localize $\rightarrow$
+plan motion $\rightarrow$ execute $\rightarrow$ check. Execution adapted
+to what is handled (P5): every call carries a speed (0--100) chosen by the
+planner, where 0 is the slowest, careful pace used for liquids and 100 is
+2.5$\times$ faster (robochem/skills/pacing.py), alongside pour angle and
+scoop depth.}
+
+\textbf{Grasping.} \todo{Upright top grasp, width = measured diameter
+minus squeeze; yaw alignment for tools lying at an angle.}
+
+\textbf{Scoop and dump.} \todo{Stroke chosen from the powder-height map;
+force-guarded descent; dump with shake and wrist twist; sideways headings
+when reach limits the tip angle.}
+
+\textbf{Pour.} \todo{Lip of held cup placed over the target; tip-angle
+tracking and stall detection.}
+
+\textbf{Stir and tool return.} \todo{Circular stir path inside the cup;
+stirrer re-seated in its holder; scoop returned to its pick site.}
+
+\begin{table}[t]
+  \caption{Skill library. \todo{fill}}
+  \label{tab:skills}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}lll@{}}
+    \toprule
+    Skill & Key parameters & Failure check \\
+    \midrule
+    \texttt{pick\_up} & \tbd & \tbd \\
+    \texttt{scoop}    & \tbd & \tbd \\
+    \texttt{dump}     & \tbd & \tbd \\
+    \texttt{pour}     & \tbd & \tbd \\
+    \texttt{stir}     & \tbd & \tbd \\
+    \texttt{place}    & \tbd & \tbd \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% =====================================================================
+% VI. Instruction Following and Planning -- budget ~0.5 page.
+% Source: robochem/agents/, robochem/orchestrator/agent_orchestrator.py,
+% robochem/agents/reporter.py. Name the model(s) and version used for the
+% reported runs.
+% =====================================================================
+\section{From Instruction Sheet to Skill Calls}
+\label{sec:planning}
+
+\textbf{Instruction parsing.} \todo{Photographed sheet $\rightarrow$
+goal and ordered steps.}
+
+\textbf{Scene grounding.} \todo{Scene agent maps the bench photos to the
+inventory; reagent-named containers.}
+
+\textbf{Planning and skill calls.} \todo{Planner emits sub-tasks; the
+skill-call agent fills parameters under a strict JSON schema over a closed
+skill vocabulary; the executor fills tool geometry from CAD and carries
+measured offsets between steps.}
+
+\textbf{Execution, recovery and reporting.} \todo{Preflight reach check,
+step-through mode, resume from a record, photos after each pour, and the
+experiment report written after the run.}
+
+% =====================================================================
+% VII. Experiments -- budget ~1.2 pages. This is the section reviewers
+% read most closely. State the protocol, the number of trials, and what
+% counts as success BEFORE giving numbers.
+%
+% Data that already exists (see progress.md; check before quoting):
+%   - 2026-10-08 full Magic Beaker run: 31/31 sub-tasks, 2177 s, no replans
+%     (experiments/agent_run_20261008_221001.json)
+%   - 2026-10-15 / 10-19 / 10-20 runs with their failures and resumes
+%   - 2026-10-22 four-item jellyfish chain timings
+% Most of these were single runs during development. A results table for
+% the paper needs repeated trials with a fixed code version.
+%
+% Label experiments, 2026-10-29 (cameras only, arm never moved). These ARE
+% repeated trials on one code version and go into Sec. VII-C as they are:
+%   - Label reading benchmark, printed vs handwritten
+%     (scripts/label_reading_benchmark.py,
+%     experiments/label_benchmark_20261029/ on the robot PC only)
+%   - Label distance test, labelled vs unlabelled
+%     (scripts/label_distance_test.py,
+%     experiments/label_distance_20261029/ on the robot PC only)
+% The raw data (scans.jsonl, report.md) is gitignored and not on the
+% laptop; every number below was copied from progress.md. Check the
+% tables against report.md on the robot PC before submitting.
+% =====================================================================
+\section{Experiments}
+\label{sec:experiments}
+
+% Structure follows P1-P5: one subsection per claim, each with a baseline.
+% The human-lab framing commits us to a messy setup: loosely placed and
+% handwritten labels, and a person perturbing the bench. Trials on a
+% carefully arranged bench undercut the claim.
+
+\subsection{Setup and Protocols}
+\todo{Tasks (\eg Magic Beaker, jellyfish, single-skill trials), number of
+trials, how the bench is set up (labels placed by hand, layouts varied),
+models used, success definitions, and the code version.}
+
+\subsection{End-to-End from the Printed Protocol (P1, P2)}
+\todo{Full runs from the photographed sheet: sub-tasks completed, replans,
+human interventions, wall-clock time, final outcome (colour change).
+Table~\ref{tab:e2e}.}
+
+\subsection{Identifying Containers by Their Labels (P3)}
+\label{sec:exp_labels}
+
+\todo{Shared protocol, 2-3 sentences, before either result. Four
+containers in a square in front of the arm: two identical white dishes
+(red cabbage powder, baking soda), a clear cup (10\,ml water) and a
+plastic beaker (vegetable oil), each standing on its paper label. The
+reader chooses among exactly these 4 label strings. Cameras only; the arm
+does not move. Each locate is the same call a skill makes, with every
+memory cleared first (kept scans, last known position, tracked objects),
+so no locate is helped by the one before. Ground truth: each container's
+position located with label reading switched off and named by its
+corner, repeated 3 times (agreed within 0.4\,mm). Score: right container,
+wrong container, or not found; about 14\,s per locate with all four
+cameras.}
+
+\textbf{Label legibility.} \todo{2-3 sentences. Same bench, labels swapped
+between sets: printed, then handwritten by different people; 10 locates
+of each container per set (Table~\ref{tab:label_reading}). Result: every
+locate found the right container, with a mean position offset of 0.2\,mm.
+Point out that the vote is doing work: single cameras did misread
+(camera 3 read the red cabbage dish as another label on both printed and
+handwritten paper, probably because it sees that paper sideways at a low
+angle), and the other cameras outvoted it every time. This is the
+single-camera vs.\ vote ablation (Table~\ref{tab:ablations}): the
+per-camera reads are already in \texttt{scans.jsonl}, so the single-camera
+row can be computed offline without new robot time. Do not name the
+writers (double-anonymous review).}
+
+\begin{table}[t]
+  \caption{\todo{Caption: what a set is, that the last column counts
+  locates where all four cameras read the right label, and that offsets
+  are from the label-free ground truth.}}
+  \label{tab:label_reading}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}lcccc@{}}
+    \toprule
+    Label set & Locates & Correct & \makecell{Offset (mm)\\mean / max} & \makecell{All 4 cameras\\read it} \\
+    \midrule
+    Printed       & 40   & 40/40     & 0.2 / 0.4  & 35/40 \\
+    Handwriting 1 & 40   & 40/40     & 0.2 / 1.1  & 33/40 \\
+    Handwriting 2 & \tbd & \tbd/\tbd & \tbd       & \tbd  \\
+    Handwriting 3 & \tbd & \tbd/\tbd & \tbd       & \tbd  \\
+    \bottomrule
+  \end{tabular}
+  % Handwriting 1 = the first handwritten set of 2026-10-29. Its "33/40"
+  % comes from progress.md: red cabbage read by 3 of 4 cameras in 7 of 10
+  % scans, every other locate 4 of 4. Handwriting 2 and 3 are the planned
+  % sets (scan --set NAME); fill from report.md once scanned, or delete
+  % the rows. If you mean to call any set "bad handwriting" in the text,
+  % put an example crop of each set in a figure so the reader can judge.
+\end{table}
+
+\textbf{Distance from the label.} \todo{3-4 sentences. One container at a
+time is moved away from its label to 5-6 spots, 3 locates per spot, 96
+locates in all; the distance is the hand-measured move of its centre.
+Two phases per container: the other three labels left on the bench, and
+removed (Table~\ref{tab:label_distance}). Headline: none of the 96 locates
+returned the wrong container; a miss is always "not found". With the
+other labels present nothing was lost, because elimination found the
+container whenever its own label was out of view. With them removed,
+16 of 48 locates were not found. Then the finding that matters for
+setting up a bench: centre distance does not predict a read. What does is
+whether the container still stands on or against its paper (the water cup
+was read 18\,cm from its spot against the edge of its paper, and missed at
+16\,cm with bare table in between). Say this is seen in a few frames and
+not measured as an edge-to-paper gap.}
+
+\begin{table}[t]
+  \caption{\todo{Caption: one container moved per row, 3 locates per
+  spot; "others' labels" says whether the other three labels stayed on
+  the bench; "wrong" is a locate that returned another container.}}
+  \label{tab:label_distance}
+  \centering
+  \footnotesize
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{@{}llccccc@{}}
+    \toprule
+    Moved container & \makecell{Others'\\labels} & Locates & \makecell{By\\label} & \makecell{By\\elim.} & Wrong & \makecell{Not\\found} \\
+    \midrule
+    \multirow{2}{*}{Baking soda dish} & on  & 18 & 14 & 4 & 0 & 0 \\
+                                      & off & 18 &  9 & 1 & 0 & 8 \\
+    \midrule
+    \multirow{2}{*}{Water cup}        & on  & 15 & 12 & 3 & 0 & 0 \\
+                                      & off & 15 & 12 & 0 & 0 & 3 \\
+    \midrule
+    \multirow{2}{*}{Oil beaker}       & on  & 15 & 12 & 3 & 0 & 0 \\
+                                      & off & 15 &  9 & 1 & 0 & 5 \\
+    \midrule
+    Total                             &     & 96 & 68 & 12 & 0 & 16 \\
+    \bottomrule
+  \end{tabular}
+  % From progress.md "Label distance test" (2026-10-29). Spots ran from
+  % about 6 cm to 44 cm; the farthest spot that was always read by label
+  % was 11-21 cm depending on the container. If there is room, a column
+  % "farthest always read" (13.1, 18, 12.3, 18, 20.8, 11.2 cm) helps, but
+  % keep the caveat that direction from the paper was not recorded.
+\end{table}
+
+\todo{Two caveats belong in the text, not only in Limitations.
+(1)~Elimination fired 2 times with the other papers removed because the
+reader named a container from what it holds (the red powder read as RED
+CABBAGE POWDER; the water cup as 10 ML WATER). Report it honestly: the
+"off" rows are not a clean "no other labels" condition. (2)~A few
+far-away "by label" reads came from a single camera and were not checked
+against the frames; count them as by label but say so, or check the
+frames first.}
+
+\todo{Why elimination was not switched off in code for the "off" phase:
+taking the other papers away removes the container's only elimination
+partner without changing the system, so the bench test runs the same
+code as a real run. One sentence; a reviewer may ask.}
+
+\subsection{Robustness to People Moving Things (P4)}
+\todo{A person moves or swaps a container between steps at random.
+Ablation: re-perceive before every skill vs.\ locate once at the start
+(Table~\ref{tab:ablations}). Also report the cost: full scans took
+11.6--15.3\,s per skill in the 2026-10-22 chain (progress.md).}
+
+\subsection{Execution Adapted to What Is Handled (P5)}
+\todo{Whole-protocol time and spills or failures with planner-set speed
+vs.\ fixed slow (speed 0) vs.\ fixed fast (Table~\ref{tab:ablations}).
+Not yet run on the robot as of 2026-10-27.}
+
+\begin{table}[t]
+  \caption{Ablations, one per property. \todo{fill}}
+  \label{tab:ablations}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}llcc@{}}
+    \toprule
+    Property & Condition & Success & Time (s) \\
+    \midrule
+    \multirow{2}{*}{P3 labels}  & Single camera        & \tbd & \tbd \\
+                                & Cross-camera vote    & 80/80 & 14 \\
+    % P3: the vote row is the label reading benchmark (printed + first
+    % handwritten set, ~14 s per locate). Single camera: score each
+    % camera's own read in scans.jsonl against ground truth, same 80
+    % locates. Update both rows when more handwriting sets are added.
+    \midrule
+    \multirow{2}{*}{P4 rescan}  & Locate once at start & \tbd & \tbd \\
+                                & Before every skill   & \tbd & \tbd \\
+    \midrule
+    \multirow{3}{*}{P5 speed}   & Fixed slow           & \tbd & \tbd \\
+                                & Fixed fast           & \tbd & \tbd \\
+                                & Planner-set          & \tbd & \tbd \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Skill-Level Results}
+\todo{Keep short. Repeated trials per skill: success rate, time, and a
+measured quantity (\eg powder mass per scoop, tip angle reached, poured
+volume).}
+
+\begin{table}[t]
+  \caption{Per-skill results on the real robot. \todo{fill}}
+  \label{tab:skill_results}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}lccc@{}}
+    \toprule
+    Skill & Success & Time (s) & Measured quantity \\
+    \midrule
+    Pick (beaker/cup) & \tbd/\tbd & \tbd & \tbd \\
+    Pick (scoop)      & \tbd/\tbd & \tbd & \tbd \\
+    Scoop             & \tbd/\tbd & \tbd & \tbd \\
+    Dump              & \tbd/\tbd & \tbd & \tbd \\
+    Pour              & \tbd/\tbd & \tbd & \tbd \\
+    Stir              & \tbd/\tbd & \tbd & \tbd \\
+    Tool return       & \tbd/\tbd & \tbd & \tbd \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[t]
+  \caption{End-to-end runs from the photographed protocol. \todo{fill}}
+  \label{tab:e2e}
+  \centering
+  \footnotesize
+  \begin{tabular}{@{}lcccc@{}}
+    \toprule
+    Protocol & Runs & Sub-tasks done & Interventions & Time (min) \\
+    \midrule
+    Magic Beaker & \tbd & \tbd & \tbd & \tbd \\
+    Jellyfish    & \tbd & \tbd & \tbd & \tbd \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Failure Analysis}
+\todo{Where runs stopped and why: reach limits on far containers, label
+ties, network/API errors, scoop jams. A small breakdown figure or table.}
+
+\begin{figure}[t]
+  \centering
+  \placeholderfig{0.95\columnwidth}{3.5cm}{Key-frame strip of one full run}
+  \caption{\todo{Key frames from an end-to-end run.}}
+  \label{fig:keyframes}
+\end{figure}
+
+% =====================================================================
+% VIII. Limitations -- budget ~0.25 page. Be specific; reviewers trust a
+% paper more when it names its own failure modes.
+% =====================================================================
+\section{Limitations}
+\label{sec:limitations}
+
+\todo{Where the robot still falls short of a person. Measuring amounts:
+no closed-loop measurement of dispensed mass. Reach limits at the far edge of the
+bench. Occlusion of the scoop bowl underside (measured depth is a lower
+bound). Reliance on a hosted VLM. One bench and a small set of
+protocols.}
+
+\todo{Labels, from Sec.~\ref{sec:exp_labels}: a label is only read while
+the container stands on or against it, so a container a person puts
+down away from its paper is found only by elimination, or not at all if
+the other labels are gone too. When it fails, it reports "not found"
+rather than picking the wrong container. Each locate takes about 14\,s
+and needs the hosted VLM; with the network down, a locate took 134\,s and
+read nothing. The labels tested were 4 short strings on one bench.}
+
+% =====================================================================
+% IX. Conclusion -- budget ~0.1 page. 3-4 sentences, no new claims.
+% =====================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+
+\todo{A robot that does bench chemistry on the human's terms (P1--P5),
+the headline result, and the next step.}
+
+% Acknowledgments and funding are added only after acceptance.
+\ifcameraready
+\section*{Acknowledgment}
+\todo{Lab members, funding, hardware.}
+\fi
+
+\balance
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
