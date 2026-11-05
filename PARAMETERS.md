@@ -42,7 +42,7 @@ limit; *estimate* = engineering judgement, no data.
 | Parameter | Value | Source | Status |
 |---|---|---|---|
 | Stroke | fixed: heading 0°, centre line | the user's choice; the map-chosen stroke behaved differently run to run | FROZEN |
-| `depth_from_map` | on: surface = scan level over the first `entry_patch` 12 mm of the fixed stroke (where the bowl enters). The bowl descends until the tip is on that surface, then digs in until the tip is `map_tip_depth` 16 mm under it, never nearer than 3 mm to the floor. Floor rule when no level can be read | the user's choice | FROZEN |
+| `depth_from_map` | on: surface = scan level over the first `entry_patch` 12 mm of the fixed stroke (where the bowl enters). The bowl descends until the tip is on that surface, then digs in until the tip is `map_tip_depth` **10 mm** under it (was 16: the floor stopped every scoop of 2026-11-05), never nearer than 3 mm to the floor, so the surface decides on any bed over 13 mm. The level is read even where the wrist-reach model calls the stroke out of reach, and without the rim band (a dish heaped over its rim lost 98% of its points to it). Floor rule when no level can be read | the user's choice; 10 mm = the 10.2-10.6 mm under the surface that the 8 scoops of 2026-11-05 dug and that worked | FROZEN (not yet on the robot) |
 | `tip_floor_gap`: head's lowest point over the inside floor | 3 mm | bench | FROZEN |
 | `floor_thickness` | 8 mm | measured dish | FROZEN |
 | `DISH_SCOOP_Z_OFFSET` | −5 mm | bench (−11 mm pressed 6 mm into the floor, 2 of 5 jammed) | FROZEN |

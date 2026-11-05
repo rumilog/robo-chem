@@ -6100,10 +6100,17 @@ inspected frame by frame.
   20:33 / 20:48 / 21:09 partial (keep-going passed over failed dumps and a
   beaker pick), 21:39 interrupted, 11-05 12:07 ✓, **14:08 ✗** (step 2 scoop
   jammed in the citric dish at +30° then +55°, arm faulted, steps 3-19
-  INFEASIBLE), **14:13 ✓** (31/31). Jellyfish (pipette/dispense version)
-  **15:06 ✗** (spoon lost on the lift, step 1), **15:10** stopped at step 5
-  (stirrer at x 0.77 clamped to 0.75), **15:17 ✓** (20/20). The 14:08-15:17
-  runs were not in this file before this entry.
+  INFEASIBLE), **14:13 ✓** (31/31). Jellyfish (pipette/dispense version,
+  `instructions/jellyfish.jpg`): **15:06 ✗** and **15:10 ✗** were both stopped
+  by hand and wrote no record, for the same cause: a tool past the x 0.75 hand
+  clamp. 15:06: spoon at x 0.777, grasp clamped to 0.75, closed 16.6 mm off,
+  lost on the lift twice. 15:10: spoon at x 0.72 worked, steps 1-4 ok; the
+  stirrer at x 0.770 was clamped to 0.75 and the log ends mid-close in step 5.
+  **15:17 ✓** (20/20, ~19 min, `run_20261105_151754/agent_run_20261105_153705.json`)
+  with the spoon at x 0.720 and the stirrer at x 0.710: no clamp. Preflight
+  does not move tools, so spoon/stirrer holders past x ~0.74 still have to be
+  brought in by hand before a run. The 14:08-15:17 runs were not in this file
+  before this entry.
 - **"31/31" is the skills' own report, not the chemistry outcome.** Since
   today a short pour returns success (`tip_short_of`), keep-going passes over
   failures, and the photo checker is wrong on white powder into water (s10).
@@ -6121,3 +6128,146 @@ inspected frame by frame.
   and interventions counted; the P4 perturbation test against locate-once;
   per-skill quantities on a scale (g per scoop, ml poured); an offline P1
   parse test on many worksheet photos; P5 ablation or drop P5 as a claim.
+
+### 2026-11-05 — What the scoop actually did today: always floor-limited
+
+- 8 scoops in the three runs that still have logs (12:07, 14:13, 15:17): **3
+  built a map, 5 did not** ("under 4 map cells where the default stroke
+  bites", the rim band). All 8 dug to the **same depth, head 3 mm over the
+  inside floor**. The 3 maps read the bed 13.2-13.6 mm over the floor and
+  asked for 16 mm, so each was "floor-limited" at 10.2-10.6 mm under the
+  surface. With no map the rim-based guess gives 16.9-17.9 mm "under the
+  surface", the same floor height. So `depth_from_map` changed only the
+  first-stage stop ("Down to the powder surface at the entry"): the mapped
+  level, or with no map the rim height. It never changed where the dig ended.
+- On a ≥15 mm bed (the protocol) the map would let the tip stop above the
+  floor; on today's ~13 mm beds it did not.
+- The 14:08, 15:06 and 15:10 run folders (and 12:03) are now in the Trash,
+  moved by the user; the entry above still describes them.
+
+### 2026-11-05 — Scoop reach: the jams are at r ≥ 0.631, not x > 0.60
+
+- Every scoop in every console log (experiments/ and the Trash), one row per
+  distinct dish position: **43 ok, up to r 0.631** (x ≤ 0.617, |y| ≤ 0.187).
+  **All 3 jams at r 0.631-0.640**: (0.604, +0.183), and 14:08's citric dish at
+  (0.599, -0.222) twice. Each "JAMMED" was the robot refusing the motion
+  (`cartesian_motion_generator_joint_velocity_discontinuity`, 0.0 mm moved),
+  i.e. the wrist's reach, not the bowl on the floor. The 14:08 dish passed
+  `SCOOP_MAX_X` 0.60 (x 0.599) and the arm was left in the dish.
+- So the preflight dish check should be a radius (r ≤ ~0.62), not x. The
+  dishes are too wide to be moved by preflight. Proposed to the user, not
+  changed.
+- Today's spoon tool offsets ranged 44.1-52.7 mm and every scoop that ran
+  came back "Successfully scooped", so the 43-47 mm grasp is not shown to
+  cause empty scoops.
+
+### 2026-11-05 — Scoop depth now set by the powder surface (offline only, not yet on the robot)
+
+The user: depth from the powder surface, and not only on a bed over 19 mm.
+
+- **Why the surface never decided:** two causes. (1) `map_tip_depth` 16 mm +
+  `tip_floor_gap` 3 mm: on today's 13-17 mm beds the floor always bound.
+  (2) **All 5 of today's "No powder map" scoops** (and both 14:08 tries) had
+  "the default stroke is past the wrist-reach model; running it anyway".
+  `_choose_line` then `continue`d past that stroke, so its level was never
+  read, although the scan had 3-18 cells at the entry. The message blamed the
+  rim band, which was not the cause.
+- **Changes (`scoop.py`):** a fixed stroke's level is read even when the reach
+  model calls it out of reach (it runs anyway). `map_tip_depth` 0.016 →
+  **0.010**: the 8 scoops today dug 10.2-10.6 mm under the measured surface and
+  worked, so 10 mm is the bite they had. The 3 mm floor gap stays as the hard
+  limit; it binds only on a bed under 13 mm, where it prints "floor-limited".
+- **Replayed on today's 8 saved npz** (real `_choose_line`, stub stroke
+  placement -29/+52 mm): every scoop now gets a level, beds 13.2-17.2 mm over
+  the inside floor, and every one is "surface decides": tip 10 mm under the
+  surface, 3.2-7.2 mm over the floor. Before, all 8 were at 3.0 mm over the
+  floor. So on the fuller beds (red cabbage 17.2, baking soda 16.6) the bite is
+  now up to 4 mm shallower than today's. Watch the amount on those.
+- Not changed: stroke, angles, sweep, descent, compliance. The paper's P5 line
+  ("scoop depth comes from the measured powder surface") is true from this
+  change on.
+
+### 2026-11-05 16:05 — Jellyfish baking soda scoop "a bit too much": the rim band hid a heaped dish (fixed, offline only)
+
+- `experiments/run_20261105_160132/` (the jellyfish run started after the
+  10 mm change), step 2. The dish was heaped: scan centre z 24.4 mm, rim 17.8
+  (`npz`, unshifted frame), measured top 20.5 (shifted). The rim band (keep z
+  < rim − 3 mm) kept **173 of 22564 points (2%)**, so no level, so the floor
+  rule: tip 3 mm over the floor = **25.7 mm under the powder**. The user: the
+  amount was a bit too much. The 10 mm rule never ran.
+- Fix (`scoop.py` `_choose_line`): **no rim band for a fixed stroke**. Its
+  entry patch is 17-29 mm from the centre, the band only mattered for "auto"
+  lines near the wall. Replayed with the real `_choose_line` on all 9 of
+  today's npz: the 8 earlier ones read within 0-1.1 mm of before; 16:05 now
+  reads a 24.8 mm bed, tip 10 mm under it (14.8 mm over the floor, 15.7 mm
+  shallower than what ran).
+- `map_tip_depth` left at 10 mm: the "too much" came from the floor fallback,
+  not from 10 mm. A run already going keeps the old code.
+
+### 2026-11-05 16:01 jellyfish run: 17/20, the pipette was "not found"; consensus for the pipette now in x, y only (offline only)
+
+- `experiments/run_20261105_160132/agent_run_20261105_161938.json`:
+  finished_with_failures. Steps 1-17 ok; **18 pick_pipette failed twice:
+  "Cameras could not agree on 'pipette'"**; 19 (dispense) and 20 (place the
+  pipette) then infeasible. Step 2 is the over-deep baking soda scoop above.
+- Console l.1038-1090: cam 2 under the 0.5 score floor (0.33, 0.26), cam 3 no
+  mask / 0.40, leaving cams 4 and 5: (0.396, 0.174, **0.122**) and (0.409,
+  0.162, **0.072**). 18 mm apart in x, y, 50 mm in z, 52.8 mm in 3D over the
+  50 mm `consensus_tolerance`. Two cameras that disagree are both refused.
+  The 15:17 run saw the same cams 4/5 split (cam 4 rejected at 25 mm) but had
+  cam 2 to pair with cam 5, and the pick worked at bulb (0.398, 0.172).
+- Cause: a thin upright transparent tube; each camera's mask covers a
+  different stretch of it, so the centroids differ in height, not position.
+- Fix (`robochem/vision/__init__.py`): `XY_CONSENSUS_OBJECTS = {"pipette"}`;
+  for those, `_filter_by_consensus` compares centroids in x, y only (log
+  prints `max_pair xy=` / `pairwise xy=`). Every other object is unchanged.
+  Checked on the logged centroids: 16:01 cams 4+5 → accepted (17.9 mm);
+  15:17 cams 2/4/5 → all three accepted. Grasp height still comes from the
+  99th-percentile top of the fused cloud. Not run on the robot yet.
+- Resume from 18 (gripper empty after 17, indicator already in the other
+  clear cup): the usual jellyfish command without `--reset`, plus
+  `--resume latest --from-step 18`.
+
+### 2026-11-05 — Final photo at the end of every run
+
+- The user: why is the final result never photographed? Photos were taken
+  only after `pour` (`SNAPSHOT_AFTER`); checks only after pour/dump. The
+  jellyfish run ends with dispense and putting the pipette back, so its result
+  had no picture. Dispense also ends with the arm lifted over the cup, in the
+  cameras' view, so adding it to `SNAPSHOT_AFTER` would mostly photograph the
+  arm.
+- Now `AgentOrchestrator._finish` takes one photo per camera when the run ends
+  (any outcome with at least one executed step, not in dry runs):
+  `photos/s<NN>_final_cam<k>.jpg`, NN = last sub-task + 1, paths in the
+  record as `final_photos`. The arm goes home first, but only if the last step
+  succeeded (after a failure it may be stuck). The reporter
+  (`robochem/agents/reporter.py`) shows them as one more group, "the end of
+  the run".
+- `test_agents_offline.py` 138/138 (the photo test now expects the end photo).
+  Not on the robot yet. A resume to step 18 will take it at the end.
+
+### 2026-11-05 16:01 + 16:22 resume — Jellyfish 20/20 (one resume); first robot use of the 10 mm scoop and the pipette xy consensus
+
+`experiments/run_20261105_160132/`: `agent_run_20261105_161938.json` (16:01,
+1-17 ok, 18-20 failed: pipette not found, see above, 1081 s) and
+`agent_run_20261105_162619.json` (resume `--from-step 18`, 18-20 ok, 200 s).
+About 21 min of robot time in all, plus one hand restart.
+
+- **Pipette xy consensus, on the robot:** all four cameras accepted
+  (`max_pair xy` 11.4-15.4 mm; z 0.083-0.124), top z 0.1385, bulb
+  (0.406, 0.168). Bulb 17.4 → 2.3 mm squeezed, tip felt contact 30 mm under the
+  rim of the other clear cup, drew for 3 s, then 3 drops into the first clear
+  cup (each squeeze to 4.4 mm against a 4.2 target). **The user, at the
+  bench: the jellyfish effect appeared** (asked whether the purple drops sank
+  through the oil, spread like a jellyfish and turned blue; answered "有的").
+  A bench observation only: no photo of it.
+- **10 mm scoop rule, on the robot (step 12, red cabbage):** map built, bed
+  16.5 mm over the floor, "tip 10.0mm under the surface" (not floor-limited).
+  The s13 check: the 20 ml water turned dark purple ("ok"). Step 2 (baking
+  soda) still ran the old rim-band path (floor, 25.7 mm under; "a bit too
+  much"); the rim-band fix came after this process started.
+- Checks: s03 baking soda into water "suspect" (the usual white-into-clear
+  miss), s09 oil pour "ok", s13 "ok".
+- **No final photo:** the resume started 16:22:58, before `_final_photos`
+  was added, so it ran the old code. `write_report.py --bench jellyfish`
+  photographs the bench as it is now if it has not been cleared.

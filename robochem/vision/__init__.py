@@ -26,6 +26,13 @@ from .label_resolver import (LabelResolver, labels_match, looks_like_label_query
 #: the table at -9.9 to -11.6 mm. The sim's table is at 0 and does not use this.
 REAL_TABLE_Z = -0.0112
 
+#: Tall thin objects whose cameras agree on x, y but not z: each sees a
+#: different stretch of it. The pipette standing in its cup, 2026-11-05
+#: 16:01: cams 4 and 5 were 18 mm apart in x, y and 50 mm in z (cam 4 the
+#: bulb, cam 5 lower down), 52.8 mm over the 50 mm tolerance, cam 2 was under
+#: the score floor, and the pick failed twice with "could not agree".
+XY_CONSENSUS_OBJECTS = {"pipette"}
+
 
 def triangulate_rays(rays):
     """
@@ -1282,7 +1289,8 @@ class VisionSystem:
             return None
 
         agreed, rejected = self._filter_by_consensus(
-            by_camera, confidences=confidences
+            by_camera, confidences=confidences,
+            xy_only=object_name in XY_CONSENSUS_OBJECTS,
         )
         rejected = list(score_rejected) + list(rejected)
         if not agreed:
@@ -1317,9 +1325,12 @@ class VisionSystem:
             result.update(extra)
         return result
 
-    def _filter_by_consensus(self, by_camera: dict, confidences: dict = None):
+    def _filter_by_consensus(self, by_camera: dict, confidences: dict = None,
+                             xy_only: bool = False):
         """
         Keep the largest set of cameras whose centroids all agree pairwise.
+        With ``xy_only`` the centroids are compared in x, y only (see
+        XY_CONSENSUS_OBJECTS).
 
         Median-of-all fails when two wrong views and two right views form
         separate clusters: everyone is far from the global median and the
@@ -1341,6 +1352,11 @@ class VisionSystem:
         centroids = {
             c: np.asarray(by_camera[c].mean(axis=0), dtype=float) for c in cam_ids
         }
+        shown = dict(centroids)
+        if xy_only:
+            # Zeroing z keeps every distance below in x, y; the tie-break on
+            # mean z then falls through to the tighter cluster.
+            centroids = {c: v * np.array([1.0, 1.0, 0.0]) for c, v in centroids.items()}
         tol = float(self.consensus_tolerance)
 
         def clique_key(subset):
@@ -1372,8 +1388,8 @@ class VisionSystem:
         if len(cam_ids) == 2 and len(best) < 2:
             d = np.linalg.norm(centroids[cam_ids[0]] - centroids[cam_ids[1]])
             for c in cam_ids:
-                print(f"    cam {c}: centroid={np.round(centroids[c], 4)} "
-                      f"pairwise={d:.4f}m REJECT")
+                print(f"    cam {c}: centroid={np.round(shown[c], 4)} "
+                      f"pairwise{' xy' if xy_only else ''}={d:.4f}m REJECT")
             return [], cam_ids
 
         accepted = best
@@ -1381,7 +1397,7 @@ class VisionSystem:
 
         for c in cam_ids:
             if c in accepted and len(accepted) == 1:
-                print(f"    cam {c}: centroid={np.round(centroids[c], 4)} "
+                print(f"    cam {c}: centroid={np.round(shown[c], 4)} "
                       f"OK (singleton cluster)")
                 continue
             if c in accepted:
@@ -1389,12 +1405,12 @@ class VisionSystem:
                     np.linalg.norm(centroids[c] - centroids[o])
                     for o in accepted if o != c
                 ]
-                print(f"    cam {c}: centroid={np.round(centroids[c], 4)} "
-                      f"max_pair={max(dists):.4f}m OK")
+                print(f"    cam {c}: centroid={np.round(shown[c], 4)} "
+                      f"max_pair{' xy' if xy_only else ''}={max(dists):.4f}m OK")
             else:
                 refs = accepted or [o for o in cam_ids if o != c]
                 d = min(np.linalg.norm(centroids[c] - centroids[o]) for o in refs)
-                print(f"    cam {c}: centroid={np.round(centroids[c], 4)} "
+                print(f"    cam {c}: centroid={np.round(shown[c], 4)} "
                       f"dist_from_cluster={d:.4f}m REJECT")
 
         return accepted, rejected

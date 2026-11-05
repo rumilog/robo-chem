@@ -751,7 +751,13 @@ def test_the_bench_is_photographed_after_each_pour():
     orchestrator, llm, skills = build(responses, snapshot=snapshot)
     outcome = orchestrator.run("make the magic beaker")
     steps = outcome.record["steps"]
-    check("photographed after each pour and nothing else", taken == [2, 3], f"{taken}")
+    # 5: the end-of-run photo after the last sub-task (4), added 2026-11-05.
+    check("photographed after each pour and at the end, nothing else",
+          taken == [2, 3, 5], f"{taken}")
+    check("the end-of-run photos are in the record",
+          outcome.record.get("final_photos") == ["/tmp/s05_final_cam2.jpg",
+                                                 "/tmp/s05_final_cam3.jpg"],
+          f"{outcome.record.get('final_photos')}")
     check("the paths are in the pour's step record",
           steps[1]["photos"] == ["/tmp/s02_pour_cam2.jpg", "/tmp/s02_pour_cam3.jpg"]
           and steps[0]["photos"] == [], f"{[s['photos'] for s in steps]}")

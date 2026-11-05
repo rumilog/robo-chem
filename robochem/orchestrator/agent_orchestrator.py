@@ -44,6 +44,7 @@ import re
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -982,12 +983,39 @@ class AgentOrchestrator:
         record["replans"] = replans
         record["seconds"] = round(time.time() - started, 1)
         record["steps"] = [s.as_dict() for s in steps]
+        if steps and self.snapshot is not None:
+            record["final_photos"] = self._final_photos(steps)
         path = self._write_log(record)
         self._say(f"\n[{outcome}] {reason}")
         if path:
             self._say(f"[log] {path}")
         return TaskOutcome(success, outcome, goal, reason, replans, list(steps),
                            record, path)
+
+    def _final_photos(self, steps) -> List[str]:
+        """
+        One photo per camera of the bench once the run is over, as
+        s<NN>_final_cam<k>.jpg after the last sub-task. Photos were only taken
+        after pours, so the jellyfish run, which ends with dispense and putting
+        the pipette back, had no picture of its result (2026-11-05). The arm
+        goes home first, out of the cameras' view, but only if the last step
+        succeeded: after a failure it may be stuck, and is left where it is.
+        """
+        last = steps[-1]
+        if last.success:
+            try:
+                self.skills.go_home()
+            except Exception as exc:
+                self._say(f"   [photos] could not home before the final photo: {exc}")
+        try:
+            paths = [str(p) for p in (self.snapshot(
+                SimpleNamespace(index=last.subtask_index + 1),
+                SimpleNamespace(skill="final")) or [])]
+            self._say(f"   [photos] {len(paths)} of the bench at the end of the run")
+            return paths
+        except Exception as exc:
+            self._say(f"   [photos] no final photo: {type(exc).__name__}: {exc}")
+            return []
 
     def _write_log(self, record: dict) -> Optional[str]:
         if not self.log_dir:

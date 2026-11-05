@@ -541,7 +541,17 @@ def write_report(records: Sequence[dict], *, camera: Optional[BenchCamera] = Non
         facts["photos_taken"] = time.strftime("%Y-%m-%d %H:%M:%S")
 
     content = [llm_client.text_block("FACTS:\n" + json.dumps(facts, default=str))]
-    content += _run_photo_blocks(executed_steps(records), out, shown, max_run_photos,
+    run_steps = list(executed_steps(records))
+    # The end-of-run photos (AgentOrchestrator._final_photos), as one more group.
+    for n, rec in enumerate(records, start=1):
+        if rec.get("final_photos"):
+            last = [st for st in run_steps if st.get("session") == n]
+            run_steps.append({"subtask_index": (int(last[-1].get("subtask_index") or 0) + 1
+                                                if last else 1),
+                              "session": n,
+                              "subtask": "the end of the run, every sub-task done",
+                              "photos": rec["final_photos"]})
+    content += _run_photo_blocks(run_steps, out, shown, max_run_photos,
                                  record_paths or [])
     for cam, frame in overview:
         keep(frame, f"overview_cam{cam}.jpg", f"camera {cam}, overview")

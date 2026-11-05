@@ -369,8 +369,14 @@ class ScoopSkill(BaseSkill):
             # Back on later on 2026-11-04 with the fixed stroke: from the floor
             # alone, a thin bed left the bowl's mouth above the powder and the
             # log called a 9 mm bed 20 mm (the rim). No map: the floor rule.
+            # 0.016 -> 0.010 on 2026-11-05 (the user: depth from the powder,
+            # not only on a bed over 19 mm). At 16 mm the floor gap stopped
+            # all 8 scoops of that day (beds 13.2-13.6 mm read), so the surface
+            # never set the depth. Those 8 scoops dug 10.2-10.6 mm under the
+            # measured surface and worked, so 10 mm is that bite, now held on
+            # any bed over 13 mm; the floor gap stays as the hard limit.
             "depth_from_map": True,
-            "map_tip_depth": 0.016,
+            "map_tip_depth": 0.010,
             # Refuse before moving if the bed under the bite is thinner than
             # this above the floor gap: nothing to scoop there. Was 6 mm; on
             # 2026-11-04 the red cabbage dish, dug down in the middle by the
@@ -589,7 +595,12 @@ class ScoopSkill(BaseSkill):
         # rim and the bank against the wall (median 23.8 mm against 18.5 on
         # the centre line), none of which the bowl, 8 mm off the wall, digs.
         keep = np.linalg.norm(rel, axis=1) <= reach_limit
-        if rim_z is not None:
+        # Not for a fixed stroke: its entry patch is 17-29 mm from the centre,
+        # far inside the wall, and a dish heaped over its rim (2026-11-05
+        # 16:05, centre 6 mm over the rim) lost 98% of its points to the band,
+        # had no level, and dug from the floor 26 mm under the powder: too
+        # much. Without the band today's other 8 scans read within 1.1 mm.
+        if rim_z is not None and not fixed:
             keep &= P[:, 2] < float(rim_z) - float(params["map_rim_band"])
         cell = max(0.002, float(params["map_cell"]))
         cells = {}
@@ -609,7 +620,12 @@ class ScoopSkill(BaseSkill):
             for s, (start, t) in fits.items():
                 if not reach_ok(h, s, start, t):
                     unreachable.append((h, s))
-                    continue
+                    # A fixed stroke runs anyway, so its level is still read:
+                    # on 2026-11-05 this skip left 5 of 8 scoops with no
+                    # level (and depth from the floor) although the scan had
+                    # 3-18 cells where the bowl enters.
+                    if not fixed:
+                        continue
                 # Only where the bowl bites: from the entry to 60% of the
                 # travel, as wide as the bowl. The stroke shoves powder forward
                 # and heaps it at the far end, which on 2026-10-22 cancelled
