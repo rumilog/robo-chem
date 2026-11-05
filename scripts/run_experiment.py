@@ -129,6 +129,26 @@ def confirm_step(subtask, call) -> bool:
         print(f"   -> --skill {call.skill} --params '{json.dumps(call.params)}'")
 
 
+class _Tee:
+    """Everything printed goes to the terminal and to the run's console.log."""
+
+    def __init__(self, stream, path: Path):
+        self.stream = stream
+        self.file = open(path, "a", encoding="utf-8", buffering=1)
+
+    def write(self, text):
+        self.stream.write(text)
+        self.file.write(text)
+        return len(text)
+
+    def flush(self):
+        self.stream.flush()
+        self.file.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
 def make_snapshot(vision, folder: Path):
     """
     The orchestrator's ``snapshot``: one photo of the bench per camera,
@@ -291,6 +311,10 @@ def main() -> int:
     parser.add_argument("--picked-at", nargs=3, type=float, metavar=("X", "Y", "Z"),
                         help="With --holding: where it was picked up (the log's "
                              "'Noted where ... was picked from'), so place can put it back")
+    parser.add_argument("--stop-on-failure", action="store_true",
+                        help="End the run at the first failed sub-task (then --max-retries "
+                             "replans), as before 2026-11-04. Default: try pick_up / scoop "
+                             "once more, then pass over what still fails and go on")
     parser.add_argument("--no-preflight", action="store_true",
                         help="Do not check every target's reach before the arm starts "
                              "(and do not move cups that are out of reach)")
@@ -391,6 +415,28 @@ def main() -> int:
         parser.error(f"got {len(args.params)} --params for {len(args.skill)} "
                      f"--skill; they are matched in order")
 
+    # One folder per run (the user, 2026-11-04: "每次实验都保存到对应实验文件夹里面，
+    # 不要分开来放"): the record, console.log, photos/, checks/, scoop_maps/.
+    # A resume of a run kept in its own folder writes into that folder, so a
+    # redo of the last steps sits beside the run it continues.
+    resume_path = None
+    if args.resume:
+        resume_path = Path(args.resume)
+        if args.resume == "latest":
+            # On 2026-10-19 a resume from 15 was pointed at the 10-15 record
+            # by hand: it ran that day's 33-step plan, not the 31-step plan
+            # the run being resumed had made.
+            from robochem.agents.reporter import latest_record
+            resume_path = latest_record(args.log_dir)
+    if resume_path is not None and resume_path.parent.name.startswith("run_"):
+        run_dir = resume_path.parent
+    else:
+        run_dir = Path(args.log_dir) / f"run_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    sys.stdout = _Tee(sys.stdout, run_dir / "console.log")
+    sys.stderr = _Tee(sys.stderr, run_dir / "console.log")
+    print(f"[run] everything from this run goes in {run_dir}/")
+
     # Reads the repo .env as well as the environment, so a simulated run out of
     # perception_env -- which never sources scripts/env.sh, and must not, since
     # that activates the robot venv -- still finds the key.
@@ -402,6 +448,8 @@ def main() -> int:
     cameras, vision, skills, robot = (
         build_sim_stack(args) if args.sim else build_stack(args)
     )
+    # Powder maps (png + raw npz) land beside the rest of this run.
+    skills.run_defaults = {"scoop": {"map_image_dir": str(run_dir / "scoop_maps")}}
 
     if args.holding:
         held = vision.canonical_name(args.holding)
@@ -439,8 +487,7 @@ def main() -> int:
             from robochem.agents.skill_planner import SkillCall
             checker = (None if args.sim or args.no_step_checks
                        else StepChecker(vision, skills, strict=args.strict_checks,
-                                        photo_dir=Path(args.log_dir) /
-                                        f"checks_{time.strftime('%Y%m%d_%H%M%S')}"))
+                                        photo_dir=run_dir / "checks"))
             timeline = []
 
             def summary():
@@ -515,6 +562,8 @@ def main() -> int:
         # bouncy spheres -- so a colour-change check there fails for reasons that
         # have nothing to do with the plan, and each failure costs a replan.
         verify = args.verify if args.verify is not None else not args.sim
+        # Planner runs: the bench's validated values beat the planner's guesses.
+        skills.bench_wins = True
         orchestrator = AgentOrchestrator(
             skills_executor=skills,
             vision_system=vision,
@@ -523,30 +572,24 @@ def main() -> int:
             max_replans=args.max_retries,
             verify=verify,
             dry_run=args.dry_run,
-            log_dir=args.log_dir,
+            log_dir=str(run_dir),
             confirm=confirm_step if args.step else None,
             snapshot=(None if args.dry_run or args.no_step_photos else make_snapshot(
-                vision, Path(args.log_dir) / f"photos_{time.strftime('%Y%m%d_%H%M%S')}")),
+                vision, run_dir / "photos")),
             preflight=(None if args.dry_run or args.sim or args.no_preflight
                        else Preflight(vision, skills)),
+            keep_going=not args.stop_on_failure,
             step_checker=(None if args.dry_run or args.sim or args.no_step_checks
                           else StepChecker(vision, skills, strict=args.strict_checks,
-                                           photo_dir=Path(args.log_dir) /
-                                           f"checks_{time.strftime('%Y%m%d_%H%M%S')}")),
+                                           photo_dir=run_dir / "checks")),
         )
 
         resume = None
         if args.resume:
-            path = Path(args.resume)
-            if args.resume == "latest":
-                # On 2026-10-19 a resume from 15 was pointed at the 10-15 record
-                # by hand: it ran that day's 33-step plan, not the 31-step plan
-                # the run being resumed had made.
-                from robochem.agents.reporter import latest_record
-                path = latest_record(args.log_dir)
-                if path is None:
-                    print(f"--resume latest: no record in {args.log_dir} that moved the robot")
-                    return 1
+            path = resume_path
+            if path is None:
+                print(f"--resume latest: no record in {args.log_dir} that moved the robot")
+                return 1
             resume = json.loads(path.read_text(encoding="utf-8"))
             done = [s.get("subtask_index") for s in resume.get("steps") or [] if s.get("success")]
             print(f"[resume] record {path}: started {resume.get('started')}, "

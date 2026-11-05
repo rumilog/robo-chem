@@ -194,8 +194,10 @@ DUMP_FORWARD_OFFSET = 0.0
 #: 54.6 deg (2026-10-15: the beaker 0.57 m out caps the tip at 59, and the
 #: streamed tip ends ~4 deg short of its command). The user: 54.6 is fine,
 #: "don't set it too strict, keeping the experiment going is the most
-#: important". 45 leaves room under the reach cap.
-DUMP_MIN_TIP_DEG = 45.0
+#: important". 45 leaves room under the reach cap. 45 then failed one at
+#: 44.6 deg (2026-11-04 21:1x, cup A 0.63 m out, capped at 49, the same ~4 deg
+#: short); 40 keeps that kind of near-miss going.
+DUMP_MIN_TIP_DEG = 40.0
 
 #: stir's circle on this bench, metres. The skill's defaults (15 mm, kept 12 mm
 #: off the wall) drew a circle the user found too small (2026-10-08). The arm
@@ -323,9 +325,38 @@ CLEAR_CUP_GRIP_WIDTH = 0.058
 #: pick_up's forward_offset for the two water cups, A and B (+ away from
 #: the arm). The user asked for the grasp 6 mm further forward on 2026-10-20.
 #: C (empty) is unchanged. Change this one number to tune it.
-WATER_CUP_FORWARD_OFFSET = 0.006
+#: **0.010 since 2026-11-04** (user: grasp at the cup's middle so a lifted
+#: cup does not tip forward or back). The slide closes 8.5-10.2 mm short of
+#: the command in x on every A/B pick on record (7 picks, 10-15 to 11-04):
+#: at +6 mm the jaws closed 2.5-3.9 mm behind the centroid. +10 mm puts them
+#: on it.
+WATER_CUP_FORWARD_OFFSET = 0.010
 _CUP_PICK = (("slide_in", CLEAR_CUP_SLIDE_IN), ("z_offset", CLEAR_CUP_GRASP_Z_OFFSET),
              ("grip_width", CLEAR_CUP_GRIP_WIDTH))
+
+#: **Not used since later on 2026-11-04**: the user went back to the slide-in
+#: for A and B, with WATER_CUP_FORWARD_OFFSET larger. Kept for a bench that
+#: wants it: pick=_WATER_CUP_WALL_PICK on a cup.
+#: How A and B were picked for two runs on 2026-11-04: by one
+#: wall, not across the cup. The user, after the slide-in kept failing on them
+#: at the end of the run ("抓杯子的一边"). pick_up comes straight down with the
+#: jaws closing along base y, one finger inside the cup and one outside, on
+#: the wall away from the base's centre line, and squeezes the wall at
+#: WATER_CUP_WALL_FORCE. pour then keeps the cup's centre, not the jaws, over
+#: the target in y. C (picked by no step of the sheet) keeps the slide-in.
+#: First robot try (2026-11-04, cup B, pipeline_20261104.log l.5275-5333) at
+#: 10 N and +6 mm: commanded TCP z 0.028, but the jaws closed at z 0.040,
+#: 12 mm high and above the 36 mm rim, holding at 16.3 mm. The cup hung off
+#: its rim and tipped sideways once lifted. The user: grip harder and lower.
+#: -6 mm cancels that 12 mm, so the jaws close about where +6 mm meant them
+#: to: the top ~17 mm of the wall, the pads (8.9 mm below the TCP) clear of
+#: the liquid.
+WATER_CUP_WALL_GRIP = "outer"
+WATER_CUP_WALL_FORCE = 20.0
+WATER_CUP_WALL_Z_OFFSET = -0.006
+_WATER_CUP_WALL_PICK = (("wall_grip", WATER_CUP_WALL_GRIP),
+                        ("grasp_force", WATER_CUP_WALL_FORCE),
+                        ("z_offset", WATER_CUP_WALL_Z_OFFSET))
 
 #: pick_up's z_offset for the beaker (the "50 ML WATER" cup): the user found
 #: the jaws closing too high on it (2026-10-08) and gave no number; 12 mm, as

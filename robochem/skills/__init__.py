@@ -110,6 +110,16 @@ class SkillsExecutor:
         self.robot = robot_interface
         self.vision = vision_system
         self.config = config or {}
+        # Per-run parameter defaults by skill, below the call's own and the
+        # bench's: run_experiment points scoop's map_image_dir into the run's
+        # folder here.
+        self.run_defaults = {}
+        # True on planner runs: a bench-validated value replaces the call's
+        # own. On 2026-11-04 the planner passed z_offset 0.02 for the beaker
+        # (the bench's is 0.0), the jaws closed above its rim and both picks
+        # failed. A --skill chain leaves it False, so a value typed there
+        # still wins, for tuning.
+        self.bench_wins = False
         
         # Pre-instantiate skills for reuse
         self._skill_instances = {}
@@ -181,6 +191,7 @@ class SkillsExecutor:
             speed = DEFAULT_SPEED
         params = self._bench_names(params)
         params = self._bench_defaults(skill_name, params)
+        params = {**(getattr(self, "run_defaults", {}) or {}).get(skill_name, {}), **params}
         params = self._resolve_pick_site(skill_name, params)
         params = self._fill_tool_geometry(skill_name, skill, params)
         if skill_name == "dispense" and params.get("tool_length") is None:
@@ -310,13 +321,20 @@ class SkillsExecutor:
         name = params.get(key) if key else None
         name = name if isinstance(name, str) else ""
         found = defaults_for(skill_name, name)
-        added = {k: v for k, v in (found if isinstance(found, dict) else {}).items()
-                 if k not in params}
-        if not added:
+        found = found if isinstance(found, dict) else {}
+        added = {k: v for k, v in found.items() if k not in params}
+        replaced = ({k: v for k, v in found.items() if k in params and params[k] != v}
+                    if getattr(self, "bench_wins", False) else {})
+        if replaced:
+            print(f"[Skills] {skill_name} {name!r}: bench-validated value replaces the "
+                  f"call's: " + ", ".join(f"{k}={v} (asked {params[k]})"
+                                           for k, v in replaced.items()))
+        if added:
+            print(f"[Skills] {skill_name} {name!r}: bench-validated "
+                  + ", ".join(f"{k}={v}" for k, v in added.items()))
+        if not added and not replaced:
             return params
-        print(f"[Skills] {skill_name} {name!r}: bench-validated "
-              + ", ".join(f"{k}={v}" for k, v in added.items()))
-        return {**params, **added}
+        return {**params, **added, **replaced}
 
     # ---------------------------------------------------------- pick sites
     #
@@ -389,6 +407,12 @@ class SkillsExecutor:
             top, bottom = result.get("object_top_z"), result.get("object_bottom_z")
             if grasp is not None and top is not None and bottom is not None:
                 tcp_z = float(np.asarray(grasp, dtype=float)[2, 3])
+                if result.get("wall_grip") and result.get("grasp_tcp_reached") is not None:
+                    # Held by a wall, from where the jaws closed: on 2026-11-04
+                    # they closed 12 mm over the commanded grasp both times, so
+                    # the cup hung 12 mm lower than pour planned and its bottom
+                    # knocked cup C over.
+                    tcp_z = float(result["grasp_tcp_reached"][2])
                 table = self.config.get("table_z")
                 # The cloud's bottom reads 3-6 mm high (the bottom edge is
                 # seen only at a grazing angle); standing on a known table,
@@ -400,6 +424,18 @@ class SkillsExecutor:
                     "height": float(top) - float(bottom),
                     "radius": float(result.get("object_radius") or 0.0),
                 }
+                if result.get("wall_grip") and result.get("centroid") is not None:
+                    # Held by one wall: the cup's centre is off the TCP. In the
+                    # tool frame, from where the jaws closed, so pour can put
+                    # the cup's centre (not the jaws) over its target.
+                    g = np.asarray(grasp, dtype=float)
+                    tcp = np.asarray(result.get("grasp_tcp_reached") or g[:3, 3],
+                                     dtype=float)
+                    d = np.asarray(result["centroid"], dtype=float)[:3] - tcp
+                    d[2] = 0.0
+                    c = g[:3, :3].T @ d
+                    self.held_measure["container"]["centre_in_tool"] = [
+                        float(c[0]), float(c[1])]
         elif skill_name in ("place", "open_gripper") or params.get("action") == "open":
             self.held = None
             self.held_measure = {}
@@ -474,7 +510,8 @@ class SkillsExecutor:
         filled = dict(params)
         for key, value in (("source_top_above_tcp", shape["top_above_tcp"]),
                            ("source_height", shape["height"]),
-                           ("source_radius", shape["radius"])):
+                           ("source_radius", shape["radius"]),
+                           ("source_centre_in_tool", shape.get("centre_in_tool"))):
             if filled.get(key) is None:
                 filled[key] = value
         return filled

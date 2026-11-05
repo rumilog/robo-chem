@@ -62,6 +62,11 @@ from robochem.agents.skill_planner import SkillCall, StepOutcome
 #: Default cap on corrective replanning attempts.
 MAX_REPLANS = 2
 
+#: With keep_going, the skills tried once more before the run passes over
+#: them: they fail before doing anything (no grasp, no bite), so a second try
+#: cannot pour or dump twice.
+RETRY_SKILLS = ("pick_up", "scoop", "pick_pipette")
+
 #: How far a pour may tip when the container it pours from still has another
 #: pour to make before it is put down. A tilted container keeps what lies below
 #: its rim at that angle, whatever it held before -- the beaker ~24 ml at 80
@@ -83,7 +88,9 @@ POUR_LAST_DEG = 90.0
 #: B into C after it. 65 (the user, 2026-10-15), not 60: the clear cup keeps
 #: ~11 ml at 60 and ~6 at 65 of its ~25, and C fizzes most and stays purple
 #: with ~70-80% of A in it (estimate, sim scoop masses; see progress.md).
-POUR_FIRST_INTO_SHARED_DEG = 65.0
+#: 90 since 2026-11-05: on the robot, A at 65 poured only a little into C (the
+#: beaker had filled A short), and the user asked for more tip.
+POUR_FIRST_INTO_SHARED_DEG = 90.0
 
 #: Skills after which the bench is photographed, when the orchestrator is
 #: given a ``snapshot``. The colours of this experiment change at the pours,
@@ -249,6 +256,7 @@ class AgentOrchestrator:
         snapshot=None,
         step_checker=None,
         preflight=None,
+        keep_going: bool = False,
     ) -> None:
         """
         Args:
@@ -283,6 +291,10 @@ class AgentOrchestrator:
             preflight: :class:`~robochem.orchestrator.preflight.Preflight`,
                 run on the plan before the first step: targets out of reach
                 are moved while the gripper is still empty. None skips it.
+            keep_going: A failed sub-task does not end the run (the user,
+                2026-11-04: "不要中断"). pick_up / scoop / pick_pipette are tried
+                once more; whatever still fails is logged and passed over, and
+                the run goes on to the next sub-task with no replan.
         """
         self.skills = skills_executor
         self.vision = vision_system
@@ -299,6 +311,8 @@ class AgentOrchestrator:
         self.snapshot = snapshot
         self.step_checker = step_checker
         self.preflight = preflight
+        self.keep_going = bool(keep_going)
+        self._skipped: List[str] = []
 
         # What we believe is in the gripper. The arm is the authority on whether
         # anything is held; only the name is bookkeeping.
@@ -476,6 +490,14 @@ class AgentOrchestrator:
                 return self._blocked(record, blocker[0], blocker[1], task, started,
                                      replans=replans, steps=steps)
 
+            if ok and self._skipped:
+                return self._finish(
+                    record, False, "finished_with_failures", task,
+                    f"ran every sub-task; {len(self._skipped)} failed and were passed "
+                    f"over: " + " | ".join(self._skipped),
+                    replans, steps, started,
+                )
+
             if ok and self.dry_run:
                 return self._finish(
                     record, True, "success", task,
@@ -594,6 +616,11 @@ class AgentOrchestrator:
                 record.seconds = time.time() - started
                 steps.append(record)
                 self._say(f"[step {subtask.index}] INFEASIBLE: {exc.reason}")
+                if self.keep_going:
+                    self._skipped.append(f"{subtask.index} (no skill call): {exc.reason}")
+                    self._say(f"   [keep-going] passing over sub-task {subtask.index}; "
+                              f"going on to the next")
+                    continue
                 return (False, subtask,
                         f"sub-task {subtask.index} ({subtask.description!r}) could not be "
                         f"expressed as a skill call: {exc.reason}", None)
@@ -633,7 +660,11 @@ class AgentOrchestrator:
                 record.adjusted = "; ".join(filter(None, [
                     record.adjusted, f"changed by the operator at the step prompt: {changed}"]))
                 self._say(f"   [operator] {changed}")
-            success, result = self.skills.execute(call.skill, call.params)
+            success, result = self.skills.execute(call.skill, dict(call.params))
+            if not success and self.keep_going and call.skill in RETRY_SKILLS:
+                self._say(f"   FAILED: {result.get('error', 'skill reported failure')}"
+                          f"\n   [keep-going] trying sub-task {subtask.index} once more")
+                success, result = self.skills.execute(call.skill, dict(call.params))
             record.success = bool(success)
             record.result = _jsonable(result)
             record.reason = (
@@ -672,6 +703,11 @@ class AgentOrchestrator:
             self._say(f"   {'ok' if success else 'FAILED'}"
                       + (f": {record.reason}" if record.reason else ""))
 
+            if not success and self.keep_going:
+                self._skipped.append(f"{subtask.index} {call.skill}: {record.reason}")
+                self._say(f"   [keep-going] passing over sub-task {subtask.index}; "
+                          f"going on to the next")
+                continue
             if not success:
                 return (False, subtask,
                         f"sub-task {subtask.index} ({subtask.description!r}) failed: "
@@ -768,8 +804,7 @@ class AgentOrchestrator:
         elif fills_later:
             want = POUR_FIRST_INTO_SHARED_DEG
             why = (f"{target} is poured into again at sub-task {fills_later[0]}: "
-                   f"the first of its pours goes at {POUR_FIRST_INTO_SHARED_DEG:g}, "
-                   f"the last at {POUR_LAST_DEG:g}")
+                   f"the first pour into it goes at {POUR_FIRST_INTO_SHARED_DEG:g}")
         elif len(pours) >= 2:
             want = POUR_LAST_DEG
             why = (f"the last of {source_name}'s {len(pours)} pours "

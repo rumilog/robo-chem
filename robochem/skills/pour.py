@@ -66,6 +66,14 @@ class PourSkill(BaseSkill):
             "source_top_above_tcp": None,
             "source_height": None,
             "source_radius": None,
+            # The held cup's centre from the TCP, tool-frame [x, y], metres.
+            # None: centred in the jaws. Set (by SkillsExecutor) for a cup
+            # pick_up took by one wall (wall_grip), so the cup -- not the
+            # jaws -- is planned over the target.
+            "source_centre_in_tool": None,
+            # Added to lip_clearance and body_clearance for such a cup: held
+            # by one wall it can swing in the jaws, so it rides higher.
+            "wall_held_extra_clearance": 0.010,
             "lip_clearance": 0.015,
             "body_clearance": 0.010,
             "lip_inset": 0.4,
@@ -210,13 +218,14 @@ class PourSkill(BaseSkill):
     # ------------------------------------------------- lip over the target
     @staticmethod
     def _cup_points(top: float, height: float, radius: float, rings: int = 6,
-                    per_ring: int = 32) -> np.ndarray:
+                    per_ring: int = 32, centre=(0.0, 0.0)) -> np.ndarray:
         """The held cup's outline in the TOOL frame (z down): rings rim to bottom."""
         phi = np.linspace(0.0, 2 * np.pi, per_ring, endpoint=False)
+        cx, cy = (float(v) for v in centre)
         out = []
         for k in range(rings):
             z = -top + height * k / (rings - 1)          # rim first, then down
-            out.append(np.c_[radius * np.cos(phi), radius * np.sin(phi),
+            out.append(np.c_[cx + radius * np.cos(phi), cy + radius * np.sin(phi),
                              np.full(per_ring, z)])
         return np.vstack(out)
 
@@ -251,8 +260,16 @@ class PourSkill(BaseSkill):
         radius = float(params["source_radius"])
         lip_clear = float(params["lip_clearance"])
         body_clear = float(params["body_clearance"])
+        centre_in_tool = params.get("source_centre_in_tool") or (0.0, 0.0)
+        if params.get("source_centre_in_tool") is not None:
+            extra = float(params["wall_held_extra_clearance"])
+            lip_clear += extra
+            body_clear += extra
         print(f"[Pour] Held cup from the pick: rim {top * 1000:+.0f}mm over the TCP, "
-              f"{height * 1000:.0f}mm tall, radius {radius * 1000:.0f}mm")
+              f"{height * 1000:.0f}mm tall, radius {radius * 1000:.0f}mm"
+              + (f", centre [{centre_in_tool[0] * 1000:+.0f}, "
+                 f"{centre_in_tool[1] * 1000:+.0f}]mm from the TCP (held by a wall)"
+                 if any(abs(float(v)) > 1e-6 for v in centre_in_tool) else ""))
 
         if params.get("reset_before_scan", True):
             print("[Pour] reset_joints (home, joint-space) clear of cameras before scan...")
@@ -272,7 +289,8 @@ class PourSkill(BaseSkill):
               f"{lip_clear * 1000:.0f}mm over the rim")
 
         per_ring = 32
-        cup = self._cup_points(top, height, radius, per_ring=per_ring)
+        cup = self._cup_points(top, height, radius, per_ring=per_ring,
+                               centre=centre_in_tool)
         closing = np.array([-lean_xy[1], lean_xy[0]])
         angles = list(np.arange(0.0, pour_tip + 1e-6, step_deg))
         if abs(angles[-1] - pour_tip) > 0.5:
@@ -308,6 +326,7 @@ class PourSkill(BaseSkill):
 
         tip_now = self._tip_deg(np.asarray(self.get_current_pose().rotation))
         lips = []
+        short_of = None
         for deg, R, xyz, lip_h in plan[1:]:
             reached = False
             for attempt in range(1, step_retries + 1):
@@ -325,11 +344,13 @@ class PourSkill(BaseSkill):
                     break
                 print(f"[Pour]   short of {deg:.0f}° ({tip_now:.1f}°) — retrying")
             if not reached:
-                print("[Pour] Incomplete tip — reset_joints to clear...")
-                self.go_home()
-                return False, {"error": (f"Pour tip incomplete: commanded {deg:.0f}°, "
-                                         f"measured {tip_now:.1f}°"),
-                               "tip_after": tip_now}
+                # The user, 2026-11-05: a pour that cannot tip all the way still
+                # pours what comes out at the furthest tip it got, and the run
+                # goes on.
+                short_of = deg
+                print(f"[Pour] WARNING: could not tip to {deg:.0f}° ({tip_now:.1f}°); "
+                      f"pouring at the furthest tip reached and going on")
+                break
             lips.append(round(lip_h * 1000, 1))
 
         print(f"[Pour] Holding {hold_duration}s at tip={tip_now:.1f}°...")
@@ -363,6 +384,7 @@ class PourSkill(BaseSkill):
             "tip_dir": "toward_base",
             "tip_after": tip_now,
             "mode": "lip_over_target",
+            "tip_short_of": short_of,
             "lip_over_rim_mm": lips,
             "lip_xy": [float(v) for v in lip_xy],
             "target_rim_z": rim_z,

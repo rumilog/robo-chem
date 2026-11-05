@@ -1,6 +1,6 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-11-04
+Last updated: 2026-11-05
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
@@ -5237,8 +5237,20 @@ being dragged or z drift (the 2026-10-10 rod-touch issue).
   misreads red cabbage on both printed and handwritten paper, so it is
   probably that view rather than the writing (in cam 3 the paper is seen
   sideways and at a low angle; not checked further).
-- Next: sets `rumi`, `aliyah` (`scan --set rumi`, …), run by the user. Each
-  appends to `scans.jsonl` and reprints the whole table.
+- **Sets `rumi` and `aliyah` were scanned the same day (read from
+  `scans.jsonl` on 2026-11-04): 40/40 each.** rumi 0.2/0.5 mm, 32/40 all 4
+  cams (cam 4 read the beaker as `10 ML WATER` in 8 of 10); aliyah 0.2/0.8
+  mm, 39/40 (cam 4 beaker once). **Total 160/160**, 139/160 with all 4
+  cams, 14.1 s mean per locate (13.2-18.1).
+  - Single-camera misreads on the right container, all 160: cam 2 1, cam 3
+    11 (all red cabbage), cam 4 9 (all beaker), cam 5 0. **Never two
+    cameras wrong in the same locate**, so the vote always won 3-1.
+  - A true single-camera locate cannot be scored from the jsonl: a camera
+    often reads the wanted label on 2+ of its instances (cam 2 on the water
+    cup 29 times), and without per-instance positions a duplicate mask of
+    the same container can't be told from a neighbour. So the paper
+    reports per-camera read accuracy as an upper bound (cam 3: ≤149/160).
+    Log instance positions if a clean single-camera ablation is wanted.
 
 **Label distance test: how far a container can stand from its label (2026-10-29). All six phases run on the cell.**
 
@@ -5503,7 +5515,609 @@ powder (or a covered one) to see whether content reads stop.
     (5.5 pt, pre-existing). The local `references.bib` still has 4 entries
     while the text cites ~20 keys, so most citations show as `[?]` locally;
     that is the user's bib, not touched.
+- **Label results written into the paper as prose (2026-11-04, robot PC,
+  user: "alter the paper to reflect these new found results").** This is
+  the user asking for prose, so the TODO-only rule was lifted for Sec.
+  VII-C. Now written: the shared protocol (with "by label" / "by
+  elimination" / "not found" defined in VII-C itself), label legibility,
+  distance from the label, the two caveats (content reads, 1-camera far
+  reads) and why elimination stayed on. `tab:label_reading` filled for all
+  four sets plus a total row, captions written, ablation P3 rows set to
+  `≤149/160` (cam 3, upper bound, see the benchmark entry) and 160/160 at
+  14.1 s. Contribution 2 now states 160/160 and 0 of 96 wrong; the
+  abstract TODO's number updated to 160/160 (abstract itself still TODO).
+  Both tables checked against `report.md` / `scans.jsonl` here.
+  - Not touched: Sec. IV-B (still TODO, including where the label must
+    be), Limitations (TODO), the user's own sentence in IV-B.
+  - No TeX on the robot PC, so not built here; braces and environments
+    balance. Build on the laptop or Overleaf to check the page count.
 - The Experiments comment lists the runs already in this file (2026-10-08
   31/31 in 2177 s, the 10-15/10-19/10-20 runs, the 10-22 chain). These were
   single development runs on changing code; the results tables need repeated
   trials on one frozen code version.
+
+**Cam 5 `Frame didn't arrive within 5000` at the scene stage (2026-11-04, Magic Beaker run).**
+- Cams 2-4 opened, cam 5 timed out, and the run went on to `[scene]` with three cameras.
+- `lsusb` still lists all four D415s on bus 2 (ports 2-3 to 2-6), all at 5000M. `dmesg` shows
+  `Non-zero status (-71) in video completion handler` and `Failed to query (GET_CUR) UVC control 1 ... -32`
+  on **all four** ports, not only cam 5. This is the same shared-controller wedge as 10-10 and
+  10-22: the cameras are still on the Intel `00:14.0` controller (bus 2) with the mouse/keyboard hub (bus 1).
+  Cam 5 is simply the first one to stop delivering frames.
+- Recovery, as on 10-10: `hardware_reset()` on cam 5 (RealSense serial 151322066932; the USB sysfs
+  serials 2046230xxxxx are different numbers) with nothing streaming, or replug the camera hub. The
+  lasting fix is still moving the hub to the ASMedia (`04:00.0`, buses 5/6) ports, which are empty.
+
+**Magic Beaker with planner speeds: 28 of 31 steps, then the robot refused a slide (2026-11-04 ~16:5x, `experiments/agent_run_20261104_155547.json`, log `experiments/pipeline_20261104.log` l.4886-4918).**
+- First full run with the planner's per-step speeds. Steps 1-28 all succeeded on the first try:
+  three scoop/dump/stir rounds (spoon picks 60, scoops and dumps 20, stirs 30, put-backs 40,
+  stirrer picks 50-60), beaker pick / two pours / place at 0, cup A pick / pour into C / place at 0.
+  Preflight 71.4 s, nothing moved; only warning: the stirrer holder at 0.70 m (fixed object).
+- Step 29 `pick_up clear cup b` (speed 0) failed: "No reachable grasp among 1 candidates". That
+  message is misleading. The hover, the approach and "down behind it" (0.367, −0.127, 0.022)
+  all ran, reaching within 15.1 mm, the same as cup A's 15.3 mm at step 26. Then the 60 mm slide
+  forward was **refused by the robot**: `[Safety] The arm did not move at all (0.5 mm)`. The
+  arm was left low behind cup B with the jaws open. Cup A's slide from the mirror-image spot
+  (y +0.117) worked minutes before, so this is not reach. The cause is in the franka-interface
+  terminal, which this log does not capture (not read yet).
+- Resume: `--resume experiments/agent_run_20261104_155547.json --from-step 29`, no `--reset`;
+  remaining steps are 29 pick cup B, 30 pour B into C at 90°, 31 place B.
+
+**Cups A and B are now taken by one wall, and pour keeps the cup's centre over the target (user, 2026-11-04). Not yet run on the robot.**
+- User: "最后这两步抓杯子A和B总是失败，改成抓杯子的一边吧，倒的时候有一个偏移，确保杯子中心在C的上方就行了"
+  (the A/B picks at the end keep failing; grip one side of the cup instead, and offset the pour so
+  the cup's centre is over C). Prompted by the step-29 slide that the robot refused (entry above).
+- `pick_up` `wall_grip` (`"outer"` / `"+y"` / `"-y"`, default None = unchanged):
+  - straight down (no slide-in, no yaw), jaws closing along base y as before;
+  - TCP `wall_grip_inset` 0.034 from the cup's centroid toward that wall, so one finger is inside
+    the cup and one outside. 0.034 lies between the rim radius 36.6 mm and ~30.5 mm 25 mm lower;
+  - `"outer"` = the wall away from y = 0, so the fingers stay away from C between A and B;
+  - force-limited close at `grasp_force`; the "closed on nothing" floor is `WALL_GRIP_MIN_WIDTH`
+    0.5 mm instead of 3 mm, because a ~1 mm wall (not measured) reads under 3 mm;
+  - result `wall_grip` ±1, and slide_in 0 so place goes straight down and opens.
+- `MAGIC_BEAKER` A and B: `_WATER_CUP_WALL_PICK` = wall_grip "outer", `WATER_CUP_WALL_FORCE` 10 N,
+  `WATER_CUP_WALL_Z_OFFSET` +6 mm (pads 8.9 mm under the TCP stay above the liquid; they hold the
+  top ~17 mm of the wall). All three are guesses. C and the jellyfish cups keep the slide-in.
+  `CUP_A_LATERAL_OFFSET` / `WATER_CUP_FORWARD_OFFSET` are kept but no longer used by A/B.
+- Executor: for a wall-grip pick, `held_measure.container.centre_in_tool` = the centroid minus
+  the reached TCP, in the tool frame; filled into pour as `source_centre_in_tool`. Pour's cup
+  model (`_cup_points`) is shifted by it, so the lip, body-clearance and flange checks all plan the
+  cup, not the jaws. Beaker and other picks get None, so their behaviour is unchanged.
+- Checked offline (seconds, not the suites): B by its −y wall, centre_in_tool [0.005, −0.031]
+  from the reached TCP. Pour into C at (0.432, −0.004): the TCP moves to y −0.038 and the cup mouth
+  centre stays at y −0.004 at 0° and 90°; x is exactly the old pour (mouth centre 22 then 15 mm
+  past C's centre, inside C's 36.6 mm radius). `test_executor_uses_bench_names` updated and passing.
+- To watch on the robot: does a 10 N pinch hold the cup at a 90° tip (raise the force if it
+  slips; lower it if the wall creases)? Does the inner finger stay out of the liquid? Does
+  the wall read above 0.5 mm when closed?
+- **First robot try of the wall grip (2026-11-04, resumed step 29, cup B, `pipeline_20261104.log`
+  l.5275-5333): the cup tipped sideways once lifted.** Gripped the −y wall at 10 N, z_offset +6 mm.
+  Commanded TCP (0.403, −0.182, 0.028), but the jaws closed at (0.399, −0.172, **0.040**). That is
+  12 mm high, above the 36 mm rim, and 9 mm toward the cup's centre. Held at 16.3 mm,
+  `gripper_is_grasped` False. Pour got centre_in_tool [+4, −25] mm. The user stopped the run
+  at the pour's 10° step and opened the jaws.
+  - The 12 mm is larger than the slide-in's 4.5 mm (step 26: commanded 0.0219, reached 0.0264).
+    Cause not known.
+  - User: grip harder and lower. Now `WATER_CUP_WALL_FORCE` 20 N and `WATER_CUP_WALL_Z_OFFSET`
+    −6 mm (cancels the 12 mm). Not yet re-run.
+- **Second try, 20 N and −6 mm (`agent_run_20261104_161807.json`, log l.5432-5568): the grip
+  held, but the pour knocked cup C over.**
+  - Commanded TCP z 0.0159; the jaws closed at **0.0275**, again 12 mm high, which is now
+    the intended height. Held at 17.0 mm through the whole 90° pour.
+  - Cause of the knock (user: "下的太低了，撞倒c杯了", it came down too low and knocked C over):
+    the executor took `source_top_above_tcp` from the commanded grasp z. The rim read +20 mm over
+    the TCP; from where the jaws actually closed it is +8.6 mm. So pour modelled the cup 11.4 mm
+    higher in the jaws than it hung, and the planned 10 mm body clearance over C's rim was really
+    about −1 mm.
+  - After the pour the cup was gone: step 31 place found the jaws at 2.0 mm.
+  - Fixes:
+    - For a wall-grip pick the executor now uses `grasp_tcp_reached` z for the held cup's height.
+      Other picks keep the commanded z, so the beaker and slide-in pours are unchanged.
+    - pour `wall_held_extra_clearance` 0.010 is added to lip and body clearance for a wall-held
+      cup, because it can swing in the jaws.
+    - Together the cup rides ~21 mm higher over C than in this run. Checked offline with this
+      run's numbers: rim +8.6 mm, centre [+3, −25] mm. Not yet re-run.
+
+**Back to the slide-in for cups A and B, grasp moved forward onto the cup's centre (user, 2026-11-04). Not yet run on the robot.**
+- User: "还是改成原来的那种方式吧，但是往前的距离要多一点，正好抓在A和B的中间，才能保证杯子抓起来以后不会前后倒"
+  (go back to the original way, but further forward, right at the middle of A and B, so a lifted
+  cup does not tip forward or back).
+- A and B are back on `_CUP_PICK` (slide_in 0.06, grip_width 0.058, z_offset 0).
+  `WATER_CUP_FORWARD_OFFSET` is now **0.010** (was 0.006).
+- Why 10 mm, from every successful A/B slide-in on record (7 picks: `agent_run_20261015_205733`,
+  `20261020_132026`, `20261020_142834`, `20261104_155547`): the jaws close **8.5-10.2 mm short of
+  the command in x** every time.
+  - At +0 they closed 8.4-10.2 mm behind the centroid.
+  - At +6 they closed 2.5-3.9 mm behind it.
+  - +10 should land within about ±1 mm of it.
+- The wall-grip code stays in `pick_up` / `pour` / the executor, off unless a pick passes
+  `wall_grip`. `_WATER_CUP_WALL_PICK` is kept in the manifest, unused.
+- `test_executor_uses_bench_names` expectations restored; passing.
+- Still open: step 29's slide was once refused by the robot (entry above, cause not seen).
+
+**New bench layout, Magic Beaker stopped at step 9 scoop of baking soda (2026-11-04 16:45, `experiments/agent_run_20261104_165412.json`, 514 s).**
+- Preflight 68 s, nothing moved. Warnings: cups A/B and the beaker sit at 0.58-0.60 m, where a dump
+  tips only 54-57° (wants ≥ 60), and there was no free spot to move them to. The dumps at
+  steps 3 (into A) still succeeded.
+- Steps 1-8 OK. Step 9 scoop, baking soda dish at (0.407, −0.121):
+  - The camera map put the powder surface at z 0.0030, only **11.2 mm over the inside floor**. A
+    thin bed, so the dig was floor-limited to 8.2 mm.
+  - The compliant descent stopped 4.8 mm high and was corrected. The tip was then 2.5 mm in. The
+    extra 2.5 mm lowering left it at 2.8 mm, so something under the bowl stopped it (packed
+    powder or the dish floor; not known).
+  - Failed on `min_immersion` 4 mm ("did not sweep").
+- Fix (keep the run going): `scoop.min_immersion` 4 → **1 mm**. A 2.8 mm bite now sweeps. Not
+  re-run yet.
+- Resume from step 9 with the spoon still in the jaws. `_replay` re-seeds the executor's held
+  tool. No `--reset` (it opens the gripper).
+
+**Runs no longer stop at a failed step: keep-going is the default (user, 2026-11-04: "不要中断不要中断！！！现在总是中断").**
+- `AgentOrchestrator(keep_going=True)`, set by `run_experiment.py` unless `--stop-on-failure`:
+  - `RETRY_SKILLS` (pick_up, scoop, pick_pipette) are run once more with the same call. They fail
+    before acting (no grasp, no bite), so a retry cannot pour or dump twice.
+  - Anything that still fails is logged (`[keep-going] passing over sub-task N`) and the run goes
+    on to the next sub-task, with no replan. This includes a dump/pour/place failure, a strict
+    step check, and a sub-task the skill-call agent finds infeasible.
+  - At the end: outcome `finished_with_failures` and a reason listing every passed-over step.
+  - Not covered: preflight `blocked` and missing-API-key blockers still stop the run, on purpose.
+  - Not covered: a failure that leaves the arm unsafe. The next steps' motions are then refused,
+    and each of those steps fails in turn.
+  - `--max-retries` only matters with `--stop-on-failure` now.
+- Checked with fake skills (scratchpad `keep_going_check.py`): scoop failing twice and dump
+  failing once. Calls were pick_up, scoop, scoop, dump, place; 2 passed over; the run reached the
+  end.
+- The resume started at 16:56:49 (from step 9 of `agent_run_20261104_165412.json`) loaded the
+  orchestrator before this change (edited 16:57), so it still stops on failure. It does have the
+  scoop `min_immersion` 1 mm (edited 16:55).
+
+**One folder per run; scoop maps saved with their raw scan and every reason for no map printed (user, 2026-11-04). Not yet run on the robot.**
+- User: "查一下吧然后每次实验都保存到对应实验文件夹里面，不要分开来放" (look into it, then save each
+  experiment's files in its own folder, not scattered).
+- **Why some scoops had no map:** `_choose_line` returned without a map, silently, at four exits.
+  - Stroke heading and line both fixed by the call.
+  - Fewer than 50 dish points, or the centre-line stroke does not fit.
+  - No stroke line fits.
+  - Fewer than 4 map cells under the default bite. Cells need ≥ 3 points, within `reach_limit`, and
+    z < rim_z − `map_rim_band` 3 mm.
+  - Today's pattern (`pipeline_20261104.log`): every dish at x ≤ 0.564 got a map; those at
+    x 0.572 / 0.585 / 0.614 did not (15:28 run steps 2 and 16, and one earlier run). No reach
+    NOTE was printed, so the default stroke was reachable.
+  - That leaves the points/fit exits or the rim-band cut. The log cannot tell which.
+  - Now each exit prints `[Scoop] No powder map (<why>)` with the point counts, and the raw scan
+    is saved, so the next miss shows its cause.
+- **Raw data:** `ScoopSkill._save_raw` writes `scoop_map_<time>_<dish>.npz` beside the PNG, map or
+  no map. It holds the dish points (world, m), site_xy, rim_z, reach_limit and, when built,
+  cell_xy / cell_z / levels / chosen / default. File names now carry the dish name.
+- **Per-run folder** `experiments/run_<start time>/` (`run_experiment.py`, every mode):
+  - the run record `agent_run_<time>.json` (orchestrator `log_dir`);
+  - `console.log` (stdout and stderr teed; the user's own `tee` still works too);
+  - `photos/` (`s<NN>_pour_cam<k>.jpg`) and `checks/` (both were `photos_<t>/`, `checks_<t>/`);
+  - `scoop_maps/`, set through the new `SkillsExecutor.run_defaults`
+    {"scoop": {"map_image_dir": ...}}. It sits below the call's and the bench's params;
+  - the report: `write_report.py` writes `report_<time>/` into the record's run folder.
+- `reporter.latest_record` and `load_run_chain` search `experiments/` and
+  `experiments/run_*/`, sorted by file name. So `--resume latest`, resuming a pre-change
+  record, and `write_report.py` all keep working. Checked in scratch: an old top-level record
+  plus a resumed one inside a run folder chain correctly. `run_experiment.py --help` creates no
+  folder.
+- The run started 17:00:30 loaded the old code. Its files still go to `photos_<t>/`,
+  `checks_<t>/` and `diag_out/scoop_maps/`. It does have keep-going.
+
+### 2026-11-04 — 17:00 Magic Beaker run: clean, 30 min; scoop-map wiring fixed
+
+- `agent_run_20261104_173037.json` (from scratch, keep-going on, old folder
+  layout): **all 31 sub-tasks succeeded, 0 replans, 0 skips**, 1796.7 s
+  (17:00:41 → 17:30:37). Pours 81–101 s each, picks 39–61 s, scoops 60–69 s.
+  Photos in `experiments/photos_20261104_170041/`, checks in
+  `experiments/checks_20261104_170041/`, maps in `diag_out/scoop_maps/`
+  (170324, 170850 — the third scoop again produced no map; old code, so no
+  reason was printed).
+- The per-run-folder entry above claimed scoop maps go to the run folder, but
+  `skills.run_defaults` was never actually set in `run_experiment.py`. Now it
+  is (right after the stack is built), so maps really do go to
+  `run_<time>/scoop_maps/` from the next run.
+- Later the same day all of that run's outputs were gathered by hand into
+  `experiments/run_20261104_170041/` (record, `photos/`, `checks/`,
+  `scoop_maps/` with the two maps, and `console.log` = lines 6733–8440 cut
+  from the shared `pipeline_20261104.log`, which stays where it is). The paths
+  in the bullet above are now stale. `latest_record` finds it there.
+
+### 2026-11-04 — Preflight in the 17:00 run moved nothing (and the run command no longer tees)
+
+- The user wants every experiment in one folder from now on. `run_experiment.py`
+  already writes `console.log` into `run_<time>/`, so the `| tee -a
+  experiments/pipeline_<date>.log` on the old commands is dropped; that file
+  only duplicated the console across runs.
+- Preflight on `run_20261104_170041/console.log` l.173-182: cup A (0.594,
+  +0.145) 0.61 m, dump 52°; cup B dump 56°; plastic beaker dump 57°. All three
+  failed the check, and **all three got "no free spot in reach found; leaving
+  it"**: 0 moved, 4 warnings, 67.8 s. A moved dump target must land in the box
+  x 0.39-0.46, |y| <= 0.14, 17 cm from each scoop dish and clear of other cups.
+  With cup C at (0.397, +0.096) and the dishes on this layout, nothing in that
+  box was free. The dumps still worked, because the dump skill only refuses
+  below 45°. So "preflight will bring a far cup closer" holds only when the box
+  has room. Not changed yet.
+- What preflight never moves: scoop dishes (too wide; a dish past x 0.60
+  **stops the run before any motion**, "move it closer by hand"), anything
+  beyond 0.72 m, the stirrer and other non-cups, and cups wider than 80 mm.
+
+### 2026-11-04 — Preflight did not fetch far cup B; four fixes (offline only, not yet on the robot)
+
+Run `experiments/run_20261104_203328/` (console.log l.169-177, 647). Cup B was
+placed on purpose at (0.734, -0.144), 0.75 m out. Preflight: "not moving it:
+0.75 m out, beyond where the arm can pick it up". Step 10's dump then refused
+(23°) and keep-going passed over it. Cup A (0.569, -0.215, 54°) again got "no
+free spot". Changes in `robochem/orchestrator/preflight.py`:
+
+1. **Fetch limit is now in x, not a radius**: `MAX_FETCH_X = 0.745`, and
+   `MAX_FETCH_REACH` is now a 0.78 m sanity radius (was a 0.72 radius). The
+   real limit is the x 0.75 hand clamp. The same run picked the spoon at
+   x 0.747 (r 0.747).
+2. **Wider fallback area when the dump box is full**: x 0.39-0.50,
+   |y| <= 0.21, the spot must still tip >= 60°. The box was full here because
+   the citric acid dish (0.407, -0.023), from the npz `site_xy`, sits in it,
+   with cup C at (0.395, +0.090). |y| stays under the (0.428, +0.233) spot
+   whose carry fell short on 2026-10-22.
+3. **Worst dump moves first** (lowest reachable tip), and each moved cup's new
+   spot is avoided by the next search. With A first, A took the only spot left
+   and B found nothing (offline replay of this layout).
+4. **Scoop dishes are now read from the plan text** ("scoop from X with ..."):
+   the planner leaves `target_container` "none" on scoops, so
+   `DISH_CLEARANCE` (0.17) was never applied. Without it B's spot was
+   (0.44, -0.16), 14 cm from the citric dish; with it, **(0.43, -0.20)**.
+   Costs one scan per dish in preflight, which scoop reuses later.
+- **No longer stops the run**: a dish past `SCOOP_MAX_X` (baking soda at x 0.604
+  scooped fine in this run) and a dump target with no spot below 45° are now
+  warnings. Keep-going handles the step.
+- Checked with a fake vision/skills replay of this layout (scratchpad
+  `pf_fake.py`): B is moved to (0.430, -0.200); A is left at 55°. **Not run on
+  the robot yet**, and the red cabbage dish's position was unknown to the
+  replay.
+- Same run, steps 5-7: the stirrer at (0.757, +0.090) was lost twice on the
+  lift. Its x is past the 0.75 clamp, so the grasp landed short. Preflight
+  cannot move it (a tool); the holder has to come in by hand.
+
+### 2026-11-04 — 20:48 run: the new preflight ran, and B was still not moved (no room on this layout)
+
+`experiments/run_20261104_204841/console.log` l.58-251, 646. The new code ran:
+8 targets including the 3 dishes, B checked first. B at (0.701, -0.126):
+29°, x 0.701, so it was fetchable. **Still "no free spot".** Preflight took
+119.1 s (was 66 s; the dish scans). Step 10's dump was then refused (29°) and
+passed over.
+- Layout: dishes citric (0.405, -0.025), red cabbage (0.424, -0.124), baking
+  soda (0.578, -0.005); cups C (0.394, +0.091), beaker (0.548, +0.110),
+  A (0.571, -0.216).
+- Offline free-space map (scratchpad `free_map.py`, same clearances as
+  preflight): **no spot anywhere in x 0.39-0.50, |y| <= 0.21** is 17 cm from
+  all three dishes and clear of the cups. The nearest free spots are at |y|
+  0.21-0.30, the side where both past side dumps failed on the carry.
+  (0.46, +0.21) is r 0.506, just past SPOT_REACH, and 133 mm from the beaker
+  (needs 133).
+- The earlier replay that put B at (0.43, -0.20) did not have the red cabbage
+  dish. It sits 8 cm from that spot.
+- Taking C out of the way would free only (0.39-0.40, +0.15..+0.21); taking the
+  cabbage dish out, only (0.39-0.42, -0.20..-0.21). Both are outside the
+  validated |y| <= 0.14. On this bench, three dishes plus C fill the whole area
+  where dumps are known to work. Nothing changed in code.
+
+### 2026-11-04 ~21:xx — Camera-only preflight check before a run
+
+- Scratchpad `check_layout.py` (session ca360e28): builds the stack with
+  `dry_run` (frankapy stubbed, `.env` key loaded), stubs `go_home` and `_move`,
+  and runs the real `Preflight` on the Magic Beaker targets. It reports what
+  preflight would move, and the arm does not move. ~104 s with 3 cameras.
+- On the layout after 20:48: B at (0.749, -0.130) was refused, because x 0.749
+  is past `MAX_FETCH_X` 0.745. A (0.586, -0.225, 50°) would go to
+  (0.420, +0.150), the one spot free. Told the user to bring B to x <= 0.74 so
+  that B, the worst dump, takes that spot. Cam 5 timed out on every scan (the
+  USB wedge again).
+
+### 2026-11-04 21:09 run — B moved by preflight; no checks/ because the only dump so far failed; min_tip 45 → 40
+
+- `experiments/run_20261104_210947/` (still running when looked at).
+  **Preflight moved cup B for the first time**: B at (0.691, -0.132), 31°, went
+  to (0.420, +0.150) by the wide-area fallback (console l.253-256). A
+  (0.585, -0.227, 50°) was left, as expected. Preflight took 171.9 s.
+- **No `checks/` folder**: `StepChecker` runs only after a dump or pour that
+  succeeded (`agent_orchestrator.py` ~l.680), and the folder is made on the
+  first saved check. Step 3, the dump into A, stalled at **44.6° of 49°**
+  (capped by reach), short of `min_tip_deg` 45, so it failed and was passed over.
+- `DUMP_MIN_TIP_DEG` 45 → **40** (bench_manifest), the third near-miss of the
+  same kind (59.9 vs 60, 54.6 vs 55, 44.6 vs 45). Takes effect from the next
+  run; the running process still has 45.
+- Later in the same run, the dump outcomes: step 3 into A failed at 44.6° (above). **Step 10 into B
+  (preflight had moved it to (0.420, +0.150)) failed: "Bowl stopped 22mm short"**.
+  The carry ended dx -3.3, dy -11.5, dz **+18.8** mm, so it was high, not off
+  the cup. This is the same side-spot carry error as 2026-10-22 (0.428, +0.233),
+  28 mm. Step 17 into the beaker succeeded (60.9°), and the run's first check,
+  `checks/s17_dump_before_after.jpg`, is "ok".
+- Bench `hover_tol` for dump: 0.02 → **0.03** (`DUMP_HOVER_TOL`), so that
+  near-miss tips. Not yet on the robot.
+- **Step 22, the beaker pick, failed twice** ("Object lost during the lift", the jaws held at 18.8 then
+  11.6 mm). The planner passed `z_offset 0.02, squeeze 0.013, grasp_force
+  1.5`, which overrides the bench's validated `z_offset 0.0`: the grasp was
+  commanded at z 0.0556 and closed at 0.0623, above the 60 mm beaker's rim
+  (~0.049). In the 17:00 run the planner passed only `speed`, the bench filled
+  z_offset 0.0, the grasp was at z 0.0356, and it worked. The source was
+  `skill_catalog.py`'s pick_up text "0.02 / 0.013 is the validated value for
+  the beaker", which are sim values. Replaced with "leave it out: the bench
+  supplies ...". Steps 23-25 then could not run (no beaker in hand).
+
+### 2026-11-04 21:39 run — no red cabbage scooped; `map_min_bed` 6 → 3 mm
+
+- `experiments/run_20261104_213945/`, step 16 (console l.906-988). Both tries were refused before
+  any motion: "Too little powder ... 4.4mm / 4.3mm ... under map_min_bed 6mm".
+  The map (`scoop_maps/scoop_map_20261104_215350_red_cabbage_powder_cup.png`)
+  shows the near half and the middle dug low (dark) and the remaining powder
+  heaped at the far rim (yellow), out of the stroke's reach. No heading or
+  offset was 2 mm fuller, so the default stroke was kept. The 21:09 run had
+  already read 6.0 mm and passed only on retry. Step 17 (the dump into the
+  beaker) was then infeasible, so the beaker got no indicator.
+- `map_min_bed` default 0.006 → **0.003** (`scoop.py`), so a thin bed still
+  gets a shallow bite. The head's 3 mm floor gap is unchanged. The real fix
+  is to level or refill the dish between runs.
+- Follow-up: the user had added more (paler) powder and asked whether the map
+  judges by colour. It does not: the depth cameras' IR stereo measures height.
+  The raw npz says the bed is real but shallow. Points within 20 mm of the
+  centre are at z 3.5/4.5/6.6 mm (p5/50/95); the 30-41 mm ring has a median of
+  6.7 and a p95 of 11.6. Inside floor (base -5.2 + 8 mm floor) is at about
+  -3 mm, so the bed is ~7.5 mm. Minus the 3 mm head gap leaves 4.3, against
+  the 6 required. The rim band (cut at 14.8 mm) removed none of it. So the cause
+  was the threshold, not missing powder or a colour issue. With 3 mm it would
+  dig a ~4 mm bite.
+- Why the 17:00 run's red cabbage scoop worked: the dish was at (0.6165, +0.0433),
+  far out ("default stroke is past the wrist-reach model"), and no map was built
+  (one of the old silent no-map exits). With no map, `map_min_bed` never runs:
+  the scoop dug from the floor rule, head 3 mm over the inside floor, and
+  succeeded. At 21:39 the dish was near, at (0.397, -0.139), the map was built,
+  and the check refused a dig to the same floor-limited depth. So the 6 mm rule
+  was refusing scoops the floor rule would have done anyway.
+
+### 2026-11-04 ~22:xx — Redo from the red cabbage scoop, in the same folder
+
+- The 21:39 run was stopped by hand during step 24's pour reset, and **no record
+  was written** (`_write_log` only runs at the end). Rebuilt one from
+  `console.log` (goal, the 31-step plan, targets inferred from "into X" /
+  "stir X with"; `steps` empty) as
+  `experiments/run_20261104_213945/agent_run_20261104_213945_rebuilt.json`.
+  `_plan_from_record` loads it, and preflight's items come out as expected.
+- `run_experiment.py`: when `--resume` (or `--resume latest`) points at a
+  record inside a `run_<time>/` folder, that folder becomes `run_dir`.
+  console.log is appended to, and photos, checks and scoop maps land beside the
+  first try. Same-index photos/checks (s23, s24 pour photos) are overwritten
+  by the redo.
+- Resume from **15** (pick up the spoon), not 16: the scoop needs the spoon in
+  hand, and nothing before 15 is needed (15-31 pick everything they place).
+- Not yet done: write the record after every step or on Ctrl-C, so a stopped
+  run can be resumed without rebuilding.
+
+### 2026-11-04 22:07 — The resume was blocked in preflight, with the arm left holding cup A
+
+- Resume from 15 (`run_20261104_213945/agent_run_20261104_220708.json`).
+  Steps 15-31 make A a **pour target only**, so it was checked against
+  `TARGET_REACH` 0.30-0.60. A at (0.565, -0.216) is 0.61 m, so it was flagged.
+  It is not a dump target, so the spot search had no box, and it took the
+  nearest free cell, **(0.380, -0.320)**. pick_up succeeded. The place's hover
+  to (0.381, -0.3125, 0.3) was refused (0.0 mm moved,
+  joint_motion_generator velocity/acceleration discontinuity, robot_mode 1),
+  and so was reset_joints (39° off). Preflight blocked, and the arm was holding
+  A at ~17 cm. The user recovered it by hand.
+- Fixes (`preflight.py`): `TARGET_REACH` → (0.30, **0.65**), because pours into
+  A at 0.61-0.62 m worked at 17:00 and 21:39. New `MOVE_MAX_ABS_Y` **0.21**
+  applies to every moved container, not only dump targets.
+- To resume again, pass the rebuilt record explicitly: `--resume latest` skips
+  records with no executed steps, and both records in that folder have none.
+
+### 2026-11-04 — What the logs cover, for freezing preflight parameters (paper)
+
+- All 37 non-dry records (experiments/, run_*/, plus 3 run folders in Trash):
+  dump 22 ok / 6 failed, pour 23 / 2, scoop 27 / 4, stir 23 / 0. **Every
+  successful dump target is at x 0.388-0.594, |y| <= 0.145 (r <= 0.611). Every
+  pour lip is at x 0.383-0.586, |y| <= 0.149.** There is no data at the sides
+  (|y| > 0.15) or past x 0.60. That is exactly where today's conflicts were
+  (the wide fallback, ±0.21, the far cups). The failed dumps:
+  3 carries 144-167 mm off, 2 "cannot locate", 1 tip 54.6/55. The 21:xx near-misses
+  (44.6°, 22 mm) are in no record, because those runs were interrupted.
+- Plan suggested to the user: values from the model or geometry where possible,
+  a small grid test on the bench for the envelope, and a bench test for the
+  17 cm dish clearance (sim-only). Then freeze the values and record the commit.
+
+### 2026-11-04 22:23 — The resumed red cabbage scoop "stopped above the powder": a bug in the immersion check (fixed)
+
+- `run_20261104_213945/console.log` l.1787-1885. Try 1 (map built): the surface
+  under the bite was z 0.0002, 8.4 mm over the floor, and the tip was planned
+  5.4 mm under it (floor-limited). The descent stopped 4.4 mm high, was
+  re-commanded 4.4 mm lower, and ended **+1.1 mm from the plan**, so the tip was
+  ~4.3 mm in. The check printed "-0.1 mm into the powder", lowered 2.1 mm, then
+  read -1.4, and lifted out. Try 2: no map (rim band left 699 points), so no
+  immersion check. **Same entry command, z 0.0067**, and it swept and
+  succeeded.
+- Cause: `immersion_now` measured the TCP against the **command** (entry minus
+  the sag compensation) instead of the planned entry, so the ~4.5 mm sag was
+  subtracted twice. Before today it never failed, because the bites were
+  planned ~12 mm deep and read 6.4-7.5 mm after losing 4.5. Lowering
+  `map_min_bed` to 3 mm let shallow (5 mm) bites reach the check, which
+  exposed it. Fixed to measure against `entry`.
+- Pattern worth stating: scoop's behaviour depends on whether a map gets built
+  (here 8.4 mm bed → map; same dish 1 min later → no map, rim band). The
+  map-only checks (min_bed, immersion) then make it fail or pass on the same
+  physical dig.
+- The user: try 2 also brought up **no powder at all**, even though the log says
+  "Successfully scooped". Then: "改成固定路线，按碗的底部决定挖多深".
+  `scoop.py` defaults are now `stroke_heading 0.0`, `stroke_across 0.0`,
+  `depth_from_map False`. Every scoop runs the straight-ahead centre-line
+  stroke, with the head's lowest point 3 mm over the inside floor (floor = table
+  + `floor_thickness` 8 mm). It prints "[Scoop] Fixed stroke ..." and still
+  saves the raw npz, but draws no map PNG. min_bed and the immersion check only
+  run with a map, so they are off. "auto" still works if a call asks for it.
+- Why try 2 got nothing (likely, not proven): the bed was ~8.4 mm, and the bowl is
+  11.5 mm deep. With its lowest point 3 mm up, only ~5 mm of the bowl is under
+  the surface. The descent also stopped 5.0 mm above its command (hit the floor
+  or packed powder early). The floor rule was validated on 13-20 mm beds
+  (17:00 run: a 21 mm rim-based bed). A thin bed is a bench condition to fix by
+  refilling. A fixed route cannot dig powder that is not there.
+
+### 2026-11-04 — Parameters frozen: `PARAMETERS.md`
+
+- New `PARAMETERS.md` lists every decision parameter (preflight, dump, scoop,
+  pick, stir) with its value, source (model / bench N / sim / limit /
+  estimate) and status (FROZEN / PENDING). PENDING items:
+  - Grid test of the dump region. It replaces `DUMP_SPOT_*`, `DUMP_WIDE_*` and
+    `MOVE_MAX_ABS_Y` with one measured region.
+  - Bench test of `DISH_CLEARANCE` (sim-only 0.17) and `FINGER_ROOM` (no source).
+  - `hover_tol`: split into xy ≤ 20 mm (geometry) plus a z rule.
+  - Bench-validated pick values should win over the planner's (beaker incident).
+- Protocol condition, not a parameter: every dish needs a levelled bed of at
+  least 15 mm before each trial.
+- Not committed yet. The working tree also carries the user's `paper/main.tex`
+  edits.
+- Two of the four PENDING items are done in code (offline checks only, not yet
+  run on the robot):
+  - **Dump arrival** (`dump.py`): the 3D `hover_tol` is replaced by
+    `hover_tol_xy` 0.020, `hover_tol_below` 0.010 and `hover_tol_above` 0.040.
+    The values come from geometry: cup r 36 − bowl half-width 10 − margin 6;
+    the 10 mm rim clearance; and higher only drops the powder further. The
+    bench's `DUMP_HOVER_TOL` 0.03 is removed. Both past misses (22 mm, 12
+    sideways/+19; 28 mm, ~13 sideways/+25) would now tip. The 144-167 mm misses
+    still fail. A carry more than 5 mm off now prints "[Dump] Over the cup:
+    ... sideways, ... in height".
+  - **Bench beats planner** (`SkillsExecutor.bench_wins`, set True by
+    `run_experiment.py` on planner runs only; `--skill` chains keep the typed
+    value). It prints "bench-validated value replaces the call's: z_offset=0.0
+    (asked 0.02)". Checked with the real manifest: the beaker's z_offset 0.02
+    → 0.0. Keys the bench does not set (squeeze, grasp_force) still pass
+    through.
+
+### 2026-11-04 22:39 — Scoop-only run with the fixed stroke: the motion ran fine, still no powder
+
+- `experiments/run_20261104_223932/` (`--holding "larger spoon" --held-offset 0.045
+  0.002 0.019 --skill scoop red cabbage`). Dish now at (0.597, -0.114).
+  Nominal: descent sag 4.6 mm compensated, then +0.9 mm; sweep 12/12, -0.3 mm
+  from the last setpoint; "Successfully scooped". **The user saw nothing in the
+  bowl.**
+- The raw npz of the last three red cabbage scans (22:24, 22:33, 22:39) agree.
+  The surface within 15 mm of the centre is at z 4.7 / 3.3 / 5.5 mm (median);
+  the 15-30 mm ring at 7.2 / 4.7 / 8.0; the 30-38 mm ring at 6.0 / 7.5 / 9.1.
+  The dish rim is at z 17.8 (table -11.2 + `DISH_HEIGHT` 29) and the inside
+  floor at about -3.2, so the **centre bed is ~7-9 mm**, a crater left by
+  repeated centre-line scoops, with powder heaped toward the wall. The fixed
+  stroke goes through the centre. The bowl is 11.5 mm deep and its lowest
+  point is planned onto the floor, so most of its mouth stays above the
+  powder.
+- The log's "powder surface z=0.0119: a 20.1mm bed" is the **rim-based
+  assumption**, not a measurement. It misleads, and should be reworded or
+  replaced by the npz centre median.
+- Differences from the 17:00 success: the tool_offset x was 51-52 mm then
+  (ruler: 52.9) and is 40.7-47.3 on today's later picks. With the bowl driven
+  to the floor, that changes where it bites, not whether it is deep enough. Not
+  ruled out.
+- Later, at the user's request ("从接触粉面开始挖"): the scoop depth comes from the
+  **measured** surface again, with the stroke still fixed. `_choose_line` no
+  longer returns early for a fixed line: it reads that line's level from the
+  scan (and draws the map PNG again). `depth_from_map` True puts the tip
+  `map_tip_depth` 16 mm under that level, never nearer than 3 mm to the floor.
+  The floor rule is used when no level can be read (e.g. the rim band leaves <4
+  cells). `map_min_bed` and the immersion check **no longer fail the
+  scoop**: a thin bed prints a WARNING and digs to the floor, and a shallow tip
+  prints a WARNING and sweeps. The misleading "powder surface ...: a 20mm bed"
+  line now says "rim-based guess". Not tested on the robot; compiles.
+  On a ~9 mm bed this gives the same depth as the floor rule (the floor binds),
+  so it will not fix the empty scoops by itself.
+- Not done on purpose: descending until the tool *feels* the powder. The
+  impedance descent already stops 4-5 mm short in free motion (the "sag"), and
+  loose powder pushes back far less than that, so a force threshold cannot
+  tell contact from sag.
+- Then (the user: same entry every time; read the powder height at that point;
+  go down to it; then dig): with a fixed stroke the level is now the mean of
+  the map cells over the first `entry_patch` 12 mm of the bite, as wide as the
+  bowl. It needs >=2 cells, and otherwise falls back to the 60 % strip. The descent is now
+  two stages: first to "tip on the surface at the entry"
+  (`touch = entry + scoop_depth`), printed as "[Scoop] Down to the powder
+  surface at the entry ...", then "Digging in: ..." to the dig depth as
+  before. On the 22:39 scan the entry patch reads z 9.1 mm (14 cells)
+  against the old strip's 7.2, so ~12 mm over the floor, giving a ~9 mm dig. Not
+  tested on the robot.
+
+### 2026-11-04 ~22:5x — Why the 17:00 red cabbage scoop worked and today's don't (the user: "not a powder problem")
+
+- Scoop logs compared line by line (17:00 step 16 against 22:39 scoop-only): the
+  same bench defaults; depth (tip 18.2 against 17.1 mm, floor gap 3); the same
+  stroke (60°, −29 → +22 mm, 52 mm); descent sag 4.5/4.6 compensated; sweep
+  12/12; lift and roll. **The motion is the same.**
+- What differs is the **spoon grasp**. The measured tool offset x was
+  **0.051-0.052 on all three spoon picks at 17:00** (ruler 52.9). On every
+  spoon pick since 21:39 it is **0.043-0.047**. The spoon's cloud also
+  changed: end widths A 7.4 / B 25.3 mm and dims 82×32 mm at 17:00, against
+  A 16.8 / B 23.7 and 87×49 mm at 22:33. The handle reads 17 mm wide, so
+  something besides the spoon is in its mask. The spoon (and holder) moved
+  from (0.742, +0.055) to (0.686, -0.113).
+- In the same 21:39 run, the baking soda scoop also brought nothing (`s10`
+  check: "suspect ... no visible powder"). Citric (s03, offset 0.047) did. So it
+  is not specific to the red cabbage dish, but it is not cleanly the grasp
+  either. Undecided. A bench look at how the spoon sits in the jaws is the
+  next step.
+
+### 2026-11-05 12:07 Magic Beaker run: 31/31, 31.5 min; A into C now 90°, pours no longer fail when short
+
+- `experiments/run_20261105_120720/agent_run_20261105_123900.json`: success, 1890.6 s,
+  every step ok. (12:03 before it never started: "FrankaInterface not ready", the
+  control stack was not up.)
+- Photo checks: s03 citric dump ok; s10 baking soda dump "suspect, no visible
+  powder", **but the user watched it dump: the check is wrong there** (white
+  powder into clear water barely shows in the photos). s17 red cabbage into the
+  beaker ok (dark liquid); s23, s24 ok; s27 A into C "suspect, cup C appears
+  empty", **the user saw it pour some, just not much**; s30 B into C ok.
+- So the s10 "suspect" in the 21:39 run is not evidence that the baking soda
+  scoop was empty either. Treat the baking soda check as unreliable, and do
+  not use it to argue about the spoon grasp.
+- s27: A poured at `POUR_FIRST_INTO_SHARED_DEG` 65° (console l.1429-1470), the
+  arm got there cleanly, and only a little came out (the user, at the bench). A was short: s23, the
+  beaker into A at 60°, held at **49.9°** (l.1295). `tip_tol_deg` is 25, so
+  49.9 counted as reaching the 60° step. The 65° was the 2026-10-15 estimate
+  (~75% of ~25 ml), never seen on the robot until now.
+- Changes (the user: "increase A tip amount; if it doesn't reach it, do not
+  throw an error and give up, just continue on"):
+  - `POUR_FIRST_INTO_SHARED_DEG` 65 → **90** (`agent_orchestrator.py`). A empties
+    into C; C still fizzes when B goes in. Catalog pour note and
+    `test_agents_offline.py` (two cups into one) updated; that test passes.
+  - `pour.py` `_pour_over_lip` (the path every bench pour takes): a tip step
+    still short after `step_retries` no longer goes home and fails. It prints
+    "WARNING: could not tip to N°", holds at the furthest tip reached, rights
+    the cup and goes home, and returns success with `tip_short_of` = the step it
+    missed. A refused trip home still fails (arm left holding the cup).
+    The older `_tip_sequence` path (no source geometry) is unchanged.
+  - Not on the robot yet.
+- Open: why the beaker held at 49.9° when 60° was commanded. Probably the arm
+  lagging the last step under the 50 ml load; `tip_tol_deg` 25 hides it.
+
+### 2026-11-05 — Evidence audit for the RA-L paper (no code changed)
+
+Counted from the records and `console.log`s in `experiments/`; the afternoon
+runs below were read from their logs only (step lines and FAILED lines), not
+inspected frame by frame.
+
+- **From-scratch full protocols since the current orchestrator (2026-11-04
+  17:00 on):** Magic Beaker **3 clean of 8 started** — 17:00 ✓ (31/31),
+  20:33 / 20:48 / 21:09 partial (keep-going passed over failed dumps and a
+  beaker pick), 21:39 interrupted, 11-05 12:07 ✓, **14:08 ✗** (step 2 scoop
+  jammed in the citric dish at +30° then +55°, arm faulted, steps 3-19
+  INFEASIBLE), **14:13 ✓** (31/31). Jellyfish (pipette/dispense version)
+  **15:06 ✗** (spoon lost on the lift, step 1), **15:10** stopped at step 5
+  (stirrer at x 0.77 clamped to 0.75), **15:17 ✓** (20/20). The 14:08-15:17
+  runs were not in this file before this entry.
+- **"31/31" is the skills' own report, not the chemistry outcome.** Since
+  today a short pour returns success (`tip_short_of`), keep-going passes over
+  failures, and the photo checker is wrong on white powder into water (s10).
+  Even the 12:07 run had A into C "only a little". No run measured mass or
+  volume (`quantity_measured: false`).
+- **Repeated trials on one code version exist only for the label
+  experiments** (160/160, 0/96 wrong, cameras only). The P4 perturbation test
+  and the P5 speed ablation have never been run; Tables III-VI are empty.
+- **Table I check:** a web search places AgentChemist (arXiv 2603.23886) on a
+  mobile chassis; Table I says "Dual-arm". The dual-arm platform is
+  RoboChemist's (Cobot Magic ALOHA). Verify from the PDF before submitting.
+- What the paper still needs, in order (told to the user): freeze a commit;
+  ≥10 from-scratch runs per protocol on varied layouts with a strict success
+  definition (no hand help, physical outcome judged by a person or a scale)
+  and interventions counted; the P4 perturbation test against locate-once;
+  per-skill quantities on a scale (g per scoop, ml poured); an offline P1
+  parse test on many worksheet photos; P5 ablation or drop P5 as a claim.

@@ -111,7 +111,9 @@ def main() -> int:
         camera = open_cameras(args.cameras, args.bench)
 
     print("Writing the report (the model may look at the bench as it goes)...")
-    path = write_report(records, camera=camera, record_paths=paths, out_dir=args.experiments,
+    # A record in a per-run folder gets its report there too.
+    out_dir = record.parent if record.parent.name.startswith("run_") else args.experiments
+    path = write_report(records, camera=camera, record_paths=paths, out_dir=out_dir,
                         notes=args.note, console_logs=logs)
     print(f"Report: {path}")
     return 0

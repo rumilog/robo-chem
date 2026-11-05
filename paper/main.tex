@@ -175,10 +175,11 @@ re-perceives before every skill call (P4), sets how each skill runs,
 including speed, from what is handled (P5).}
 \todo{Result: one end-to-end number (runs, sub-tasks completed,
 interventions, time) and one number each from the label and perturbation
-experiments. Label number available now (Sec.~\ref{sec:exp_labels}): 80/80
-locates found the right container on printed and handwritten labels, and
-0 of 96 returned the wrong container when it was moved away from its
-label. Pick one; the first is the easier one to state in a clause.}
+experiments. Label number available now (Sec.~\ref{sec:exp_labels}): 160/160
+locates found the right container on printed labels and the handwriting of
+three people, and 0 of 96 returned the wrong container when it was moved
+away from its label. Pick one; the first is the easier one to state in a
+clause.}
 \todo{Takeaway: one step closer to a robot doing bench chemistry the way
 people do. Avoid "human reasoning", "thinks like a chemist",
 "human-level".}
@@ -270,12 +271,10 @@ The contributions of \sysname{} are as follows:
   hand-written or printed labels, which they stand on, read in each of four
   camera views and combined by a cross-camera vote. Because the position of
   each container comes from multi-view geometry, the label only needs to say
-  what the container is and can be placed loosely.
-  \todo{identification accuracy: e.g.\ "found the right container in all
-  80 locates with printed and handwritten labels, and never picked the
-  wrong one in 96 locates with containers moved off their labels"
-  (Tables~\ref{tab:label_reading}, \ref{tab:label_distance}). Update the
-  80 once the other handwriting sets are scanned.}
+  what the container is and can be placed loosely. It found the right
+  container in all 160 locates with printed labels and the handwriting of
+  three people, and it never picked the wrong container in 96 locates with
+  a container moved away from its label.
   \item Re-locating and re-identifying the containers before every step,
   so the robot finds a container a person has moved between steps, even
   among identical-looking ones. We compare this against locating objects
@@ -569,9 +568,11 @@ experiment report written after the run.}
 %   - Label distance test, labelled vs unlabelled
 %     (scripts/label_distance_test.py,
 %     experiments/label_distance_20261029/ on the robot PC only)
-% The raw data (scans.jsonl, report.md) is gitignored and not on the
-% laptop; every number below was copied from progress.md. Check the
-% tables against report.md on the robot PC before submitting.
+% The raw data (scans.jsonl, report.md) is gitignored and lives on the
+% robot PC only. Every number below was checked against report.md and
+% scans.jsonl there on 2026-11-04; the per-camera counts were computed
+% from label_matches in scans.jsonl (each camera's read on the container
+% the vote chose).
 % =====================================================================
 \section{Experiments}
 \label{sec:experiments}
@@ -594,36 +595,41 @@ Table~\ref{tab:e2e}.}
 \subsection{Identifying Containers by Their Labels (P3)}
 \label{sec:exp_labels}
 
-\todo{Shared protocol, 2-3 sentences, before either result. Four
-containers in a square in front of the arm: two identical white dishes
-(red cabbage powder, baking soda), a clear cup (10\,ml water) and a
-plastic beaker (vegetable oil), each standing on its paper label. The
-reader chooses among exactly these 4 label strings. Cameras only; the arm
-does not move. Each locate is the same call a skill makes, with every
-memory cleared first (kept scans, last known position, tracked objects),
-so no locate is helped by the one before. Ground truth: each container's
-position located with label reading switched off and named by its
-corner, repeated 3 times (agreed within 0.4\,mm). Score: right container,
-wrong container, or not found; about 14\,s per locate with all four
-cameras.}
+Both label experiments use the same bench. Four containers stand in a
+square in front of the arm, each on its paper label: two identical white
+dishes (red cabbage powder and baking soda), a clear plastic cup (10\,ml
+water) and a plastic beaker (vegetable oil). The reader chooses among
+exactly these four label strings. Only the cameras are used; the arm does
+not move. Each locate is the same call a skill makes, and every memory is
+cleared before it (kept scans, last known position and tracked objects),
+so no locate is helped by the one before. A locate is settled \emph{by
+label} when at least one camera reads the wanted label on the container
+the vote chooses, and \emph{by elimination} when no camera reads it but
+every other label of that kind of container is placed on another one.
+Otherwise it returns \emph{not found} instead of a guess. The ground truth
+is each container's position located with label reading switched off and
+named by its corner of the square; three repeats agreed within 0.4\,mm. A
+locate with all four cameras took 14.1\,s on average (13.2 to 18.1\,s).
 
-\textbf{Label legibility.} \todo{2-3 sentences. Same bench, labels swapped
-between sets: printed, then handwritten by different people; 10 locates
-of each container per set (Table~\ref{tab:label_reading}). Result: every
-locate found the right container, with a mean position offset of 0.2\,mm.
-Point out that the vote is doing work: single cameras did misread
-(camera 3 read the red cabbage dish as another label on both printed and
-handwritten paper, probably because it sees that paper sideways at a low
-angle), and the other cameras outvoted it every time. This is the
-single-camera vs.\ vote ablation (Table~\ref{tab:ablations}): the
-per-camera reads are already in \texttt{scans.jsonl}, so the single-camera
-row can be computed offline without new robot time. Do not name the
-writers (double-anonymous review).}
+\textbf{Label legibility.} The labels were swapped between four sets:
+printed, and handwritten by three different people. In each set every
+container was located 10 times (Table~\ref{tab:label_reading}). All 160
+locates found the right container, with a mean offset of 0.2\,mm from the
+ground truth and at most 1.1\,mm. The vote across cameras is needed for
+this. In 21 of the 160 locates one camera read another label on the right
+container: camera 3 in 11, always on the red cabbage dish and on both
+printed and handwritten paper, probably because it sees that paper
+sideways at a low angle; camera 4 in 9, all on the beaker and 8 of them in
+one handwriting set; and camera 2 once. No locate had more than one camera
+misreading, so the other three outvoted it every time. Used alone, camera
+3 would have found at most 149 of the 160 containers
+(Table~\ref{tab:ablations}).
 
 \begin{table}[t]
-  \caption{\todo{Caption: what a set is, that the last column counts
-  locates where all four cameras read the right label, and that offsets
-  are from the label-free ground truth.}}
+  \caption{Label reading on four label sets, each container located 10
+  times per set. Offsets are from the ground truth located without
+  labels. The last column counts locates in which all four cameras read
+  the right label on the container.}
   \label{tab:label_reading}
   \centering
   \footnotesize
@@ -631,39 +637,46 @@ writers (double-anonymous review).}
     \toprule
     Label set & Locates & Correct & \makecell{Offset (mm)\\mean / max} & \makecell{All 4 cameras\\read it} \\
     \midrule
-    Printed       & 40   & 40/40     & 0.2 / 0.4  & 35/40 \\
-    Handwriting 1 & 40   & 40/40     & 0.2 / 1.1  & 33/40 \\
-    Handwriting 2 & \tbd & \tbd/\tbd & \tbd       & \tbd  \\
-    Handwriting 3 & \tbd & \tbd/\tbd & \tbd       & \tbd  \\
+    Printed       & 40  & 40/40   & 0.2 / 0.4 & 35/40 \\
+    Handwriting 1 & 40  & 40/40   & 0.2 / 1.1 & 33/40 \\
+    Handwriting 2 & 40  & 40/40   & 0.2 / 0.5 & 32/40 \\
+    Handwriting 3 & 40  & 40/40   & 0.2 / 0.8 & 39/40 \\
+    \midrule
+    Total         & 160 & 160/160 & 0.2 / 1.1 & 139/160 \\
     \bottomrule
   \end{tabular}
-  % Handwriting 1 = the first handwritten set of 2026-10-29. Its "33/40"
-  % comes from progress.md: red cabbage read by 3 of 4 cameras in 7 of 10
-  % scans, every other locate 4 of 4. Handwriting 2 and 3 are the planned
-  % sets (scan --set NAME); fill from report.md once scanned, or delete
-  % the rows. If you mean to call any set "bad handwriting" in the text,
-  % put an example crop of each set in a figure so the reader can judge.
+  % From experiments/label_benchmark_20261029/ on the robot PC (report.md
+  % and scans.jsonl, checked 2026-11-04). Sets in the order scanned on
+  % 2026-10-29: printed, then three writers (names in scans.jsonl; keep
+  % them out of the paper while under review). If you mean to call any set
+  % "bad handwriting" in the text, put an example crop of each set in a
+  % figure so the reader can judge.
 \end{table}
 
-\textbf{Distance from the label.} \todo{3-4 sentences. One container at a
-time is moved away from its label to 5-6 spots, 3 locates per spot, 96
-locates in all; the distance is the hand-measured move of its centre.
-Two phases per container: the other three labels left on the bench, and
-removed (Table~\ref{tab:label_distance}). Headline: none of the 96 locates
-returned the wrong container; a miss is always "not found". With the
-other labels present nothing was lost, because elimination found the
-container whenever its own label was out of view. With them removed,
-16 of 48 locates were not found. Then the finding that matters for
-setting up a bench: centre distance does not predict a read. What does is
-whether the container still stands on or against its paper (the water cup
-was read 18\,cm from its spot against the edge of its paper, and missed at
-16\,cm with bare table in between). Say this is seen in a few frames and
-not measured as an edge-to-paper gap.}
+\textbf{Distance from the label.} One container at a time (the baking
+soda dish, the water cup or the beaker) was moved away from its label to
+5 or 6 spots between 2 and 44\,cm, and located 3 times at each spot, 96
+locates in all. The distance is how far its centre moved, measured by
+hand. Each container was tested twice: with the other three labels left on
+the bench, and with those labels removed while their containers stayed
+(Table~\ref{tab:label_distance}). None of the 96 locates returned the
+wrong container; every miss was \emph{not found}. With the other labels
+present no locate failed, because whenever the moved container's own
+label was not read, elimination found it (10 locates). With the other
+labels removed, 16 of 48 locates were not found. The distance of the
+centre does not predict whether the label is read. The water cup was read
+by all four cameras 18\,cm from its spot, standing against the edge of its
+paper, and was not found at 16\,cm with bare table between it and the
+paper. The baking soda dish was not read at 6\,cm, where it stood on top
+of its own text. What decides the read is whether the label is still in
+view beside the container, that is, whether the container stands on or
+against its paper. We saw this in a few frames and did not measure the gap
+from the container to its paper or the direction of the move.
 
 \begin{table}[t]
-  \caption{\todo{Caption: one container moved per row, 3 locates per
-  spot; "others' labels" says whether the other three labels stayed on
-  the bench; "wrong" is a locate that returned another container.}}
+  \caption{Locates with one container moved away from its label, 3 per
+  spot. ``Others' labels'' says whether the other three labels stayed on
+  the bench; ``wrong'' is a locate that returned another container.}
   \label{tab:label_distance}
   \centering
   \footnotesize
@@ -684,26 +697,29 @@ not measured as an edge-to-paper gap.}
     Total                             &     & 96 & 68 & 12 & 0 & 16 \\
     \bottomrule
   \end{tabular}
-  % From progress.md "Label distance test" (2026-10-29). Spots ran from
+  % From experiments/label_distance_20261029/report.md on the robot PC
+  % (checked 2026-11-04; the 3 locates with no label reads at all, a
+  % network failure, were on-label checks and are not in this table).
+  % Spots ran from
   % about 6 cm to 44 cm; the farthest spot that was always read by label
   % was 11-21 cm depending on the container. If there is room, a column
   % "farthest always read" (13.1, 18, 12.3, 18, 20.8, 11.2 cm) helps, but
   % keep the caveat that direction from the paper was not recorded.
 \end{table}
 
-\todo{Two caveats belong in the text, not only in Limitations.
-(1)~Elimination fired 2 times with the other papers removed because the
-reader named a container from what it holds (the red powder read as RED
-CABBAGE POWDER; the water cup as 10 ML WATER). Report it honestly: the
-"off" rows are not a clean "no other labels" condition. (2)~A few
-far-away "by label" reads came from a single camera and were not checked
-against the frames; count them as by label but say so, or check the
-frames first.}
-
-\todo{Why elimination was not switched off in code for the "off" phase:
-taking the other papers away removes the container's only elimination
-partner without changing the system, so the bench test runs the same
-code as a real run. One sentence; a reviewer may ask.}
+Two results need care. First, with the other labels removed, elimination
+still settled 2 of the 48 locates, because the reader named a container
+from what it holds: one camera read the red cabbage dish as ``red cabbage
+powder'' from its red powder, and another read the water cup as ``10\,ml
+water''. The rows without the other labels are therefore not a clean
+condition with no other labels. Second, two far reads counted as by label
+rest on a single camera and were not checked against the frames: the
+baking soda dish at 44\,cm (2 of 3 locates) and at 18\,cm without the
+other labels. They may come from the contents of the dish and not from its
+label. Elimination was not switched off in the code for the phase without
+the other labels. Removing those labels takes away the moved container's
+only elimination partner without changing the system, so the test runs the
+same code as a real run.
 
 \subsection{Robustness to People Moving Things (P4)}
 \todo{A person moves or swaps a container between steps at random.
@@ -725,12 +741,16 @@ Not yet run on the robot as of 2026-10-27.}
     \toprule
     Property & Condition & Success & Time (s) \\
     \midrule
-    \multirow{2}{*}{P3 labels}  & Single camera        & \tbd & \tbd \\
-                                & Cross-camera vote    & 80/80 & 14 \\
-    % P3: the vote row is the label reading benchmark (printed + first
-    % handwritten set, ~14 s per locate). Single camera: score each
-    % camera's own read in scans.jsonl against ground truth, same 80
-    % locates. Update both rows when more handwriting sets are added.
+    \multirow{2}{*}{P3 labels}  & Single camera (cam.~3) & $\leq$149/160 & -- \\
+                                & Cross-camera vote    & 160/160 & 14.1 \\
+    % P3: the vote row is the label reading benchmark (all four sets,
+    % 14.1 s mean per locate). Single camera: each camera's read on the
+    % container the vote chose (label_matches in scans.jsonl): cam 2
+    % 159/160, cam 3 149/160, cam 4 151/160, cam 5 160/160. It is an upper
+    % bound: a camera alone also fails when it reads the wanted label on a
+    % second instance, and the jsonl cannot tell a duplicate mask of the
+    % same container from a neighbour (no per-instance positions logged).
+    % Not timed alone, hence "--".
     \midrule
     \multirow{2}{*}{P4 rescan}  & Locate once at start & \tbd & \tbd \\
                                 & Before every skill   & \tbd & \tbd \\

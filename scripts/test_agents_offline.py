@@ -657,7 +657,7 @@ def test_a_container_put_down_between_its_pours_still_keeps_some():
 
 
 def test_the_first_of_two_pours_into_one_cup_keeps_some():
-    """A, then B, into C: 65 then 90 (the user, 2026-10-15: first 60, then 65)."""
+    """A, then B, into C: both at 90 (65 until 2026-11-05: A put nothing into C)."""
     print("\n[loop: two cups into one]")
     subtasks = [subtask("pick_up clear cup a"),
                 subtask("pour from clear cup a into clear cup c at 80 degrees", "clear cup c"),
@@ -678,7 +678,7 @@ def test_the_first_of_two_pours_into_one_cup_keeps_some():
     outcome = orchestrator.run("make the magic beaker")
     pours = [p["pour_angle"] for n, p in skills.calls if n == "pour"]
     check("the run succeeds", outcome.success, outcome.reason)
-    check("A into C at 65, B into C at 90", pours == [65.0, 90.0], f"{pours}")
+    check("A into C at 90, B into C at 90", pours == [90.0, 90.0], f"{pours}")
     check("the record says C is poured into again",
           "poured into again at sub-task 5" in outcome.record["steps"][1]["adjusted"],
           f"{outcome.record['steps'][1].get('adjusted')}")

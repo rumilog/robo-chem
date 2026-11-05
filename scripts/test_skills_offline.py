@@ -2726,8 +2726,8 @@ def test_executor_uses_bench_names():
           "release_clearance" not in back, f"{back}")
     ex.held = None
     cup_pick = {"slide_in": 0.06, "z_offset": CLEAR_CUP_GRASP_Z_OFFSET, "grip_width": 0.058}
-    # The water cups A and B are taken 6 mm further forward (the user,
-    # 2026-10-20); C is not.
+    # The water cups A and B are taken further forward, on their centre (the
+    # user, 2026-10-20 and 2026-11-04); C is not.
     check("cups B and C are slid into from behind, at the bench z_offset, closed to 58 mm",
           ex._bench_defaults("pick_up", {"object_name": "clear cup b"})
           == {"object_name": "clear cup b", **cup_pick,

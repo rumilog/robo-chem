@@ -26,6 +26,7 @@ always have. Moving the cup is what fixes the reach.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -34,17 +35,20 @@ import numpy as np
 from robochem.skills.dump import reachable_tip_deg
 
 #: A dump that can tip less than this is fixed by moving its target. The dump
-#: skill itself stops below its min_tip_deg (45 on the bench); a bowl tipped
+#: skill itself stops below its min_tip_deg (40 on the bench since 2026-11-04); a bowl tipped
 #: only 45-60 deg empties poorly.
 DUMP_TIP_TOO_LOW = 60.0
 #: Below this the dump skill itself refuses (the bench's min_tip_deg).
-DUMP_MIN_TIP = 45.0
+DUMP_MIN_TIP = 40.0
 #: What a moved dump target must allow at its new spot (79 is the default
 #: dump angle; 0.50 m from the base gives 78).
 DUMP_TIP_WANTED = 75.0
 #: Distance from the base (m) outside which a pour, stir or dispense target is
 #: moved. A guess, not measured: stirs and pours have worked out to ~0.6 m.
-TARGET_REACH = (0.30, 0.60)
+#: Was 0.60; on 2026-11-04 pours into cup A at 0.61-0.62 m worked twice (17:00
+#: at (0.600, +0.149), 21:39 at (0.566, -0.229)), and flagging A at 0.61 sent
+#: it on a move to the far side that the robot refused, holding the cup.
+TARGET_REACH = (0.30, 0.65)
 #: Where a moved container may stand: the sim's LAYOUT_REACH (0.35-0.56),
 #: its outer edge pulled in so a dump there reaches ~78 deg.
 SPOT_REACH = (0.35, 0.50)
@@ -65,13 +69,27 @@ SCOOP_MAX_X = 0.60
 #: limits, so it alone is not enough.
 DUMP_SPOT_X = (0.39, 0.46)
 DUMP_SPOT_MAX_ABS_Y = 0.14
+#: No moved container goes further to the side than this, whatever its step.
+#: 2026-11-04 22:07: a pour-only cup A was sent to (0.380, -0.320); the hover
+#: over it was refused (joint_motion_generator velocity/acceleration
+#: discontinuity), reset_joints too, and the arm was left holding the cup.
+MOVE_MAX_ABS_Y = 0.21
 #: Tall containers keep this far from a dish being scooped: the scooping hand
 #: hit them at 144-161 mm in sim and cleared 172 mm (LAYOUT_SCOOP_CLEARANCE
 #: rounds that to 0.18).
 DISH_CLEARANCE = 0.17
-#: A container farther than this is not fetched: the pick hovers 60 mm
-#: behind it and the safety clamp stops the hand at x 0.75.
-MAX_FETCH_REACH = 0.72
+#: A container farther out than this (x, m) is not fetched: the safety clamp
+#: stops the hand at x 0.75 and the cup picks land ~10 mm past the centre.
+#: Was a 0.72 m radius until 2026-11-04, which left cup B at (0.734, -0.144),
+#: 0.75 m out, where it was while the same run picked the spoon at x 0.747.
+MAX_FETCH_X = 0.745
+MAX_FETCH_REACH = 0.78
+#: When the dump box is full (2026-11-04 20:33: the citric acid dish at
+#: (0.407, -0.023) and cup C at (0.395, +0.090) left no room in it), a dump
+#: target may go here instead, as long as it still tips DUMP_TIP_TOO_LOW. The
+#: |y| edge stays inside the (0.428, +0.233) spot whose carry fell 28 mm short.
+DUMP_WIDE_X = (0.39, 0.50)
+DUMP_WIDE_MAX_ABS_Y = 0.21
 #: Containers wider than this (radius, m) are not picked up to be moved.
 MAX_MOVABLE_RADIUS = 0.040
 #: The scoop's tool offset for planning: measured at the pick 40.6-47.3 mm
@@ -114,9 +132,15 @@ class Preflight:
         out = []
         for sub in plan.subtasks:
             target = str(getattr(sub, "target_container", "") or "").strip()
-            if not target or target.lower() == "none":
-                continue
             text = sub.description.lower()
+            if not target or target.lower() == "none":
+                # The planner leaves a scoop's target empty ("scoop from citric
+                # acid cup with the larger spoon"), so its dish was never seen
+                # here and DISH_CLEARANCE never applied (2026-11-04).
+                m = re.search(r"scoop\b.*?\bfrom (?:the )?(.+?)(?: with | using |$)", text)
+                if m:
+                    out.append(("scoop", m.group(1).strip()))
+                continue
             kind = next((k for word, k in _KINDS if word in text), None)
             if kind is not None:
                 out.append((kind, target))
@@ -158,7 +182,20 @@ class Preflight:
         dishes = [found[n] for n, kinds in targets.items()
                   if "scoop" in kinds and found.get(n)]
 
-        for name, kinds in targets.items():
+        def urgency(item):
+            # Worst dump first: free room near the base is scarce, and on
+            # 2026-11-04 cup A (54°, dumps fine) would have taken the only
+            # spot left for cup B (22°, refused).
+            name, kinds = item
+            loc = found.get(name)
+            if loc is None:
+                return -1.0
+            if "dump" not in kinds:
+                return 90.0
+            xy = np.asarray(loc["rim_center"], float)[:2]
+            return reachable_tip_deg(xy, float(loc["top_z"]), PLAN_TOOL_OFFSET)
+
+        for name, kinds in sorted(targets.items(), key=urgency):
             loc = found.get(name)
             if loc is None:
                 # Its step would fail the same way, after the arm had already
@@ -182,13 +219,14 @@ class Preflight:
             self.say(f"[preflight] {name} at ({xy[0]:.3f}, {xy[1]:+.3f}): {why}")
             movable, reason = self._movable(name)
             if "scoop" in kinds and not movable:
-                # The scoop would jam after the pick_up; stop while nothing has moved.
-                report["blocked"] = f"{name}: {why}; move it closer to the robot by hand"
-                self.say(f"[preflight] {report['blocked']}")
-                break
-            if movable and r > MAX_FETCH_REACH:
-                movable, reason = False, (f"{r:.2f} m out, beyond where the arm can pick "
-                                          f"it up; move it closer by hand")
+                # Was a stop; the scoop at x 0.604 worked on 2026-11-04, and
+                # keep-going passes over one that jams.
+                report["warnings"].append(f"{name}: {why}; move it closer to the robot by hand")
+                self.say(f"[preflight]   not moving it: {reason}; the scoop may jam")
+                continue
+            if movable and (xy[0] > MAX_FETCH_X or r > MAX_FETCH_REACH):
+                movable, reason = False, (f"x {xy[0]:.3f}, {r:.2f} m out, beyond where the arm "
+                                          f"can pick it up; move it closer by hand")
             if not movable:
                 report["warnings"].append(f"{name}: {why}; not moved: {reason}")
                 self.say(f"[preflight]   not moving it: {reason}")
@@ -196,15 +234,9 @@ class Preflight:
             spot = self._find_spot(name, loc, need_dump="dump" in kinds, dishes=dishes,
                                    others=[found[n] for n in targets if n != name and found[n]])
             if spot is None:
-                if "dump" in kinds and row.get("dump_tip", 90.0) < DUMP_MIN_TIP:
-                    # The dump would refuse it after the scoop; say so now.
-                    report["blocked"] = (
-                        f"{name} is out of reach for the dump ({why}) and no free spot "
-                        f"in the dump box x {DUMP_SPOT_X[0]:.2f}-{DUMP_SPOT_X[1]:.2f}, "
-                        f"|y| <= {DUMP_SPOT_MAX_ABS_Y:.2f} is clear of everything else: "
-                        f"make room there by hand")
-                    self.say(f"[preflight] {report['blocked']}")
-                    break
+                # A dump that will refuse it is still not a reason to stop the
+                # whole run (the user's call, 2026-11-04): keep-going passes
+                # over that one step.
                 report["warnings"].append(f"{name}: {why}; no free spot in reach")
                 self.say(f"[preflight]   no free spot in reach found; leaving it")
                 continue
@@ -212,6 +244,10 @@ class Preflight:
             report["moved"].append({"object": name, "from": [round(float(v), 4) for v in xy],
                                     "to": [round(float(v), 4) for v in spot],
                                     "why": why, "ok": ok, "detail": detail})
+            if ok:
+                # The next container's spot search must avoid where this one now stands.
+                rim = list(np.asarray(loc["rim_center"], float))
+                found[name] = {**loc, "rim_center": [float(spot[0]), float(spot[1])] + rim[2:]}
             if not ok:
                 report["blocked"] = f"moving {name} out of the way failed: {detail}"
                 # A pick that gave up leaves the hand wherever it stopped.
@@ -301,12 +337,33 @@ class Preflight:
         dish_xy = [np.asarray(d["rim_center"], float)[:2] for d in dishes]
         top_z = float(loc["top_z"])
 
+        best = self._nearest_spot(here, radius, occupied, containers, dish_xy, top_z,
+                                  need_dump, DUMP_SPOT_X, DUMP_SPOT_MAX_ABS_Y, DUMP_TIP_WANTED)
+        if best is None and need_dump:
+            best = self._nearest_spot(here, radius, occupied, containers, dish_xy, top_z,
+                                      need_dump, DUMP_WIDE_X, DUMP_WIDE_MAX_ABS_Y,
+                                      DUMP_TIP_TOO_LOW)
+            if best is not None:
+                self.say(f"[preflight]   dump box full; using the wider area x "
+                         f"{DUMP_WIDE_X[0]:.2f}-{DUMP_WIDE_X[1]:.2f}, |y| <= "
+                         f"{DUMP_WIDE_MAX_ABS_Y:.2f}")
+        if best is not None:
+            self.say(f"[preflight]   free spot ({best[0]:.3f}, {best[1]:+.3f}), "
+                     f"{np.linalg.norm(best):.2f} m from the base, "
+                     f"{np.linalg.norm(best - here) * 100:.0f} cm "
+                     f"from where it stands ({len(occupied)} occupied cells, "
+                     f"{len(containers)} other containers avoided)")
+        return best
+
+    @staticmethod
+    def _nearest_spot(here, radius, occupied, containers, dish_xy, top_z,
+                      need_dump, box_x, box_abs_y, min_tip):
         best, best_d = None, None
         for x in np.arange(SPOT_MIN_X, SPOT_REACH[1] + 1e-9, GRID):
             for y in np.arange(-SPOT_REACH[1], SPOT_REACH[1] + 1e-9, GRID):
                 p = np.array([x, y])
                 r = float(np.linalg.norm(p))
-                if not (SPOT_REACH[0] <= r <= SPOT_REACH[1]):
+                if not (SPOT_REACH[0] <= r <= SPOT_REACH[1]) or abs(y) > MOVE_MAX_ABS_Y:
                     continue
                 d = float(np.linalg.norm(p - here))
                 if best_d is not None and d >= best_d:
@@ -317,17 +374,11 @@ class Preflight:
                     continue
                 if any(np.linalg.norm(c - p) < DISH_CLEARANCE for c in dish_xy):
                     continue
-                if need_dump and not (DUMP_SPOT_X[0] <= x <= DUMP_SPOT_X[1]
-                                      and abs(y) <= DUMP_SPOT_MAX_ABS_Y):
+                if need_dump and not (box_x[0] <= x <= box_x[1] and abs(y) <= box_abs_y):
                     continue
-                if need_dump and reachable_tip_deg(p, top_z, PLAN_TOOL_OFFSET) < DUMP_TIP_WANTED:
+                if need_dump and reachable_tip_deg(p, top_z, PLAN_TOOL_OFFSET) < min_tip:
                     continue
                 best, best_d = p, d
-        if best is not None:
-            self.say(f"[preflight]   free spot ({best[0]:.3f}, {best[1]:+.3f}), "
-                     f"{np.linalg.norm(best):.2f} m from the base, {best_d * 100:.0f} cm "
-                     f"from where it stands ({len(occupied)} occupied cells, "
-                     f"{len(containers)} other containers avoided)")
         return best
 
     # --------------------------------------------------------------- move

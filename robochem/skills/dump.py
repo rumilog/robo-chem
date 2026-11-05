@@ -215,7 +215,16 @@ class DumpSkill(BaseSkill):
             # +X is forward from the base, so negative pulls it back.
             "forward_offset": 0.0,
             "lateral_offset": 0.0,
-            "hover_tol": 0.02,
+            # Where the carry must end, split by direction (2026-11-04; was
+            # one 3D hover_tol of 0.02). Sideways, the bowl must stay over the
+            # opening: a 72 mm cup, a 20.5 mm bowl and 6 mm of margin leave
+            # 36 - 10 - 6 = 20 mm. Lower than planned eats into the 10 mm rim
+            # clearance. Higher only drops the powder further: the misses on
+            # 2026-10-22 (28 mm, 25 of it high) and 2026-11-04 (22 mm, 19 high,
+            # 12 sideways) were both the arm stopping high.
+            "hover_tol_xy": 0.020,
+            "hover_tol_below": 0.010,
+            "hover_tol_above": 0.040,
             "tip_tol_deg": 10.0,
             # Warn when the bowl ends up further than this from over the
             # target: the powder is then landing somewhere else.
@@ -285,7 +294,6 @@ class DumpSkill(BaseSkill):
         tip_tol = float(params["tip_tol_deg"])
         min_tip = float(params["min_tip_deg"])
         reach_limit = PANDA_REACH - float(params["reach_margin"])
-        hover_tol = float(params["hover_tol"])
         tool_offset = self.resolve_tool_offset(params)
 
         print(f"[Dump] Emptying the scoop into '{target}'")
@@ -457,13 +465,24 @@ class DumpSkill(BaseSkill):
                         float(params["transfer_seconds"]), "carry"):
             rest("Failed to carry the scoop to the target")
             return False, {"error": "Failed to carry the scoop to the target"}
-        arrived, err = self.reached(start_tcp, hover_tol)
-        if not arrived:
-            rest(f"Bowl stopped {err * 1000:.0f}mm short of the cup")
+        now = np.asarray(self.get_current_pose().translation, dtype=float)
+        off = now - np.asarray(start_tcp, dtype=float)
+        off_xy, off_z = float(np.linalg.norm(off[:2])), float(off[2])
+        if (off_xy > float(params["hover_tol_xy"])
+                or off_z < -float(params["hover_tol_below"])
+                or off_z > float(params["hover_tol_above"])):
+            rest(f"Bowl stopped {off_xy * 1000:.0f}mm sideways, {off_z * 1000:+.0f}mm "
+                 f"in height from over the cup")
             return False, {
                 "error": (f"Could not bring the bowl over '{target}' "
-                          f"(off by {err * 1000:.0f}mm)"),
+                          f"({off_xy * 1000:.0f}mm sideways, {off_z * 1000:+.0f}mm in height; "
+                          f"allowed {float(params['hover_tol_xy']) * 1000:.0f}mm sideways, "
+                          f"-{float(params['hover_tol_below']) * 1000:.0f}/"
+                          f"+{float(params['hover_tol_above']) * 1000:.0f}mm in height)"),
             }
+        if np.linalg.norm(off) > 0.005:
+            print(f"[Dump] Over the cup: {off_xy * 1000:.0f}mm sideways, "
+                  f"{off_z * 1000:+.0f}mm in height from the plan")
         record("arrived")
 
         # 4. Tip, in one motion, the bowl centre fixed over the opening.

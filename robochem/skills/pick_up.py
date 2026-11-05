@@ -122,6 +122,10 @@ def tool_extent_x(points, grasp_pose):
 #: home with a +-166 deg range, so +-120 is clear whichever way it turns.
 MAX_GRASP_YAW_DEG = 120.0
 
+#: "Closed on nothing" floor for a wall grip: the jaws on a ~1 mm cup wall
+#: (not measured) read under the usual 3 mm, and fully shut read ~0.
+WALL_GRIP_MIN_WIDTH = 0.0005
+
 
 def drop_stray_points(points, radius: float = 0.003, min_neighbours: int = 8):
     """
@@ -352,6 +356,18 @@ class PickUpSkill(BaseSkill):
             # width at the jaws is known and which a force-limited close
             # crushes: the clear cups.
             "grip_width": None,
+            # Take a cup by one wall instead of across it (the user,
+            # 2026-11-04): straight down with the jaws closing along base Y,
+            # one finger inside the cup and one outside, wall_grip_inset from
+            # the cup's centre, then a force-limited close at grasp_force.
+            # "outer": the wall away from the base's centre line (y = 0);
+            # "+y" / "-y": that wall. Replaces slide_in, yaw, lateral_offset
+            # and grip_width. pour then keeps the cup's centre, not the jaws,
+            # over its target (SkillsExecutor fills the offset in).
+            "wall_grip": None,
+            # The wall at the jaws, from the cup's centre: 36.6 mm at the rim,
+            # ~30.5 mm 25 mm under it (the user's measurements, 2026-10-08).
+            "wall_grip_inset": 0.034,
             # Clear the cameras before scanning via frankapy reset_joints
             # (home), not a hardcoded XYZ park.
             "reset_before_scan": True,
@@ -371,6 +387,18 @@ class PickUpSkill(BaseSkill):
         """
         return self.validate_params(params)
     
+    @staticmethod
+    def _wall_side(want, centroid) -> int:
+        """+1 / -1: grip the cup's +y / -y wall (``wall_grip``); 0: across it."""
+        if not want:
+            return 0
+        want = str(want).strip().lower()
+        if want in ("+y", "-y"):
+            return 1 if want == "+y" else -1
+        if want != "outer":
+            print(f"[PickUp] wall_grip {want!r} is not outer / +y / -y; using outer")
+        return 1 if float(centroid[1]) >= 0.0 else -1
+
     @staticmethod
     def _grasp_yaw(params, object_pc, grasp_type, slide):
         """(yaw in radians or 0.0, what was decided) for this pick's ``yaw`` param."""
@@ -548,15 +576,24 @@ class PickUpSkill(BaseSkill):
         forward_offset = float(params["forward_offset"])
         lateral_offset = float(params["lateral_offset"])
         slide = float(params.get("slide_in") or 0.0)
-        yaw, yaw_info = self._grasp_yaw(params, object_pc, grasp_type, slide)
+        wall_side = self._wall_side(params.get("wall_grip"), centroid)
+        if wall_side:
+            slide = 0.0
+            lateral_offset = wall_side * float(params["wall_grip_inset"])
+            print(f"[PickUp] Gripping the {'+' if wall_side > 0 else '-'}y wall: "
+                  f"{abs(lateral_offset) * 1000:.0f}mm from the centre, one finger "
+                  f"inside, closing at {float(grasp_force):.1f} N")
+        yaw, yaw_info = ((0.0, None) if wall_side else
+                         self._grasp_yaw(params, object_pc, grasp_type, slide))
         grasp_pose = None
         for i, cand in enumerate(candidates):
             pose = cand.copy()
             if yaw:
                 pose[:3, :3] = yaw_about_z(yaw) @ pose[:3, :3]
-            if slide > 0:
+            if slide > 0 or wall_side:
                 # Jaws across the slide: they close along base Y, so they
                 # pass either side of the object as the hand moves along X.
+                # A wall grip closes along Y too, across the +-y wall.
                 pose[:3, :3] = np.diag([1.0, -1.0, -1.0])
             tilt_away = float(params.get("tilt_away_deg") or 0.0)
             if tilt_away:
@@ -657,8 +694,13 @@ class PickUpSkill(BaseSkill):
 
         force_limited = bool(params["force_limited"])
         grip_width = params.get("grip_width")
+        if wall_side:
+            force_limited, grip_width = True, None
         if grip_width is not None:
             force_limited = False
+        # A wall is ~1 mm thick (not measured), so it is held under the usual
+        # 3 mm "closed on nothing" floor.
+        held_floor = WALL_GRIP_MIN_WIDTH if wall_side else 0.003
         # Best-effort width for logging / width-close mode. Flat objects often
         # have no cloud at grasp height — that used to abort the whole pick.
         expected = width_along_closing_axis(object_pc, grasp_pose)
@@ -750,7 +792,7 @@ class PickUpSkill(BaseSkill):
                  else "")
               + ")")
 
-        if gripper_width < 0.003:
+        if gripper_width < held_floor:
             self.open_gripper()
             return False, {
                 "error": "Gripper closed on nothing",
@@ -797,7 +839,7 @@ class PickUpSkill(BaseSkill):
         # held object (e.g. a spoon's neck), so a low-force grasp that
         # settled there was misreported as lost even while still holding it.
         lifted_width = self.get_gripper_width()
-        if lifted_width < 0.003:
+        if lifted_width < held_floor:
             self.open_gripper()
             return False, {
                 "error": (f"Object lost during the lift: gripper went from "
@@ -851,6 +893,8 @@ class PickUpSkill(BaseSkill):
             # How far behind it the jaws came down (0: from above). Place
             # leaves the same way, sliding the open jaws back out.
             "slide_in": slide,
+            # +1 / -1: held by its +y / -y wall, off its centre (0: across it).
+            "wall_grip": wall_side,
             # How far the grasp was moved down (-) from the computed one;
             # a put-back sets the object down that much lower to match.
             "z_offset": float(z_offset or 0.0),

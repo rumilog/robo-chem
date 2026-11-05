@@ -108,12 +108,17 @@ CATALOG: Dict[str, SkillSpec] = {
         params=[
             Param("object_name", "string",
                   "What to grasp. Must be a name perception can resolve.", required=True),
+            # 2026-11-04: "0.02 / 0.013 are validated for the beaker" (sim
+            # values) made the planner raise the real beaker's grasp 20 mm,
+            # above its rim; both picks closed on nothing. The bench manifest
+            # fills the validated grasp when these are left out.
             Param("z_offset", "number",
                   "Raise (+) or lower (-) the grasp relative to the measured one, metres. "
-                  "0.02 is the validated value for the beaker.", default=0.0),
+                  "Leave it out: the bench supplies each object's validated grasp height.",
+                  default=0.0),
             Param("squeeze", "number",
                   "Close this far inside the measured object width, metres. Larger grips "
-                  "harder. 0.013 is the validated value for the beaker.", default=0.004),
+                  "harder. Leave it out unless a pick has slipped.", default=0.004),
             Param("grasp_force", "number",
                   "Gripper force, newtons: the jaws stop closing once the pads read this. "
                   "Lower for a thin or fragile item; 1.0 is the validated value for the "
@@ -153,9 +158,9 @@ CATALOG: Dict[str, SkillSpec] = {
              "a container out -- all of it, or whatever is left in it -- is 90. Tip "
              "less, about 80, only when the step says to pour SOME and keep the rest "
              "for later. Pours that belong together are set for you: when the same "
-             "container pours more than once, every pour but its last runs at 60; when "
-             "the same target is poured into more than once, every pour into it but "
-             "the last runs at 65; the last runs at 90.",
+             "container pours more than once, every pour but its last runs at 60 and "
+             "the last at 90; every pour into a target that is poured into more "
+             "than once runs at 90.",
         params=[
             Param("target_container", "string",
                   "Container to pour into.", required=True),

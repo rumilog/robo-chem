@@ -338,7 +338,13 @@ class ScoopSkill(BaseSkill):
             # powder, so repeated scoops do not keep digging the same trench
             # (2026-10-22: one scoop left a 3-6 mm trench through the middle
             # and a 5 mm heap at its far end, measured from the cameras).
-            "stroke_across": "auto",
+            # 0 since 2026-11-04 (the user: "改成固定路线，按碗的底部决定挖多深"):
+            # every scoop runs the same straight-ahead centre-line stroke, its
+            # depth set by the dish floor. With the map choosing the line and
+            # the depth, the same dish passed or failed a minute apart
+            # (map built or not), and two map-only checks refused digs the
+            # floor rule would have made. "auto" still works when asked for.
+            "stroke_across": 0.0,
             # Which way the stroke runs, degrees about world Z from the way
             # the wrist points at home (straight ahead, + = toward the robot's
             # left). "auto": with stroke_across, the heading whose bite sees
@@ -347,7 +353,7 @@ class ScoopSkill(BaseSkill):
             # stroke turns with it -- the wrist, the bite, the push -- and the
             # arm is homed afterwards, so the next skill starts facing ahead.
             # 0 runs straight ahead as before.
-            "stroke_heading": "auto",
+            "stroke_heading": 0.0,
             # Depth from the powder the cameras see. The surface is the median
             # height of the dish's points along the chosen stroke's bite (not
             # the rim, which is what surface_z was before), and the tip goes
@@ -360,16 +366,25 @@ class ScoopSkill(BaseSkill):
             # the "Target 15.9mm at the tip" the floor rule reported on
             # 2026-10-22 (measured from the rim). Off when the call sets
             # tip_floor_gap or powder_surface_z itself.
+            # Back on later on 2026-11-04 with the fixed stroke: from the floor
+            # alone, a thin bed left the bowl's mouth above the powder and the
+            # log called a 9 mm bed 20 mm (the rim). No map: the floor rule.
             "depth_from_map": True,
             "map_tip_depth": 0.016,
             # Refuse before moving if the bed under the bite is thinner than
-            # this above the floor gap: nothing to scoop there.
-            "map_min_bed": 0.006,
+            # this above the floor gap: nothing to scoop there. Was 6 mm; on
+            # 2026-11-04 the red cabbage dish, dug down in the middle by the
+            # day's runs, read 4.3-4.4 mm twice and the run went on without
+            # indicator. A thin bite of indicator still colours the beaker.
+            "map_min_bed": 0.003,
             # After the descent (and its sag correction), the tip must be at
             # least this far under the mapped surface before the sweep starts;
             # it is lowered once more if not, and the scoop gives up rather
-            # than sweep through air.
-            "min_immersion": 0.004,
+            # than sweep through air. 1 mm since 2026-11-04: at 4 mm the whole
+            # Magic Beaker run stopped at a baking soda bite 2.8 mm in (a thin
+            # 11 mm bed; the extra 2.5 mm lowering did not go deeper). A
+            # shallow bite still carries some powder; air does not.
+            "min_immersion": 0.001,
             "stroke_headings_deg": [0.0, 20.0, -20.0, 40.0, -40.0],
             # auto: the powder map's cell, metres. Each candidate stroke is
             # scored by the mean of the cell medians inside the area its bowl
@@ -378,6 +393,9 @@ class ScoopSkill(BaseSkill):
             # rim (rim and wall, not powder).
             "map_cell": 0.004,
             "map_rim_band": 0.003,
+            # Fixed stroke: the powder level is read over the first this-much
+            # of the bite (where the bowl goes in), as wide as the bowl.
+            "entry_patch": 0.012,
             # Where to write the map with every candidate and the chosen
             # stroke, one image per scoop. None: no image.
             "map_image_dir": "diag_out/scoop_maps",
@@ -506,8 +524,27 @@ class ScoopSkill(BaseSkill):
             headings = [np.radians(float(h_choice or 0.0))]
         h_default = 0.0 if is_auto(h_choice) else headings[0]
         s_default = 0.0 if is_auto(a_choice) else float(a_choice or 0.0)
-        if not is_auto(a_choice) and not is_auto(h_choice):
+        image_dir = params.get("map_image_dir")
+        points = located.get("points")
+        site_xy = np.asarray(site, dtype=float)[:2]
+
+        def no_map(why, **extra):
+            # Every way out without a map says why and keeps the raw cloud: on
+            # 2026-11-04 two scoops of the 15:28 run had no map and the log
+            # could not tell which exit they took.
+            print(f"[Scoop] No powder map ({why}); depth from the floor and the "
+                  f"default stroke")
+            ScoopSkill._save_raw(image_dir, source, points=points, site_xy=site_xy,
+                                 rim_z=rim_z, reach_limit=reach_limit, why=why, **extra)
             return (h_default, s_default), {}, None
+
+        if not is_auto(a_choice) and not is_auto(h_choice):
+            # The line is fixed; the scan still gives the powder level under
+            # its bite, which sets the depth (the user, 2026-11-04: dig from
+            # where the powder is, not from the floor).
+            print(f"[Scoop] Fixed stroke: heading {np.degrees(h_default):+.0f}°, "
+                  f"{s_default * 1000:+.0f}mm across; depth from the powder where it enters")
+        fixed = not is_auto(a_choice) and not is_auto(h_choice)
 
         fracs = [i / waypoints for i in range(waypoints + 1)]
         angles = [dig_tilt_deg + (end_tilt_deg - dig_tilt_deg) * f ** roll_late
@@ -519,10 +556,12 @@ class ScoopSkill(BaseSkill):
             line["across"] = 0.0
             return got
 
-        points = located.get("points")
         centre = stroke(0.0)
-        if points is None or len(points) < 50 or centre is None:
-            return (h_default, s_default), {}, None
+        if points is None or len(points) < 50:
+            return no_map(f"only {0 if points is None else len(points)} points of the "
+                          f"dish in the scan")
+        if centre is None:
+            return no_map("the centre-line stroke does not fit in the dish")
         need = float(params["stroke_min_travel_frac"]) * centre[1]
         fits = {}
         if is_auto(a_choice):
@@ -540,10 +579,9 @@ class ScoopSkill(BaseSkill):
             if got is not None:
                 fits[s_default] = got
         if not fits:
-            return (h_default, s_default), {}, None
+            return no_map("no stroke line fits in the dish")
 
         P = np.asarray(points, dtype=float)
-        site_xy = np.asarray(site, dtype=float)[:2]
         rel = P[:, :2] - site_xy
         # The map: cell medians, inside the walls the bowl keeps clear of, and
         # without the rim. On 2026-10-23 a raw-point median over a strip that
@@ -578,7 +616,15 @@ class ScoopSkill(BaseSkill):
                 # the trench out of a whole-line median.
                 m = ((along >= start) & (along <= start + 0.6 * t)
                      & (np.abs(across - s) <= half))
-                if m.sum() >= 4:
+                if fixed:
+                    # A fixed stroke goes in at one place every time (the
+                    # user, 2026-11-04): the level is the powder right where
+                    # the bowl enters, the first entry_patch of the bite.
+                    patch = ((along >= start) & (along <= start + float(params["entry_patch"]))
+                             & (np.abs(across - s) <= half))
+                    if patch.sum() >= 2:
+                        m = patch
+                if m.sum() >= (2 if fixed else 4):
                     levels[(h, s)] = float(np.mean(cell_z[m]))
                     areas[(h, s)] = (f, c, start, start + 0.6 * t, s - half, s + half)
         default = (h_default, s_default)
@@ -586,7 +632,16 @@ class ScoopSkill(BaseSkill):
             print(f"[Scoop] NOTE: the default stroke is past the wrist-reach model "
                   f"here; running it anyway, as before")
         if default not in levels:
-            return default, {}, None
+            inside = int((np.linalg.norm(rel, axis=1) <= reach_limit).sum())
+            return no_map(
+                f"under 4 map cells where the default stroke bites: {int(keep.sum())} of "
+                f"{len(P)} points kept ({inside} inside the bowl's reach, the rest cut "
+                f"by the rim band at z < {(float(rim_z) - float(params['map_rim_band'])) * 1000:.1f}mm)"
+                if rim_z is not None else
+                f"under 4 map cells where the default stroke bites ({int(keep.sum())} of "
+                f"{len(P)} points kept)",
+                cell_xy=cell_xy, cell_z=cell_z,
+                default_unreachable=default in unreachable)
         best = max(levels, key=lambda k: (levels[k], -abs(k[0]), -abs(k[1])))
         gain = levels[best] - levels[default]
         chosen = best if gain >= float(params["stroke_prefer_fuller"]) else default
@@ -601,7 +656,11 @@ class ScoopSkill(BaseSkill):
         if unreachable:
             print(f"[Scoop] Out of reach: " + ", ".join(
                 f"{np.degrees(h):+.0f}°/{s * 1000:+.0f}mm" for h, s in unreachable))
-        image_dir = params.get("map_image_dir")
+        ScoopSkill._save_raw(image_dir, source, points=points, site_xy=site_xy, rim_z=rim_z,
+                             reach_limit=reach_limit, cell_xy=cell_xy, cell_z=cell_z,
+                             chosen=np.array(chosen), default=np.array(default),
+                             levels_keys=np.array(list(levels.keys())),
+                             levels=np.array(list(levels.values())))
         if image_dir:
             try:
                 ScoopSkill._save_map(image_dir, source, site_xy, reach_limit, cell, cell_xy,
@@ -617,6 +676,32 @@ class ScoopSkill(BaseSkill):
             print(f"[Scoop] Keeping the default stroke (nothing "
                   f"{float(params['stroke_prefer_fuller']) * 1000:.0f}mm fuller)")
         return chosen, table, levels[chosen]
+
+    @staticmethod
+    def _map_name(image_dir, source, ext):
+        import os
+        import re
+        import time as _time
+        os.makedirs(image_dir, exist_ok=True)
+        tag = re.sub(r"[^a-z0-9]+", "_", str(source).lower()).strip("_") or "dish"
+        return os.path.join(image_dir,
+                            f"scoop_map_{_time.strftime('%Y%m%d_%H%M%S')}_{tag}.{ext}")
+
+    @staticmethod
+    def _save_raw(image_dir, source, **arrays):
+        """The scan the map was (or was not) built from, as .npz next to the image:
+        the dish's points (world, metres), its centre, rim z, reach, and the map
+        cells and candidate levels when there are any."""
+        if not image_dir:
+            return
+        try:
+            data = {k: (np.asarray(v) if v is not None else np.array(np.nan))
+                    for k, v in arrays.items()}
+            path = ScoopSkill._map_name(image_dir, source, "npz")
+            np.savez_compressed(path, **data)
+            print(f"[Scoop] Powder scan data: {path}")
+        except Exception as exc:
+            print(f"[Scoop] scan data not written: {type(exc).__name__}: {exc}")
 
     @staticmethod
     def _save_map(image_dir, source, site_xy, reach_limit, cell, cell_xy, cell_z,
@@ -661,8 +746,7 @@ class ScoopSkill(BaseSkill):
         cv2.putText(img, f"colour {(lo - 0) * 1000:.1f}..{hi * 1000:.1f} mm (world z); "
                          f"top = away from the base, left = robot's left",
                     (8, size - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
-        os.makedirs(image_dir, exist_ok=True)
-        path = os.path.join(image_dir, f"scoop_map_{_time.strftime('%Y%m%d_%H%M%S')}.png")
+        path = ScoopSkill._map_name(image_dir, source, "png")
         cv2.imwrite(path, img)
         print(f"[Scoop] Powder map with the candidate strokes: {path}")
 
@@ -830,9 +914,8 @@ class ScoopSkill(BaseSkill):
             floor_source = (f"base_z {base_z:.4f} + floor_thickness "
                             f"{float(params['floor_thickness']) * 1000:.1f}mm")
         floor_clearance = max(0.0, float(params["floor_clearance"]))
-        print(f"[Scoop] Inside floor z={floor_z:.4f} ({floor_source}); powder "
-              f"surface z={surface_z:.4f}: a {(surface_z - floor_z) * 1000:.1f}mm "
-              f"bed")
+        print(f"[Scoop] Inside floor z={floor_z:.4f} ({floor_source}); rim-based "
+              f"guess of the surface z={surface_z:.4f} (the map, if any, replaces it)")
         if surface_z - floor_z <= floor_clearance:
             return False, {
                 "error": (f"No powder to scoop: the surface z={surface_z:.4f} is "
@@ -1091,15 +1174,14 @@ class ScoopSkill(BaseSkill):
             print(f"[Scoop] Powder under the bite (camera map): surface z={map_surface:.4f}, "
                   f"{(map_surface - floor_z) * 1000:.1f}mm above the inside floor "
                   f"(the rim-based surface was {surface_z:.4f})")
-            if room_below < float(params["map_min_bed"]):
-                return False, {
-                    "error": (f"Too little powder where the bowl can dig in '{source}': "
-                              f"{room_below * 1000:.1f}mm between the mapped surface and "
-                              f"{gap * 1000:.0f}mm over the floor, under "
-                              f"map_min_bed {float(params['map_min_bed']) * 1000:.0f}mm. "
-                              f"Refill or level the dish."),
-                    "map_surface_z": map_surface,
-                }
+        if map_surface is not None and room_below < float(params["map_min_bed"]):
+            # Not a refusal since 2026-11-04 (keep going): dig as the floor
+            # rule does and say the bed is thin.
+            print(f"[Scoop] WARNING: only {room_below * 1000:.1f}mm of powder over the "
+                  f"{gap * 1000:.0f}mm floor gap under the bite -- digging to the floor "
+                  f"anyway; refill/level '{source}' (>= 15 mm) for a full scoop")
+            map_surface = None
+        if map_surface is not None:
             surface_z = map_surface
             scoop_depth = min(target, room_below)
             depth_reference = "tip"
@@ -1316,7 +1398,17 @@ class ScoopSkill(BaseSkill):
             # what the old stroke used to carry travel, and travel is what hit
             # the wall.
             entry = self.tcp_for_tip(entry_centre, entry_rotation, tool_offset) + up
-            print(f"[Scoop] Descending the bowl floor to z={entry_centre[2] + raise_total:.4f} "
+            if dig == 0 and scoop_depth > 0.002:
+                # Down to the powder first, then in (the user, 2026-11-04:
+                # descend to the surface at the entry, then dig): the tip
+                # stops on the surface the scan read there.
+                touch = entry + np.array([0.0, 0.0, scoop_depth])
+                print(f"[Scoop] Down to the powder surface at the entry, z={surface_z:.4f} "
+                      f"(tip on the surface)...")
+                self.goto_pose_rigid(touch, entry_rotation,
+                                     duration=max(0.5, float(params["descend_seconds"])),
+                                     use_impedance=True)
+            print(f"[Scoop] Digging in: descending the bowl floor to z={entry_centre[2] + raise_total:.4f} "
                   f"({(scoop_depth - raise_total) * 1000:.0f}mm below the surface, tilted, "
                   f"compliant)...")
             if not self.goto_pose_rigid(entry, entry_rotation,
@@ -1364,10 +1456,14 @@ class ScoopSkill(BaseSkill):
                 tip_rel = head_heights(dig_tilt_deg)[0]
 
                 def immersion_now(commanded):
+                    # Against the PLANNED entry, not the command: the command
+                    # sits below the plan by the sag compensation, so measuring
+                    # from it counted the ~4.5 mm sag twice. On 2026-11-04 a
+                    # tip 4.3 mm in read -0.1 mm, and the scoop gave up.
                     z_now = float(np.asarray(self.get_current_pose().translation,
                                              dtype=float)[2])
                     tip_z = (float(plan[0][1][2]) + raise_total + tip_rel
-                             + (z_now - float(commanded[2])))
+                             + (z_now - float(np.asarray(entry, dtype=float)[2])))
                     return map_surface - tip_z, tip_z
 
                 commanded = np.asarray(entry, dtype=float) - lowered
@@ -1386,18 +1482,13 @@ class ScoopSkill(BaseSkill):
                                              use_impedance=True)
                         immersed, tip_z = immersion_now(commanded)
                 if immersed < need_in:
-                    print(f"[Scoop] The bowl did not get into the powder "
-                          f"({immersed * 1000:.1f}mm, wants {need_in * 1000:.0f}mm); "
-                          f"lifting out")
-                    self.lift_out(height=0.06, tag="Scoop")
-                    return False, {
-                        "error": (f"The bowl stopped {immersed * 1000:.1f}mm into the powder "
-                                  f"in '{source}' (wants {need_in * 1000:.0f}mm) and did not "
-                                  f"sweep: something hard under it, or the map read high"),
-                        "immersion": immersed, "map_surface_z": map_surface,
-                    }
-                print(f"[Scoop] In the powder: tip {immersed * 1000:.1f}mm under the mapped "
-                      f"surface, {(tip_z - floor_z) * 1000:.1f}mm over the floor")
+                    # Sweeping anyway since 2026-11-04: a refusal here brought
+                    # up nothing for certain.
+                    print(f"[Scoop] WARNING: the tip reads only {immersed * 1000:.1f}mm into "
+                          f"the powder (wants {need_in * 1000:.0f}mm); sweeping anyway")
+                else:
+                    print(f"[Scoop] In the powder: tip {immersed * 1000:.1f}mm under the "
+                          f"mapped surface, {(tip_z - floor_z) * 1000:.1f}mm over the floor")
 
             # 9. The sweep. Roll nose-down -> nose-up about a bowl centre that
             # barely moves. Every waypoint recomputes the TCP from the bowl

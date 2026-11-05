@@ -191,7 +191,7 @@ def load_run_chain(path) -> Tuple[List[dict], List[str]]:
     records = [json.loads(path.read_text(encoding="utf-8"))]
     paths = [str(path)]
     by_start = {}
-    for other in path.parent.glob("agent_run_*.json"):
+    for other in _records_under(path):
         try:
             started = json.loads(other.read_text(encoding="utf-8")).get("started")
         except (OSError, json.JSONDecodeError):
@@ -210,12 +210,24 @@ def load_run_chain(path) -> Tuple[List[dict], List[str]]:
     return records, paths
 
 
+def _records_under(path) -> List[Path]:
+    """Every run record beside ``path``: in its folder and, for a record kept
+    in a per-run ``run_<time>/`` folder (since 2026-11-04), in the experiments
+    folder above it and every run folder there."""
+    path = Path(path)
+    root = path.parent.parent if path.parent.name.startswith("run_") else path.parent
+    return list(root.glob("agent_run_*.json")) + list(root.glob("run_*/agent_run_*.json"))
+
+
 def latest_record(folder) -> Optional[Path]:
     """
     The newest run record that actually moved the robot: dry runs (plans
-    only) and records with no executed step are skipped.
+    only) and records with no executed step are skipped. Looks in ``folder``
+    and in its per-run ``run_<time>/`` folders.
     """
-    for path in sorted(Path(folder).glob("agent_run_*.json"), reverse=True):
+    found = list(Path(folder).glob("agent_run_*.json")) + list(
+        Path(folder).glob("run_*/agent_run_*.json"))
+    for path in sorted(found, key=lambda p: p.name, reverse=True):
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
