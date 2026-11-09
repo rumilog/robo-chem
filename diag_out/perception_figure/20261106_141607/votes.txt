@@ -1,0 +1,9 @@
+Wanted: 20 ML WATER
+cam 2  20 ML WATER  ok
+cam 3  VEGETABLE OIL  x
+cam 4  RED CABBAGE POWDER  x
+cam 5  20 ML WATER  ok
+vote: label vote across cameras: 2 of 4 read '20 ML WATER'
+placed: silhouette triangulation, cams [2, 3, 4, 5], rays within 3mm, centre 32mm up
+position: [0.4295, -0.1103, 0.0212]
+grasp: (0.4295, -0.1103, 0.0219), slide-in 60 mm, grip 58 mm

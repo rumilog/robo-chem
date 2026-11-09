@@ -1,6 +1,6 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-11-05
+Last updated: 2026-11-06
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
@@ -6271,3 +6271,44 @@ About 21 min of robot time in all, plus one hand restart.
 - **No final photo:** the resume started 16:22:58, before `_final_photos`
   was added, so it ran the old code. `write_report.py --bench jellyfish`
   photographs the bench as it is now if it has not been cleared.
+
+### 2026-11-06 — `scripts/perception_figure.py`: the paper's perception figure from one capture
+
+- For `fig:perception` (four views with SAM 3 masks, the label reads and vote,
+  the fused cloud with the chosen container and its grasp). Read-only.
+- **Same frames everywhere**: it captures once with `view_pointcloud.capture`
+  (8-frame median depth, 1280x720) and runs the real `VisionSystem.locate` on
+  those frames by replacing `object_localizer.capture_pointclouds`, recording
+  `segment_instances` and `label_resolver.read_all`. The cloud is the TSDF of
+  the same depth images. The grasp is `compute_grasp_pose(top)` plus the
+  bench's pick params (slide-in, offsets, grip width), as in `PickUpSkill`.
+- Outputs in `diag_out/perception_figure/<time>/`: `cam<N>_masks[_plain].png`,
+  `cloud[_close][_clean].png`, `votes.txt/json`, `capture.npy`
+  (`--from-saved` re-draws without cameras, SAM 3 or the label model).
+- Tested offline on `diag_out/pointcloud/pointcloud_20261010_192220_raw.npy`
+  (old layout): the vote ran on 1280x720 frames with no change ("plastic
+  beaker", 2 of 4 read 50 ML WATER, silhouettes within 2 mm). Not yet run on
+  the cameras. The slide-in drawing was checked with a hand-set 60 mm grasp on
+  that capture.
+- Command: `python scripts/perception_figure.py --object "clear cup a"`
+  (arm at home, out of the views).
+- **Figure set made from the saved 2026-10-10 19:22 capture, no robot**:
+  `python scripts/perception_figure.py --object "clear cup a" --from-capture
+  diag_out/pointcloud/pointcloud_20261010_192220_raw.npy` ->
+  `diag_out/perception_figure/20261010_192220/`. A real 3-of-4 vote: cams 2, 3, 5
+  read A 10 ML WATER, cam 4 read 50 ML WATER; silhouettes within 5 mm; grasp
+  (0.4454, -0.1623, 0.0219). In cam 3 SAM 3's mask for A merges with the cup
+  behind it (real output, left as is). Cams 4 and 5 show a person's arm and
+  torso at the next table, no face.
+- Fingers are drawn open (80 mm, `JAW_OPEN`): at the 58 mm grip width they cut
+  through the 73 mm cup model, which is not how the slide-in works.
+- **Live run, jellyfish bench, 2026-11-06 14:16** (`--bench jellyfish --object
+  "other clear cup"`, `diag_out/perception_figure/20261106_141607/`): the
+  "20 ml water" cup placed by all four silhouettes within 3 mm at (0.4295,
+  -0.1103). Reads on it: cam 2 and 5 "20 ML WATER", cam 3 "VEGETABLE OIL",
+  cam 4 "RED CABBAGE POWDER" (the dish's paper is next to it in that view; not a
+  cup label, so not counted). It still won: the oil beaker took VEGETABLE OIL
+  with 4 of 4 reads, so the share-out left 20 ML WATER to this cup ("2 of 4").
+  The lidded white pipette cups were segmented as "clear plastic cup" too and
+  read as "2/3 CUP OF WATER", each by one camera, so unassigned.
+  1280x720 live frames worked with no change.

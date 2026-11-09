@@ -1,0 +1,9 @@
+Wanted: A 10 ML WATER
+cam 2  A 10 ML WATER  ok
+cam 3  A 10 ML WATER  ok
+cam 4  50 ML WATER  x
+cam 5  A 10 ML WATER  ok
+vote: label vote across cameras: 3 of 4 read 'A 10 ML WATER'
+placed: silhouette triangulation, cams [2, 3, 4, 5], rays within 5mm, centre 27mm up
+position: [0.4354, -0.1623, 0.0159]
+grasp: (0.4454, -0.1623, 0.0219), slide-in 60 mm, grip 58 mm

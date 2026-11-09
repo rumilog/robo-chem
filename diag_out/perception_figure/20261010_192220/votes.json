@@ -1,0 +1,41 @@
+{
+  "wanted": "A 10 ML WATER",
+  "rows": [
+    {
+      "cam": 2,
+      "read": "A 10 ML WATER",
+      "ok": true
+    },
+    {
+      "cam": 3,
+      "read": "A 10 ML WATER",
+      "ok": true
+    },
+    {
+      "cam": 4,
+      "read": "50 ML WATER",
+      "ok": false
+    },
+    {
+      "cam": 5,
+      "read": "A 10 ML WATER",
+      "ok": true
+    }
+  ],
+  "resolved_by": "label vote across cameras: 3 of 4 read 'A 10 ML WATER'",
+  "localized_by": "silhouette triangulation, cams [2, 3, 4, 5], rays within 5mm, centre 27mm up",
+  "position": [
+    0.4354,
+    -0.1623,
+    0.0159
+  ],
+  "grasp": {
+    "xyz": [
+      0.44535171497330855,
+      -0.1623022100712479,
+      0.02191
+    ],
+    "slide_in": 0.06,
+    "grip_width": 0.058
+  }
+}
