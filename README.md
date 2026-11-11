@@ -9,6 +9,156 @@ Barati Farimani Lab, CMU.
 Working in this repo: read [`progress.md`](progress.md) before you start and
 update it when you finish — see [`CLAUDE.md`](CLAUDE.md).
 
+---
+
+## Running the experiments from another account on this machine
+
+A second Linux account on the robot workstation can run every experiment with
+its own clone, its own OpenAI key and its **own processes**: the grounding
+service and the robot control stack. It also works while rumi is logged out.
+
+The installed stack under `/home/rumi` is used **read-only**. That covers the
+ROS workspace `frankapy/`, the robot venv `franka/`, `robomail` with the
+camera calibration, librealsense, and the SAM 3 env and weights. These are
+world-readable files on disk, so they work whether or not rumi is logged in.
+Nothing is reinstalled. `<user>` below is the new account's name.
+
+### 0. Once per account, by an admin (sudo)
+
+```bash
+sudo usermod -aG video <user>      # then <user> logs out and back in
+```
+
+The cameras are `/dev/video*` (`root:video 0660`). Without the group, a
+camera opens only for whoever is logged in at the desktop.
+
+### 1. Once per account, as `<user>`
+
+```bash
+git clone git@github.com:rumilog/robo-chem.git ~/robo-chem   # needs read access on GitHub
+cd ~/robo-chem
+
+# Borrow the two gitignored pieces from rumi's checkout (read-only)
+ln -s /home/rumi/Desktop/robo-chem/perception_env perception_env    # SAM 3 service env
+mkdir -p weights && ln -s /home/rumi/Desktop/robo-chem/weights/sam3.pt weights/sam3.pt
+echo perception_env >> .git/info/exclude     # .gitignore does not match a symlink
+
+# Your own key, and your own port for the grounding service
+( umask 077; printf 'OPENAI_API_KEY=sk-...\nGROUNDING_URL=http://127.0.0.1:%s\n' \
+    "$((5100 + $(id -u) % 800))" > .env )
+
+# Passwordless login to the robot's control PC (asks for the franka password once)
+ssh-copy-id franka@franka-Alienware-Area-51-R5
+```
+
+- Do **not** run `git submodule update --init`. Nothing here needs a
+  submodule, and the `robomail_Aliyah` entry has no URL, so the command errors.
+- Do **not** run `calibrate_cameras.py`. It installs into the shared
+  `robomail` (`/home/rumi/Desktop/camera examples/robomail`), which every
+  account reads its calibration from.
+
+### 2. Every session
+
+1. **Robot.** Unlock the arm in Franka Desk and activate FCI. The lights must
+   be **blue**: white means the e-stop is down, and a stack started under
+   white lights fails with `FrankaInterface status not ready`. Then start the
+   control stack from a desktop terminal, because the script opens
+   gnome-terminals. It has to run from `/home/rumi/frankapy`, because the
+   script uses relative paths:
+
+   ```bash
+   cd /home/rumi/frankapy && bash bash_scripts/start_control_pc.sh -u franka -i franka-Alienware-Area-51-R5
+   ```
+
+   Only one stack can drive the robot. If an earlier session's stack is still
+   up, whoever started it closes its terminals first.
+
+2. **Env + perception service** (same terminal as the runs):
+
+   ```bash
+   cd ~/robo-chem
+   source scripts/env.sh
+   scripts/grounding.sh start      # idempotent; status | log | restart | stop
+   ```
+
+   Your service runs on your own port (`GROUNDING_URL` in `.env`), so you
+   never use, or try to stop, another account's service.
+
+3. **Bench, before each trial** (see [`PARAMETERS.md`](PARAMETERS.md)):
+   - each powder dish holds a levelled bed of **at least 15 mm**
+   - the spoon and stirrer holders sit at **x ≤ 0.74 m**: preflight does not
+     move tools, and past the 0.75 m hand clamp the grasp lands short
+   - scoop dishes are within about **0.62 m** of the base: scoops jammed at
+     0.631-0.640 m
+   - optional camera-only layout check (the arm does not move):
+     `python scripts/check_bench_layout.py --bench magic_beaker` (or `--bench jellyfish`)
+
+### 3. The experiments
+
+All commands run from `~/robo-chem` after `source scripts/env.sh`. Each run
+writes everything (record, `console.log`, photos, checks, scoop maps) to
+`experiments/run_<time>/` in **your** clone. That folder is gitignored, so it
+is not shared through git.
+
+**Magic Beaker** (`instructions/magic_beaker.png`, 31 sub-tasks, ~30 min):
+
+```bash
+python -u scripts/run_experiment.py --bench magic_beaker --workspace-min 0.25 -0.40 -0.13 \
+  --instruction-image instructions/magic_beaker.png --follow-steps --no-verify --reset
+```
+
+**Jellyfish** (`instructions/jellyfish.jpg`, 20 sub-tasks, ~20 min):
+
+```bash
+python -u scripts/run_experiment.py --bench jellyfish --workspace-min 0.25 -0.40 -0.13 \
+  --instruction-image instructions/jellyfish.jpg --follow-steps --no-verify --reset
+```
+
+- `--reset` homes the arm and **opens the gripper** before step 1. Use it
+  only when starting from scratch.
+- **Resume after a stop:** run the same command **without `--reset`** and
+  add `--resume latest --from-step N`. Start from a step that does not need
+  something already in the gripper, e.g. the pick before a scoop.
+- To see the plan without moving the arm, replace `--reset` with
+  `--dry-run`. The cameras and LLM calls still run.
+- Write the report afterwards with
+  `python scripts/write_report.py --bench magic_beaker` (or `--bench jellyfish`).
+
+**Label experiments** (cameras only, the arm is never imported; bench =
+`LABEL_TEST` in `progress.md`):
+
+```bash
+# Label reading benchmark: printed vs handwritten label sets
+python scripts/label_reading_benchmark.py scan --set <set-name>   # takes ground truth first for a new set
+python scripts/label_reading_benchmark.py report
+
+# Label distance test: objects "baking soda cup" | "10 ml water cup" | "beaker",
+# phases labelled | unlabelled
+python scripts/label_distance_test.py run --object "beaker" --phase labelled   # ground-truth + trials
+python scripts/label_distance_test.py report
+```
+
+If the arm gets stuck, stop the run (Ctrl-C). Before you resume, home it, and
+open the gripper only after taking out anything it holds:
+
+```bash
+python -c "from frankapy import FrankaArm; fa=FrankaArm(); fa.reset_joints(); print(fa.get_pose().translation)"
+python -c "from frankapy import FrankaArm; fa=FrankaArm(); fa.open_gripper(); print(fa.get_gripper_width())"
+```
+
+### 4. End of every session
+
+```bash
+scripts/grounding.sh stop
+```
+
+Then close the control-stack terminals. Both keep running after you log out.
+After its first query the SAM 3 service holds ~3 GB of RAM and ~5 GB of the
+GPU's 11 GB, so a forgotten one can leave no room for the next person's.
+Only its owner or an admin can stop it (`sudo pkill -u <user> -f grounding_service.py`).
+
+---
+
 ## Requirements
 
 | Piece | Notes |

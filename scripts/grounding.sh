@@ -20,16 +20,23 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# Each account runs its own service on its own port (GROUNDING_URL in .env,
+# written by scripts/setup_user.sh), so one account never talks to, or tries to
+# stop, another account's service. Without a GROUNDING_URL it is 5005.
+if [ -z "${GROUNDING_URL:-}" ] && [ -f "$ROOT/.env" ]; then
+    GROUNDING_URL="$(grep -E '^GROUNDING_URL=' "$ROOT/.env" | tail -1 | cut -d= -f2- | tr -d "\"'")"
+fi
 URL="${GROUNDING_URL:-http://127.0.0.1:5005}"
+PORT="${URL##*:}"; PORT="${PORT%%/*}"
 LOG="$ROOT/diag_out/grounding_service.log"
 PIDFILE="$ROOT/diag_out/grounding_service.pid"
 PY="$ROOT/perception_env/bin/python"
-ARGS=(--backend sam3 --model "$ROOT/weights/sam3.pt" --no-exemplars)
+ARGS=(--backend sam3 --model "$ROOT/weights/sam3.pt" --no-exemplars --port "$PORT")
 
 health() { curl -s --max-time 5 "$URL/health" 2>/dev/null; }
 
 running_pid() {
-    pgrep -f "grounding_service.py" | while read -r p; do
+    pgrep -u "$(id -u)" -f "grounding_service.py" | while read -r p; do
         [ "$(tr -d '\0' < "/proc/$p/cmdline" 2>/dev/null | grep -c python)" -gt 0 ] && echo "$p"
     done | head -1
 }

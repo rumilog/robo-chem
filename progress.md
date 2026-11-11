@@ -1,6 +1,6 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-11-06
+Last updated: 2026-11-11
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
@@ -6312,3 +6312,57 @@ About 21 min of robot time in all, plus one hand restart.
   The lidded white pipette cups were segmented as "clear plastic cup" too and
   read as "2/3 CUP OF WATER", each by one camera, so unassigned.
   1280x720 live frames worked with no change.
+
+### 2026-11-11 — Running the experiments from a second Linux account (README top section; not yet tried by a second account)
+
+The user asked what another account on this machine needs before it can run the
+experiments standalone, with rumi logged out and without using rumi's
+running service. The steps are at the top of `README.md`.
+**Chosen: share rumi's installed files read-only; each account runs its own
+processes.** Logging out stops processes (grounding service, control stack)
+and moves the camera ACL. It does not remove files. So the minimum per account
+is: the `video` group, a clone, symlinks to `perception_env` and
+`weights/sam3.pt`, its own `.env` (key + `GROUNDING_URL` port), `ssh-copy-id`
+to the control PC, and its own grounding service and control stack.
+
+- `scripts/grounding.sh` changed: it reads `GROUNDING_URL` from `.env` when the
+  shell has none, starts the service with `--port` taken from it, and
+  `pgrep -u $(id -u)` finds only the caller's process. Before this, a second
+  account's `start` found rumi's healthy service on 5005 and used it, and `stop`
+  tried to kill rumi's pid. For rumi nothing changes (no `GROUNDING_URL` in
+  `.env`, so 5005; `status` still finds pid 346815).
+- **Tried and dropped the same day: a full per-account rebuild**
+  (`scripts/setup_user.sh` + pinned `setup/` requirements and patches). The user
+  called it overkill. The clean-HOME test got 2.7 GB into the robot venv and hit a
+  PyPI read timeout, so it was never proven end to end. Deleted. If it is ever
+  needed (another machine), these facts cost time to find:
+  - The system `python3.8`/`python3.10` have **no ensurepip**: `python -m venv`
+    fails. Both reference envs were made with the system-wide
+    `/usr/local/bin/virtualenv` 20.24.5.
+  - `~/frankapy` (iamlab-cmu @ d467fee) has local edits. One is
+    `franka_constants.WORKSPACE_WALLS`: side walls ±0.38 (upstream ±0.46), back
+    −0.59, **front 1.08 (upstream 0.75)**, top 1.23, bottom −0.01. The other is
+    the `start_control_pc.sh` defaults (`franka`, `/home/franka/franka-interface`).
+    An upstream install would silently change the walls.
+  - `pyrealsense2` 2.57.7 in `~/franka` is not in `pip freeze`. It is
+    `/home/rumi/librealsense` built from source with RUNPATH into that build,
+    `FORCE_RSUSB_BACKEND=OFF` (V4L, which is why the `video` group suffices),
+    `BUILD_WITH_DDS=ON`, and libudev not found (it built without it).
+  - `autolab_perception` (iamlab-cmu/perception @ e7bcf17, editable) supplies
+    `CameraIntrinsics` to robochem and robomail.
+- **Where the calibration actually lives:** `robo-chem/robomail/` is an empty,
+  uninitialised submodule. The venv imports an editable
+  `/home/rumi/Desktop/camera examples/robomail` (BaratiLab @ b7b83a0), whose
+  `vision/calib/realsense_camera{2..5}w.npy` are **uncommitted** there, and
+  md5-identical to this repo's `calibration_out/`. It also carries a local
+  `cam_utils.py` fix (cam 3 read cam 2's `.intr`). A fresh BaratiLab clone gets
+  stale extrinsics.
+- `robomail_Aliyah` is a gitlink with no `.gitmodules` entry:
+  `git submodule update --init` errors.
+- **Cameras:** `/dev/video*` is `root:video 0660` + logind `uaccess` ACL for
+  the console user; rumi is not in `video`. The D415 USB nodes are root `0664`
+  with no ACL.
+- **Control PC:** `start_control_pc.sh` uses key SSH as
+  `franka@franka-Alienware-Area-51-R5`, so each account needs `ssh-copy-id`.
+- Run commands in the README are the latest form from shell history (no
+  `--max-retries 0`, no `tee`).
