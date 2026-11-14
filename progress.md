@@ -1,6 +1,6 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-11-11
+Last updated: 2026-11-13
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
@@ -6366,3 +6366,313 @@ to the control PC, and its own grounding service and control stack.
   `franka@franka-Alienware-Area-51-R5`, so each account needs `ssh-copy-id`.
 - Run commands in the README are the latest form from shell history (no
   `--max-retries 0`, no `tee`).
+
+### 2026-11-11 — Weighing test: `scripts/weigh_test.py` + `robochem/vision/scale_reader.py` (read-only tested; arm part NOT yet run)
+
+The user put a white digital kitchen scale on the bench and asked for a test:
+pick the scoop, set it on the scale, arm away, read the display from the
+cameras, pick it back up, put it back at its first pick site.
+
+```bash
+source scripts/env.sh && scripts/grounding.sh start
+python scripts/weigh_test.py --read-only     # locate + read only, arm does not move
+python scripts/weigh_test.py                 # baseline read, scoop on, read, scoop back, read
+```
+
+- **Cam 5 cannot read this scale where it stands.** The scale (platform centre
+  (0.442, +0.226), top 40 mm over the table, 182x146x37 mm) sits on cam 5's
+  bottom edge: platform and buttons in frame, the display below it, out of
+  frame. **Cam 2 faces the display**; cams 3 and 4 see it obliquely. Default
+  `--read-cams 2 5 3 4`; all four are read and voted.
+- **The display is small**: ~40x60 px of an 848x480 cage frame in cam 2. The
+  reader therefore opens its own colour-only 1920x1080 stream per camera (one
+  at a time, no depth), crops to the scale's scan box (the 848x480 box scaled;
+  same field of view, checked by eye), upscales to >= 768 px, and sends the
+  crop plus a CLAHE copy to the strong model with a strict schema
+  (`display_state`, `reading`, `value`, `unit`, `confidence`). "Never guess" is
+  in the prompt.
+- **Measured, run_20261111_162252 (read-only):** cams 2, 3, 4 =
+  `blank_or_off`, high confidence; cam 5 = `not_visible`. The crops agree:
+  cam 2 shows the whole LCD panel with no segment lit, so the scale was most
+  likely OFF. At 1080p cam 2's panel was still blank. **Not yet known: whether
+  lit digits are legible.** Turn the scale on and rerun `--read-only` first.
+- **Locate "digital scale" with `use_labels=False`.** Without it the name
+  looks like a reagent label and went through the cup-label reader first:
+  105 s, then the direct SAM prompt found it (cams 2, 3, 5 agree; cam 4 9 mm
+  off the cluster, rejected).
+- **Why not `place on_top`:** it releases the TCP 20 mm over the located top,
+  and the scoop's bowl hangs below the handle (CAD 28 mm), so it would drive
+  the bowl into the platform. Also, with the scoop held, `place` on any other
+  name is redirected to its pick site unless `on_top` is set
+  (`_resolve_pick_site`). The script passes explicit coordinates instead:
+  TCP xy = platform centre − (pick centroid − grasp TCP), z = platform top +
+  (grasp TCP z − table z at the pick) + `--release-clearance` (8 mm).
+- The second pick (off the scale) would overwrite `pick_sites`, so the script
+  saves the first pick's site/grasp/z_offset and restores them before the
+  put-back. A failed set-down that is still holding puts the scoop back.
+- Grounding was down at the start of this session; `grounding.sh start`
+  brought it up (SAM 3, exemplars off).
+
+### 2026-11-11 (later) — Scale reader rebuilt after a confident misread: 174.00 for -1140.0
+
+Run `run_20261111_162957` (user's, scale moved so cam 5 sees the display,
+not rotated -- the user wants it to work without turning the scale): cam 5 read
+`174.00 g`, "high confidence", for a display showing **-1140.0**; cams 2, 3, 4
+saw it blank (LCD viewing angle: the same lit display is empty from there).
+The model was already gpt-4.1 on our key; the input was the problem: the whole
+scale crop, LCD ~120x150 px of it, digits ~15 px tall and turned ~70 deg.
+
+Now (`robochem/vision/scale_reader.py`), per camera: SAM 3 `"digital display"`
+inside the scale crop (0.96 cam 5, 0.94 cam 2; `"lcd screen"` missed cam 5,
+`"scale display"` took the whole scale on cam 2) -> quad warped flat, long side
+horizontal, 15% margin -> model sees it both ways up and returns which is
+upright + the DIGITS -> separate minus-sign call -> number composed in code,
+the point placed by `--decimals` (default 1) -> 3 frames, majority vote.
+
+Measured on the saved cam 5 crop of that run (offline, 3 calls each):
+| What was sent | Result |
+| --- | --- |
+| whole scale crop (old) | `174.00` |
+| straightened, both orientations | `11400`, upright correct 3/3; no sign, no point |
+| + "minus is a bar left of the first digit" in the prompt | sign 0/3 at 15% margin; 1/3 at 25%; it called the bar "a segment that could be mistaken for a minus sign" |
+| **separate yes/no on the left 30% of the upright display** | **minus 3/3; control with the bar painted over: no 3/3** |
+| final pipeline | **-1140.0 on 3/3 frames** |
+
+- **Decimal point is not visible** at all from cam 5 (~1 px); it is placed by
+  the scale's format, `--decimals 1`. `--decimals -1` trusts the model instead.
+  If the scale is switched to a unit with a different format, change it.
+- **Tried and dropped: thresholding for the minus sign.** Adaptive threshold
+  on the upright display does find it (55x36 px blob, mid-height, left), but
+  glare and the LCD frame make blobs of the same size; not trustworthy.
+- **The scale auto-powers off** after a minute or two. `run_20261111_163555`
+  read blank on all four cameras, correctly: the display had gone off. Press
+  ON (and tare with the platform empty -- -1140.0 empty means it was zeroed
+  with a load on) right before a run.
+- Cost: a camera that sees digits = 2 calls x 3 frames (~10 s/frame); a
+  blank/unreadable first frame stops that camera after 1 call; no display
+  found = no call.
+- Not yet tested live with the display lit through `weigh_test.py`; only the
+  offline re-read above.
+
+### 2026-11-13 — Scale reader: empty scale "0.0" read as 8.8; fixed by right-alignment + per-digit middle bar (offline)
+
+User's `--read-only` run `run_20261113_182846` (scale on, tared, display
+`0.0`): cam 5 read `8 8` -> **8.8 on 3/3 frames** (so the vote passed it);
+cam 2 read `8888`, `3100`, `00` (no majority, correctly withheld); cams 3, 4
+blank (viewing angle). Photos: `experiments/run_<time>/scale/` --
+`*_full.jpg`, `*_crop.png`, `*_display<i>.png` (exactly what the model saw).
+
+Cause, from re-reading the saved crops: **the 8s came with the wrong
+orientation.** Every cam 5 read that picked the upside-down image said 8 with
+a middle bar; every one that picked the right image said 0. A 0's side
+segments meet at mid-height with a gap, which the model took for a bar.
+
+Fixes (`robochem/vision/scale_reader.py`):
+1. Prompt: the scale **right-aligns** its number -- on the upright image the
+   last digit is at the right end; digits at the left end mean upside down.
+2. `digit_cells`: per digit, `middle_bar` yes/no; code turns 0/8 into 8 only
+   with a bar (`fix_zero_eight`). The model's own digits are kept as
+   `digits_model` in the record.
+
+Offline on the saved crops (live path: SAM display -> rectify -> read):
+| Photo | Before | After |
+| --- | --- | --- |
+| 11-13 cam 5, shows 0.0 | 8.8 (3/3) | **0.0 (5/5)**, upright "second" every time |
+| 11-13 cam 2, shows 0.0 | no majority | **0.0 (3/3)** |
+| 11-11 cam 5, shows -1140.0 | -1140.0 (3/3) | **-1140.0 (3/3)** |
+
+- With only the middle-bar field (no right-alignment rule) cam 5 was still
+  8.8 on 2/3: the per-digit question does not help while the orientation is
+  wrong. The orientation rule is the fix that mattered.
+- Cam 2 sometimes lists `0000` (blank cells as zeros); the composed value is
+  unchanged by leading zeros.
+- Still not run live through the full arm test.
+
+### 2026-11-13 — First arm run of weigh_test: spoon set down too far back and released too high, fell over
+
+`run_20261113_183452`. The user: "too far back, and it let go too early; the
+spoon fell over". From the log:
+- The spoon lay **on its side** at the pick (`end heights A 23.3 / B 8.3 mm`,
+  pick_up's on_side warning). The jaws closed 11.9 mm above the commanded
+  grasp (z 0.014 instead of 0.0048), held at 16.7 mm, and 8.0 mm at the start
+  of the place: it shifted in the jaws.
+- The release was computed as platform top 0.0277 + TCP-over-table at the pick
+  (25 mm) + 8 mm = **z 0.061**. That rule assumes a flat-lying spoon held the
+  same way; here it opened too high.
+- xy: TCP = platform centre − (centroid − jaws) = 13 mm back of centre; with
+  the spoon on its side the centroid offset meant nothing, and it landed too
+  far back.
+
+Changed (`scripts/weigh_test.py`, defaults, all overridable):
+- **`--stop-force 1.0`**: place's existing force probe (`stop_force_n`, the
+  stirrer put-back's, robot-validated at 1 N). Starts at the computed height
+  (`probe_above 0`), steps 2 mm down to `--probe-below 0.04` under it, opens
+  on contact. Nothing felt -> still holding -> the script puts the spoon back.
+  `--stop-force 0` restores the old open-at-height behaviour.
+- **`--place-offset 0.03 0`**: 30 mm forward (+X). A plain knob, not measured;
+  tune it at the bench.
+- The empty baseline read on that run was 0.0 (cam 2 had 5.8 on the loaded read
+  while cam 5 read 0.0 -- the spoon had fallen; not checked further).
+- Not yet rerun on the robot.
+
+### 2026-11-13 — weigh_test `--speed`
+
+The user found the arm slow and asked whether the VLM or I had set speed 0.
+Neither: the script has no planner, and `speed` absent means `DEFAULT_SPEED 0`
+= the validated pace, the slowest allowed (`robochem/skills/pacing.py`; 100 =
+0.4x the time). Added `--speed` (default 0), passed into every skill call.
+Not changed by it: the force probe (2 mm per 1 s step, up to ~20 s), the
+settle wait, and the scale reads -- ~45 s per read on 4 cameras (cams 2/5
+~15 s each, 3/4 ~8 s each to say "blank"), three reads per run.
+`--read-cams 2 5` drops the two cameras that have only ever seen it blank.
+
+### 2026-11-13 — Scale read: ~45 s -> ~9 s when cam 5 reads it
+
+The user: "why is reading so slow?" Measured per camera (cam 5, offline +
+live): capture 6.4 s (1080p stream start + 30 warm-up frames + 3 frames;
+cameras strictly one at a time, the USB rule), SAM display 0.4 s, model
+2.5 s per frame (main call + minus call 0.9 s) x 3 frames IN SERIES = ~15 s
+per camera, all four read every time = ~45 s per read, three reads per run.
+
+Changed:
+- The 3 frames' model calls run in parallel (ThreadPoolExecutor).
+  `run_20261113_184647`: 7.9-8.6 s per camera (was ~15).
+- `--read-cams` default **5 2 3 4**, and the first camera whose frames all
+  agree ends the read (`stop_when_unanimous`; `--all-cams` reads all). With
+  cam 5 reading the display: ~9 s per read. When nothing can be read (scale
+  off) it still tries all four, ~33 s.
+- Not changed: capture time. Most of the 6.4 s is the 1080p pipeline start;
+  fewer warm-up frames would save <1 s and risk an unsettled exposure.
+- That run read blank on all four: the scale had auto-powered off again.
+
+### 2026-11-13 — run_20261113_184134: placement works (force probe), reading does NOT -- the display is too few pixels
+
+First full run with `--stop-force 1.0` + `--place-offset 0.03 0`: contact at
+z 0.0616 (-1.01 N), released there, spoon stayed on the scale; put-back ok.
+**No usable weight:** baseline 8.8 (cam 2, 2/3; the display showed 0.0),
+loaded none (cam 5: 6.9 / 6.8 / 8.9), after 8.8 (cam 5, 2/3; should be 0.0).
+The 2/3 majority let wrong values through twice.
+
+The user: "the camera photos are very blurry". They are: from cam 5 (>1 m
+away) a digit is ~25 px tall in the 1080p frame; after the 7x upscale I
+cannot read `loaded_cam5_display*.png` either. -1140.0 read correctly because
+5 digits + the right-alignment rule constrain it; two small digits do not.
+Prompt or model changes cannot recover pixels that were never captured.
+
+Checked: **no wrist camera is connected** (`get_cam_info(1)` gives serial
+220222066259; only the four cage D415s 2-5 are on the bus). The D415 colour
+sensor is fixed-focus, 1920x1080 max.
+
+### 2026-11-13 — Scale moved next to cam 2: much sharper, but the digits fall off the frame
+
+`run_20261113_185059` (`--read-only --read-cams 2`), scale at platform centre
+(0.470, -0.270). The display is ~200 px wide in cam 2's 1080p frame (~90 px
+from cam 5 before) and the digit strokes are crisp at 2.5x -- this distance
+is good enough. But the display sits on the frame's bottom edge and the digits
+(at the display's lower end) are cut off, so the model saw empty LCD and
+said "blank" 3/3; the SAM mask was clipped by the border and the warp smeared.
+Needs the scale a few cm further from cam 2 (up in cam 2's image).
+
+### 2026-11-13 — Scale next to cam 2, fully in frame: reads 0.0 on 3/3, digits crisp
+
+`run_20261113_185256` (`--read-only --read-cams 2`), platform centre
+(0.450, -0.167), display square to cam 2 near its bottom edge but fully in
+frame. **0.0, 3/3 frames, high confidence, 9.2 s.** The straightened display
+shows `0.0` with clean strokes and even the decimal point. This is the layout
+to use: run with `--read-cams 2`. Cam 5 stays out of the read since it can
+misread at its distance, and the default order (5 first) would try it first.
+
+### 2026-11-13 — Set-down on the scale: the 1 N "contact" was a settling wobble; slow 1 mm probe at 2.5 N
+
+The user: the set-down is still not precise; descend very slowly until the
+spoon is fully on the scale, then release. `run_20261113_184134`'s probe:
+baseline -0.94 N at z 0.0636, +0.07 N at 0.0636, **-1.01 N at 0.0616 ->
+"contact"**, 2 mm into the probe and 0.01 N over the stirrer's 1.0 N
+threshold: the arm settling after a 1 s step, not the platform. The spoon
+was released above the scale.
+
+`scripts/weigh_test.py` defaults now (place params only; place.py and the
+controller unchanged): `--stop-force 2.5`, `--probe-step 0.001`,
+`--probe-seconds 1.5` (~0.7 mm/s, force read after settling),
+`--probe-below 0.04` (<= 40 steps, ~60 s worst case). The on-scale place
+always runs at speed 0: pacing shortens a probe step to 1.0 s at higher
+speeds. Not yet run on the robot. If 2.5 N still fires early, raise it; if it
+presses visibly before releasing, lower it.
+The spoon was again picked lying on its side in that run (on_side warning).
+
+### 2026-11-13 — Taking the spoon off the scale grasped ~4 cm behind it: SAM merged spoon + scale; now re-grasps at the release pose
+
+`run_20261113_185734` (first full run with the slow probe: contact at z
+0.0491, -3.82 N, 12 mm below the computed height; **weight 5.9 g**, loaded
+5.9 - baseline 0.0, cam 2; after 0.0). The user: taking the spoon off the
+scale always grasps too far back.
+
+The log: the second `pick_up` "larger spoon" ("white plastic tool") found
+an object **259 x 214 x 99 mm, centroid (0.447, -0.171)** -- the scale's
+platform centre was (0.447, -0.175). The white scale and the white spoon on it
+are one mask. The spoon had been released with the TCP at (0.459, -0.169)
+and its centroid ~19 mm in front of the jaws, so it was near x 0.477; the
+grasp went to 0.437 (centroid − 10 mm forward_offset), ~4 cm behind. The
+first try failed "no reachable grasp" (height from a 154 mm tall object).
+
+Fix (`scripts/weigh_test.py`, no skill changed): the spoon does not move after
+the jaws open, so `regrasp()` returns the TCP to place's `place_position`
+(the contact pose) with the release orientation (read right after place,
+which keeps it through the retract): open, hover +15 cm, +3 cm, down,
+force-limited close at `--regrasp-force 1.0`, check width > 3 mm, lift
+15 cm, check again. Tolerances 50/50/25 mm (this arm stops ~12 mm short
+even in free air). Any miss: jaws open, back to hover, run stops with the
+spoon on the scale. Then held / held_measure from the first pick are
+restored and the put-back is the usual place to the first pick site.
+Not yet run on the robot.
+
+### 2026-11-13 — The scoop on the scale found by HEIGHT (no SAM): works with the scoop on it; empty-scale control still to do
+
+The user chose the height approach over re-grasping blind. `scale_reader.
+locate_on_platform()`: each camera's depth inside the scale's scan box (grown
+30%: the box is the empty scale's and the scoop sticks out above) -> world
+points -> inside the platform's outline (+1 cm) and 4-60 mm above its top ->
+largest 5 mm-grid cluster -> per-camera median; cameras > 3 cm from the
+median dropped. `weigh_test.py` step 6 now: find it, grasp at found
+centroid − (centroid − jaws offset from the first pick), with the release
+orientation, z of the place contact; if nothing is found, or it is
+> `--max-shift 0.04` from where it was released, the release pose is used.
+`--find-on-scale` runs just the find (no arm, no read).
+
+- **Platform top was wrong with the scoop already on the scale.** The
+  97th-percentile top was the scoop: 0.0359, platform outline 95 x 57 mm, and
+  only the scoop's highest part counted (39 mm "long",
+  `run_20261113_190748`). `platform_from_points()` now takes the most
+  populated 2 mm z level in the upper half of the scale's cloud: **0.0247 (36
+  mm over the table), outline 126 x 142 mm** with the scoop on it
+  (`run_20261113_190914`). The place height uses this top too now.
+- `run_20261113_190914`, scoop on the scale: all four cameras found it
+  (1753 / 1446 / 802 / 1291 points), none rejected, centroid (0.4588,
+  -0.1784, 0.0342). The red overlays in `find_cam*.jpg` cover the scoop. Merged
+  length 104 mm vs ~86 mm real (per-camera offsets of a few mm add up); the
+  grasp uses the per-camera median, not the extent.
+- **Not done yet: the empty-scale control.** Whether the shiny steel
+  platform makes false points above its top. Take the scoop off and run
+  `--find-on-scale`: it should print "nothing found above the platform".
+- Not yet run on the robot.
+
+### 2026-11-13 — `weigh_test.py --pick-from-scale`: pick the scoop off the scale and set it back (not yet run)
+
+The user put the scoop on the scale by hand and asked to test only: pick it up,
+put it back. With no earlier pick there is no jaws-to-centroid offset or
+release orientation to reuse, so this mode runs the real `pick_up`
+(bench grasp defaults, yaw auto, working_end_distance, lift) and only swaps
+its input: for this one call `vision.locate(<object>)` returns
+`locate_on_platform()`'s cloud (points 4-60 mm above the platform) instead
+of SAM's merged scale+scoop mask. pick_up then records the pick site as usual,
+and the put-back is `place {"target_location": "scoop"}` to that site with
+the slow probe (1 mm / 1.5 s, 2.5 N, from 20 mm above the site's centroid,
+up to 40 mm down), at speed 0. "Put back" = the same spot on the scale (the
+scoop had no other known site in that session).
+
+Known caveats before the first run: the found cloud lacks the scoop's
+lowest 4 mm (the cut above the platform), and the four cameras' merged cloud
+is ~1-2 cm longer than the scoop (calibration spread), which can move
+`working_end_distance`'s grasp point a few mm. pick_up's on-side check
+measures heights from the table, so on the scale it reports "unknown" (warn
+only on this bench).
