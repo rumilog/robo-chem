@@ -84,6 +84,13 @@ ssh-copy-id franka@franka-Alienware-Area-51-R5
    Your service runs on your own port (`GROUNDING_URL` in `.env`), so you
    never use, or try to stop, another account's service.
 
+   **Only one grounding service fits on the GPU at a time.** SAM 3 takes about
+   5 GB of the 10.76 GB card, so a second account's service leaves too little
+   memory. Every detection then fails with `CUDA out of memory`, and preflight
+   reports "... not found on the bench". Before starting, check with
+   `nvidia-smi`; if another account's `grounding_service.py` is listed, ask
+   them to run `scripts/grounding.sh stop`. Stop yours when you finish.
+
 3. **Bench, before each trial** (see [`PARAMETERS.md`](PARAMETERS.md)):
    - each powder dish holds a levelled bed of **at least 15 mm**
    - the spoon and stirrer holders sit at **x ≤ 0.74 m**: preflight does not

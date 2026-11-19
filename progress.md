@@ -6774,3 +6774,18 @@ only on this bench).
   the README section are committed, and `--bench make_it_blue` is in
   `BENCHES`, so `run_experiment` / `check_bench_layout` / `write_report`
   accept it.
+
+### 2026-11-19 14:02 — Make It Blue rerun blocked at preflight: two grounding services, GPU out of memory
+
+- `experiments/run_20261119_140232/`: every grounding call returned
+  `CUDA out of memory`, so preflight said "red cabbage powder cup not found".
+  The bench was fine.
+- `nvidia-smi`: victoralvarado's `grounding_service.py` (PID 660139, 5197 MiB)
+  and rumi's (PID 789233, 4997 MiB) on the 10.76 GiB card. **Two SAM 3
+  services do not fit; only one account can run experiments at a time.**
+  The README per-account section now says so.
+- The plan with the 2026-11-19 prompt fix had 17 sub-tasks and step 6 came out
+  correctly: 15 pick_pipette, 16 dispense 3 drops into the beaker, 17 put the
+  pipette back. It dropped the final stir rather than adding it after the
+  dispense, even though the capability note says "then stir". It did not
+  reach the robot.
