@@ -43,6 +43,9 @@ class RobotProfile:
         "The robot CANNOT perform two spatially-separate actions simultaneously. "
         "Any instruction of the form 'do A and B at the same time' must be "
         "re-expressed as a strictly sequential plan.",
+        "Each sub-task is ONE skill on the ONE held object. Never write a "
+        "sub-task that combines two actions ('dispense while stirring', "
+        "'stir and pour'); split it, with a 'place' between tools.",
         "The robot CANNOT exert two independent forces at once -- it cannot hold a "
         "container steady while stirring it. Containers must be stable on the "
         "bench unaided.",

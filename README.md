@@ -91,7 +91,7 @@ ssh-copy-id franka@franka-Alienware-Area-51-R5
    - scoop dishes are within about **0.62 m** of the base: scoops jammed at
      0.631-0.640 m
    - optional camera-only layout check (the arm does not move):
-     `python scripts/check_bench_layout.py --bench magic_beaker` (or `--bench jellyfish`)
+     `python scripts/check_bench_layout.py --bench magic_beaker` (or `--bench jellyfish`, `--bench make_it_blue`)
 
 ### 3. The experiments
 
@@ -114,6 +114,26 @@ python -u scripts/run_experiment.py --bench jellyfish --workspace-min 0.25 -0.40
   --instruction-image instructions/jellyfish.jpg --follow-steps --no-verify --reset
 ```
 
+**Make It Blue with a Base!** (`instructions/make_it_blue.png`, about 20 sub-tasks):
+
+```bash
+python -u scripts/run_experiment.py --bench make_it_blue --workspace-min 0.25 -0.40 -0.13 \
+  --instruction-image instructions/make_it_blue.png --follow-steps --no-verify --reset
+```
+
+- Set up before starting: the small measuring beaker on its `40 ml water`
+  label, **already filled to 40 mL**. One clear cup on `1/2 cup water`,
+  **already half full**. The baking soda and red cabbage powder dishes on their
+  labels. The pipette standing in its lidded white paper cup. One scoop, lying
+  flat bowl-up. The stirrer in its holder.
+- Run `check_bench_layout.py --bench make_it_blue` first. On 2026-11-18 the
+  dishes started at 0.65 m from the base (the limit is 0.62 m), the scoop was
+  0.126 m from the baking soda dish (needs 0.136 m), and the stirrer holder was
+  0.164 m from the red cabbage dish (needs 0.18 m).
+- If Franka Desk shows "end-effector not connected" while the gripper node
+  runs, but the gripper still opens and closes, it is harmless. See
+  `progress.md`, 2026-11-18.
+
 - `--reset` homes the arm and **opens the gripper** before step 1. Use it
   only when starting from scratch.
 - **Resume after a stop:** run the same command **without `--reset`** and
@@ -122,7 +142,7 @@ python -u scripts/run_experiment.py --bench jellyfish --workspace-min 0.25 -0.40
 - To see the plan without moving the arm, replace `--reset` with
   `--dry-run`. The cameras and LLM calls still run.
 - Write the report afterwards with
-  `python scripts/write_report.py --bench magic_beaker` (or `--bench jellyfish`).
+  `python scripts/write_report.py --bench magic_beaker` (or `--bench jellyfish`, `--bench make_it_blue`).
 
 **Label experiments** (cameras only, the arm is never imported; bench =
 `LABEL_TEST` in `progress.md`):

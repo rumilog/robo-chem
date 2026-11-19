@@ -1,6 +1,6 @@
 # Progress — robo-chem (Franka + RealSense)
 
-Last updated: 2026-11-13
+Last updated: 2026-11-19
 
 Live manipulation stack for the Franka Panda + RealSense cage. Related but
 separate from the PLATO/agent notes in [`robomail/docs/progress.md`](robomail/docs/progress.md).
@@ -6676,3 +6676,101 @@ is ~1-2 cm longer than the scoop (calibration spread), which can move
 `working_end_distance`'s grasp point a few mm. pick_up's on-side check
 measures heights from the table, so on the scale it reports "unknown" (warn
 only on this bench).
+
+### 2026-11-18 — New experiment "Make It Blue with a Base!" (`--bench make_it_blue`): manifest + first camera-only check
+
+- Sheet: `instructions/make_it_blue.png` (booklet pp. 10-11, a phone photo of
+  the whole spread, keyboard visible; not cropped).
+- New manifest `MAKE_IT_BLUE` in `bench_manifest.py`, from
+  `scene_captures/make_it_blue_20261118_163914`. It has these objects:
+  - dishes on `red cabbage powder` and `baking soda`
+  - `beaker` (the small measuring beaker) on `40 ml water`, noted as ALREADY at
+    the 40 mL line (step 1 done)
+  - `clear cup` on `1/2 cup water`, noted as ALREADY half full (step 3 done)
+  - the pipette through the lidded white paper cup
+  - one scoop for small and medium
+  - stirrer + holder
+
+  Notes tell the planner to stir only with the stirrer and to do step 6 in
+  turn (drip, put pipette back, then stir), because the arm has one hand.
+  The beaker dims are NOT measured (the Magic Beaker's, as Jellyfish).
+  Pre-filled notes follow the Jellyfish lesson (2026-10-21: "fill the cup"
+  became a pour of the wrong vessel).
+- `check_bench_layout.py --bench make_it_blue`. Labels and finds:
+  - Labels all read: red cabbage 4/4, baking soda 4/4, 40 ml water 4/4,
+    1/2 cup water 3/4. The white pipette cup is also segmented as "clear
+    plastic cup" (1-camera reads, unassigned), which is harmless.
+  - **Pipette only on cam 4** (scores cams 2/3/5 = 0.35/0.48/0.46 < 0.5). It
+    was 4/4 in Jellyfish, where it stood at x 0.66; here it is at (0.42, +0.15).
+  - Spoon 3 of 4 cameras (cam 5 picked another object, rejected).
+  - Stirrer 3 of 4 cameras (cam 2 saw no mask).
+- **Layout rules broken as first set up:**
+  - red cabbage dish 0.659 m and baking soda dish 0.648 m from the base
+    (scoops jammed at 0.631-0.640 before)
+  - spoon 0.126 m from the baking soda dish (needs 0.136)
+  - stirrer holder 0.164 m from the red cabbage dish (needs 0.18)
+  - In the photos the spoon looks to lie on its side, not flat bowl-up.
+
+  Asked the user to move the dishes ~6 cm toward the arm and re-check.
+  Not dry-run or run yet.
+
+### 2026-11-18 — Desk "end-effector not connected" while the gripper node runs: harmless; the real faults were elsewhere
+
+- **Symptom:** Desk shows the hand connected while no node is running, and
+  "end-effector not connected" as soon as `franka_gripper.launch` connects.
+  **The message stays during a run that works.** In
+  `experiments/run_20261118_173743` (make_it_blue) the gripper opened to
+  78.7 mm, closed on the larger spoon and held it at 18.8 mm, and the scoop
+  dumped into the beaker. Do not chase the Desk message by itself.
+- **Real failures this session, in order:**
+  1. The node stopped after `Found default_grasp_epsilon`, then repeated
+     `GripperServer: Exception reading gripper state: libfranka: UDP receive:
+     Timeout`. TCP to 172.16.0.2:1338 was ESTABLISHED, but the gripper's UDP
+     sockets on the control PC had Recv-Q 0. The arm's socket (franka_interface)
+     had 4352 B, so the network and firewall were fine (ufw `ENABLED=no`).
+     There were no duplicate gripper nodes and no apt updates since Oct 2.
+  2. After the user reset things in Desk: `libfranka: Connection to FCI
+     refused`. Port 1338 refused while 1337 (arm) was open, so the controller
+     was not serving the hand, even with FCI active and lights blue.
+  3. It then started working, with Desk still showing "not connected". It is
+     unclear which step fixed it; this Desk version has no "None" end-effector
+     option to toggle.
+- **Quick checks from the workstation** (key SSH to the control PC, no sudo):
+  - `ssh franka@franka-Alienware-Area-51-R5 'ss -tunap | grep -E ":133[78] "; ss -uanp | grep franka'`
+  - Port 1338 ESTAB plus gripper UDP Recv-Q > 0 means the hand is talking.
+  - 1338 refused means the controller isn't serving the hand: check End-Effector
+    = Franka Hand in Desk, then power-cycle.
+- Unrelated: the control PC load average is about 9, mostly from `whoopsie` (30% CPU for 190
+  days); it shows "System restart required" and has been up 202 days.
+
+### 2026-11-18/19 — Make It Blue: first robot run 16/20; step 6 planned as "dispense while stirring" (fix not yet re-run)
+
+- Run: `experiments/run_20261118_173743/` (record `agent_run_20261118_175404.json`),
+  the README command with `--reset`. `finished_with_failures`, **16/20**.
+  - **Succeeded (1-15):** both scoop → dump → stir rounds (red cabbage into the
+    beaker, baking soda into the clear cup), every tool put back, and
+    `pick_pipette` from the clear cup (held at 6.9 mm). Cam 3 timed out
+    ("Frame didn't arrive within 5000") several times; the other three cameras
+    carried the run.
+  - **16-19 failed with no skill call.** The plan was: 15 pick_pipette,
+    16 pick up the stirrer, 17 stir, 18 "dispense drops from pipette into
+    beaker while stirring", 19 put the stirrer back. The executor refused each
+    one, correctly, because the pipette was still held. 20 put the pipette back.
+    **Nothing was dripped into the beaker**, so the blue change at the end of
+    the sheet did not happen.
+  - The capability pass saw the conflict and still wrote "dispense ... while
+    stirring, alternating as needed". The old bench note ("drip, put pipette
+    back, then stir") was not enough.
+- **Fix (prompt only, no skill motion changed; NOT yet re-run):**
+  - `MAKE_IT_BLUE` pipette note now spells out step 6 as six ordered
+    sub-tasks: pick_pipette, dispense into the beaker, place the pipette, pick
+    up the stirrer, stir, place the stirrer. It also says never "while stirring".
+  - `RobotProfile.hard_constraints` gained one rule for every bench: each
+    sub-task is ONE skill on the one held object, never two actions combined.
+- Only steps 15-20 need re-running. Use the README command without `--reset`,
+  plus `--resume latest --from-step 15`, with the clear cup and beaker as the
+  run left them.
+- For other accounts: `instructions/make_it_blue.png`, the scene capture and
+  the README section are committed, and `--bench make_it_blue` is in
+  `BENCHES`, so `run_experiment` / `check_bench_layout` / `write_report`
+  accept it.

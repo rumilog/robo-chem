@@ -553,6 +553,84 @@ JELLYFISH = BenchManifest("jellyfish", [
     skill_defaults=MAGIC_BEAKER.skill_defaults,
 )
 
+#: The booklet's "Make It Blue with a Base!" (pages 10-11,
+#: instructions/make_it_blue.png) as set up on the real bench on 2026-11-18
+#: (scene_captures/make_it_blue_20261118_163914): the Jellyfish dishes, scoop,
+#: stirrer and lidded pipette cup; the measuring beaker on "40 ml water" and
+#: one clear cup on "1/2 cup water", both already filled.
+MAKE_IT_BLUE = BenchManifest("make_it_blue", [
+    _dish("red cabbage powder cup", "red cabbage powder"),
+    _dish("baking soda cup", "baking soda"),
+    BenchObject(
+        name="beaker", label="40 ml water", category="clear plastic cup",
+        aliases=("plastic beaker", "measuring beaker", "indicator beaker",
+                 "40 ml water"),
+        note=("a small clear measuring beaker ALREADY filled with water to the "
+              "40 mL line: sheet step 1 is done, nothing needs pouring into "
+              "it. The red cabbage powder goes in here (step 2) and the base "
+              "solution is dripped in here (step 6)"),
+        # NOT MEASURED: the Magic Beaker's beaker numbers, as for Jellyfish.
+        transparent=True, radius=0.022, height=0.060,
+        pick=(("z_offset", BEAKER_GRASP_Z_OFFSET), ("tilt_away_deg", 10.0)),
+    ),
+    _cup("clear cup", "1/2 cup water",
+         ("base cup", "cup of water", "half cup of water", "1/2 cup water"),
+         pick=_CUP_PICK,
+         note=("a clear plastic cup ALREADY half full of water: sheet step 3 "
+               "is done. The baking soda goes in here (step 4); the pipette "
+               "draws the base solution from it (step 5)")),
+    BenchObject(
+        name="pipette", prompt="pipette",
+        aliases=("dropper", "transfer pipette", "plastic pipette"),
+        note=("a clear plastic transfer pipette standing upright through the "
+              "lid of a white paper cup, bulb up; take it with pick_pipette, "
+              "which also draws liquid into it. Sheet step 6 is these sub-tasks "
+              "in this order: pick_pipette from the clear cup, dispense into "
+              "the beaker, place the pipette back, pick up the stirrer, stir "
+              "the beaker, place the stirrer back. Never plan 'dispense while "
+              "stirring' or pick up the stirrer while the pipette is held"),
+    ),
+    BenchObject(
+        name="pipette cup",
+        aliases=("pipette holder", "lidded cup", "white paper cup"),
+        note=("the lidded white paper cup the pipette stands in; it holds no "
+              "reagent and is not one of the kit's clear cups"),
+    ),
+    BenchObject(
+        name="larger spoon", prompt="white plastic tool",
+        aliases=("big scoop", "big spoon", "large spoon", "scoop",
+                 "small scoop", "small spoon", "medium scoop", "medium spoon",
+                 "smaller spoon", "smaller scoop", "white plastic tool"),
+        note=("a white plastic scoop lying flat on the bench, and the ONLY "
+              "scoop here: use it wherever the instructions call for the "
+              "small or the medium scoop. It only scoops and dumps powder; "
+              "all stirring is done with the stirrer"),
+        pick=(("z_offset", 0.0), ("grasp_force", 1.0), ("forward_offset", -0.010),
+              ("yaw", "auto"), ("working_end_distance", 0.042),
+              ("right_if_on_side", "warn")),
+    ),
+    BenchObject(
+        name="stirrer", prompt="white cube",
+        aliases=("stirring rod", "stir rod", "stirring stick", "stir stick",
+                 "white cube"),
+        note=("a rod with a white cube on top, standing in its holder; the "
+              "gripper takes it by the cube. The arm has one hand, so step 6 "
+              "is done in turn: drip the base solution in, put the pipette "
+              "back, then stir the beaker with this"),
+        pick=(("z_offset", 0.0), ("grasp_force", 1.0), ("yaw", "auto")),
+    ),
+    BenchObject(
+        name="stirrer holder",
+        aliases=("holder", "stirrer stand", "stir holder", "tool holder"),
+        note=("the dark block the stirrer stands in; the stirrer goes back "
+              "into it and nothing else does"),
+    ),
+],
+    measured_tool_offset=True,
+    skill_defaults=MAGIC_BEAKER.skill_defaults,
+)
+
 #: Benches selectable with ``run_experiment.py --bench``.
 BENCHES: Dict[str, BenchManifest] = {MAGIC_BEAKER.name: MAGIC_BEAKER,
-                                     JELLYFISH.name: JELLYFISH}
+                                     JELLYFISH.name: JELLYFISH,
+                                     MAKE_IT_BLUE.name: MAKE_IT_BLUE}
