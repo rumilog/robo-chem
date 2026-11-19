@@ -141,7 +141,13 @@ class Preflight:
                 if m:
                     out.append(("scoop", m.group(1).strip()))
                 continue
-            kind = next((k for word, k in _KINDS if word in text), None)
+            # Whole words, and never a pick or place step: "place the stirrer
+            # back to stirrer holder" matched "stir" inside "stirrer", and
+            # preflight blocked on finding the holder (2026-11-19).
+            if re.match(r"\s*(place|pick)", text):
+                continue
+            kind = next((k for word, k in _KINDS
+                         if re.search(rf"\b{re.escape(word)}\b", text)), None)
             if kind is not None:
                 out.append((kind, target))
         return out

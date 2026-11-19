@@ -6789,3 +6789,22 @@ only on this bench).
   pipette back. It dropped the final stir rather than adding it after the
   dispense, even though the capability note says "then stir". It did not
   reach the robot.
+
+### 2026-11-19 14:10 — Make It Blue blocked at preflight: "stirrer holder not found" (preflight bug, fixed)
+
+- `experiments/run_20261119_141038/`: GPU clear now, every target resolved
+  (dishes 4/4 cams, beaker 40 ML WATER x4, clear cup 2-2 vote → 1/2 CUP WATER).
+  Blocked on `stirrer holder not found on the bench`.
+- Cause: `Preflight.items_from_plan` picked a step's kind by substring, and
+  "place the stirrer back to **stir**rer holder" matched `stir`. Preflight then
+  tried to camera-find "stirrer holder" (no SAM prompt; 0 masks on all four
+  cams). The executor already maps a tool's home name to "put it back"
+  (`skills/__init__.py`, `tool.home`), so the run itself would have been fine.
+  Yesterday's plan said "back to stirrer", so it never hit this.
+- Fix: whole-word matching, and pick/place steps are skipped. On today's 20
+  steps it now yields only stir/dispense → beaker, dump → clear cup and the
+  two scoop dishes. Checked directly on those strings; no test covered
+  `items_from_plan`.
+- This plan had all 20 steps and step 6 right: 15 pick_pipette,
+  16 dispense into the beaker, 17 pipette back, 18-20 stirrer, stir the beaker,
+  stirrer back.
